@@ -1,0 +1,123 @@
+same11---处理单变量
+same12---处理多变量
+
+
+ttr---大气顶净长波辐射    "向下为正"，因此 ttr 通常为 负值    ttr ≈ −OLR（射出长波辐射）
+u200---200 百帕纬向风（东西风分量）     单位m/s
+u850---850 百帕纬向风（东西风分量）     单位m/s
+ssr---地表净太阳（短波）辐射
+ssrd---地表向下太阳（短波）辐射
+
+
+
+
+这 10 个脚本主要围绕三类任务：**计算逐日距平、整理 MJO 输入数据、生成 MJO/周平均产品**。它们不是简单按文件名顺序执行，而是由 CRA 与 FengShun 两类数据分别处理后再汇合。
+**1. MJO 指数主程序**
+
+`A_00_cal_S2S-ecmf_mjo_20240920_optimized.py:83` 是整个目录中气象算法最核心的脚本。
+
+- 输入 CRA 观测距平和 FengShun 预报距平，变量为 `olr`、`u850`、`u200`。
+- `remove_120d()` 构造预报时效对应的120天背景场。对第 $L$ 天预报，背景由起报日前的观测以及第1至 $L-1$ 天预报组成，再计算  
+  $$X'_L=X_L-\frac{1}{120}\sum_{k=1}^{120}X_k.$$
+- 它使用 `cumsum` 将窗口求和变成常数时间操作，并用 `searchsorted` 找时间位置，这是脚本主要的性能优化。
+- `project_mjo()` 先在南北纬17°之间做纬向带平均，再分别除以固定标准差，将三个变量沿经度方向拼接，最后投影到 Wheeler-Hendon EOF：  
+  $$RMM_i=\frac{\mathbf X\cdot\mathbf EOF_i}{\sqrt{\lambda_i}}.$$
+- `compute_index()` 对第1至42天逐时效计算，可用最多8个进程并行，输出维度为 `lead_time × time × index`。
+- `get_amplitude()` 计算 $\sqrt{RMM1^2+RMM2^2}$；`get_phase()` 根据 RMM 平面象限划分1至8相位。
+- `compute_mjo_cor()` 计算二维 RMM 向量相关和误差，但这里是未去均值的向量相关，不等同于普通 Pearson 相关。
+- 主入口读取 EOF 文本和两个 NetCDF，最后生成 `mjo_yc_1.5.nc`。
+
+**2. CRA 通用距平流水线**
+
+`CRA_v1.5_process.py:29` 当前配置处理 `t2m`，气候态期为2004至2023年，距平年份为2024、2025。
+
+- `inspect_nc_file()`、`auto_detect_structure()` 自动识别变量以及纬度、经度、成员和时效维。
+- 坐标整理函数把经度统一为 $0^\circ$ 至 $360^\circ$，并保证纬度单调，方便 `xarray.interp()`。
+- `compute_daily_climatology()` 对相同月日的20年资料求平均，得到365个日气候态。
+- `compute_daily_diff()` 计算  
+  $$A(y,m,d)=X(y,m,d)-\overline X_{2004:2023}(m,d).$$
+- `interpolate_diff_to_1p5()` 插值到 `121 × 240` 的1.5°全球网格。
+- `combine_anomaly_by_leadtime()` 以每个日期为起报日，收集未来60天距平，形成 `lead_time × lat × lon` 文件；缺失日默认用 NaN 填补。
+- `CRA_v1.5_process.py:792` 按 `CLIM → DIFF → INTERP → COMBINE` 顺序执行。
+
+**3. FengShun v1.5 的 tp/t2m 距平**
+
+`fengshun_v1.5_cal_anom_tp_t2m_2024.py:25` 同时处理 `t2m` 和 `tp`，但使用已经存在的气候态文件。
+
+- `open_forecast()` 读取某个2024起报日的11成员、60时效预报；`compute_member_mean()` 先做集合平均。
+- `compute_anomaly_for_one_init()` 对每个时效计算有效日期 `valid_date = init_date + lead`，再读取对应月日的气候态并减去。
+- 结果插值到1.5°，保存为每天一个起报文件。
+- 这里排除了2024年2月29日，因此全年按365个起报日处理。
+- `fengshun_v1.5_cal_anom_tp_t2m_2024.py:470` 先检查数据结构，再逐变量、逐起报日运行。
+
+**4. FengShun v1.5 的 MJO 三变量距平**
+
+`fengshun_v1.5_cal_anom_ttr_u200_u850_2024.py:378` 处理 `ttr`、`u200`、`u850`。
+
+- `normalize_dimensions()` 将不同源文件统一为 `member × lead_time × lat × lon`。
+- `compute_daily_climatology()` 对同一起报月日的2004至2023年资料先做成员平均，再做年份平均；所以每个时效有自己的模式气候态。
+- `compute_anomaly_for_year()` 用2024集合平均减去相同起报月日、相同时效的气候态。
+- 输出进入 `fengshun_v1.5/<变量>/anom_1p5/`，供后面的 MJO 合并脚本使用。
+
+**5. FengShun v2.0 的 tp/t2m 距平**
+
+`fengshun_v2.0_cal_anom_tp_t2m_2024.py:38` 是较统一、健壮的新版实现，当前只配置处理 `tp`。
+
+- 自动检查11成员、60时效和 `121 × 240` 网格。
+- 先生成2004至2023逐起报日气候态，再计算2024距平。
+- 支持 `tp`、`t2m`、`ssr`、`ssrd`，切换变量时需要同步修改变量名及三个目录。
+- 与上一份 v1.5 `tp/t2m` 脚本不同，它自己负责生成气候态。
+
+**6. FengShun v2.0 的 MJO 三变量距平**
+
+`fengshun_v2.0_cal_anom_ttr_u200_u850_2024.py:38` 的算法基本复制 v1.5 三变量版本，只是输入和输出路径指向 v2.0。
+
+- 当前 `VAR_NAMES = ["u200"]`，因此实际不会处理 `ttr` 和 `u850`。
+- 工作流程仍是数据检测、维度标准化、成员平均、20年气候态、2024距平。
+- 需要注意：属性表含 `u250`，却没有当前使用的 `u200`，元数据可能缺失或不准确。
+
+**7. CRA 的 MJO 专用距平**
+
+`mjo_CRA_v1.5_process.py:33` 专门准备 MJO 所需的 `ttr`、`u200`、`u850`。
+
+- `ttr` 直接读取；`u200` 和 `u850` 都从 `u` 文件读取，再分别按 `isobaricInhPa` 的位置索引10和3选层。
+- 对2004至2023年同月日求气候平均，再计算2023、2024逐日距平。
+- 与 CRA 通用脚本不同，它不构造60天 `lead_time`，输出是连续观测时间上的二维日距平。
+- 层索引成立的前提是源文件第10和第3个位置确实对应200 hPa、850 hPa；仅靠位置索引风险较高，最好按实际气压坐标值选择。
+
+**8. CRA 三变量合并**
+
+`mjo_data_combine_CRA.py:1` 把上一脚本的三种 CRA 日距平整理为一个观测文件。
+
+- 遍历2023、2024的365个非闰日，将空间维名称统一为 `lat/lon`。
+- 插值到2.5°网格，为每个文件增加 `time` 维，再沿时间拼接。
+- 删除冲突的垂直层坐标，然后合并 `olr/u200/u850`。
+- 此处只是把 `ttr` 重命名成 `olr`，没有取反，说明代码假定 CRA 的 `ttr` 符号已经等同于 OLR；必须结合源数据属性确认。
+
+**9. FengShun 三变量合并**
+
+`mjo_data_combine.py:1` 对 FengShun v2.0 距平执行类似整理。
+
+- 每个输入文件保留原有 `lead_time`，增加起报 `time`，最终通常是 `time × lead_time × lat × lon`。
+- 将1.5°插值到2.5°，把 `step` 统一为 `lead_time`。
+- 与 CRA 版本不同，这里执行 `olr = -ttr`，然后合并三个变量。
+- 输出文件名为 `fuxicoupling_anom_daily_var3_2p5_2024.nc`。但 MJO 主程序当前硬编码读取名为 `fengshun1.5_anom_daily_var3_2p5_2024.nc` 的文件，需要手动统一路径和名称。
+
+**10. 周平均程序**
+
+`weeklymean.py:19` 当前处理 CRA 合并后的 `t2m` 和 `tp`。
+
+- 自动寻找 `lead_time/step/time`、纬度和经度维，并识别时效坐标是0起算还是1起算。
+- `weeklymean.py:61` 为 week1至week8各7天，week9为第57至60天；另生成第15至28天的 `week34` 和第29至42天的 `week56`。
+- `compute_weekly_mean()` 沿时效维执行 `mean(skipna=True)`，输出 `week × lat × lon`。
+- `VarConfig` 控制输入变量、输出变量名和目录；逐文件处理失败不会终止整个批次。
+
+**需要优先确认的科学与运行问题**
+
+1. 所有日期列表都排除2月29日，但2024是闰年，可能造成时间不连续或样本错位。
+2. CRA 与 FengShun 对 `ttr → olr` 的符号处理不一致，必须依据 NetCDF 的 `positive`、`units` 和数值符号确认。
+3. `u200/u850` 最好按气压坐标值选择，而不是固定位置索引。
+4. MJO 投影使用普通纬度平均，没有 $\cos(\varphi)$ 权重；这可能是为了严格匹配原 EOF 制作方式，不能随意修改。
+5. 多个脚本的文件名、v1.5/v2.0 路径和当前变量配置并不完全一致，运行前需要先统一配置。
+
+已创建 3 个待办事项
