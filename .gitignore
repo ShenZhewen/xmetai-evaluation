@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+*.eggs/
+.venv/
+venv/
+env/
+build/
+dist/
+*.so
+
+# 数据 / 结果（不入库）
+*.nc
+*.zarr/
+*.npy
+*.npz
+
+# 编辑 / 系统
+.DS_Store
+.idea/
+.vscode/
