@@ -203,6 +203,9 @@ def run_evaluation(cfg) -> int:
             f"实际可用范围为 {min(discovered_by_init)} 到 {max(discovered_by_init)}"
         )
     log.info("起报时间: %s 到 %s，共 %d 个", init_times[0], init_times[-1], len(init_times))
+    log.info("实际起报数量: %d", len(init_times))
+    log.info("实际起报前5个: %s", init_times[:5])
+    log.info("实际起报后5个: %s", init_times[-5:])
 
     forecast_var = forecast_cfg.get("variable", "tp")
     obs_var = observation_cfg.get("variable", "precipitation")
@@ -298,6 +301,8 @@ def run_evaluation(cfg) -> int:
                 and abs(float(lead) % window_hours) < 1e-6
             ]
             log.info("评估时效: %s", window_leads)
+            log.info("站点数量: %d", len(station_lats))
+            log.info("观测数据维度: %s", observation_ds.sizes)
         for lead in window_leads:
             if lead not in forecast_windows.lead_time.values:
                 continue
@@ -314,6 +319,15 @@ def run_evaluation(cfg) -> int:
                     coords=forecast_at_station.coords,
                 )
                 n_valid = int(valid_mask.sum())
+                if init_idx < 3:
+                    log.info(
+                        "样本诊断 init=%s lead=%s forecast_shape=%s obs_shape=%s n_valid=%d",
+                        init_time,
+                        lead,
+                        forecast_at_station.shape,
+                        obs_window.shape,
+                        n_valid,
+                    )
                 if n_valid == 0:
                     skipped += 1
                     continue
