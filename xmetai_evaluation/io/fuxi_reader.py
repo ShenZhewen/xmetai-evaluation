@@ -178,8 +178,10 @@ class FuXiReader(Reader):
             ),
         )
 
+    def read(self, request: DataRequest, index: DataIndex) -> DataBundle:
         """
-        读取所有时效文件并拼接
+        读取所有起报时间；兼容 Reader 抽象接口。
+        全年流式评测请使用 read_one()。
 
         Args:
             request: 数据请求（需要 init_times, variables）
