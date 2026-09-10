@@ -74,7 +74,15 @@ class Matcher:
         observation_ds = observation_ds[variables]
 
         # 计算 valid_time（如果预报有 init_time 和 lead_time）
+        sample_records = {}
         if "init_time" in forecast_ds.dims and "lead_time" in forecast_ds.dims:
+            for init_time in forecast_ds.coords["init_time"].values:
+                for lead_time in forecast_ds.coords["lead_time"].values:
+                    valid_time = init_time + np.timedelta64(int(lead_time), "h")
+                    sample_records[valid_time] = {
+                        "init_time": str(init_time),
+                        "lead_h": float(lead_time),
+                    }
             forecast_ds = self._add_valid_time(forecast_ds)
 
         # 集合处理
@@ -114,6 +122,7 @@ class Matcher:
                     weights,
                     valid_time,
                     reference,
+                    sample_records.get(valid_time, {}),
                 )
                 batches.append(batch)
         else:
@@ -163,6 +172,7 @@ class Matcher:
         weights: xr.DataArray,
         valid_time: Optional[np.datetime64],
         reference: Optional[DataBundle],
+        sample_record: Optional[Dict[str, Any]] = None,
     ) -> EvaluationBatch:
         """创建单个 EvaluationBatch"""
         # 计算共同有效掩码
@@ -175,9 +185,12 @@ class Matcher:
             valid_mask = valid_mask & forecast_valid[var] & observation_valid[var]
 
         # Sample key
-        sample_keys = [{
-            "valid_time": str(valid_time) if valid_time is not None else "unknown",
-        }]
+        sample_keys = [
+            {
+                **(sample_record or {}),
+                "valid_time": str(valid_time) if valid_time is not None else "unknown",
+            }
+        ]
 
         # 对齐记录
         alignment = {
@@ -193,5 +206,6 @@ class Matcher:
             valid_mask=valid_mask,
             reference=reference,
             weights=weights,
+            sample_dim="grid",
             alignment=alignment,
         )

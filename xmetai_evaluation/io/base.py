@@ -78,20 +78,3 @@ class Reader(ABC):
             ContractError: 单位/维度不符
         """
         pass
-
-    def load(self, request: DataRequest) -> DataBundle:
-        """
-        便捷方法：发现 + 读取
-
-        子类通常需要提供对应的 Catalog，或在此方法中实现简单的发现逻辑。
-
-        Args:
-            request: 数据请求
-
-        Returns:
-            DataBundle
-        """
-        raise NotImplementedError(
-            f"Reader '{self.source_id}' does not implement load(). "
-            "Use read() with an explicit DataIndex from a Catalog."
-        )

@@ -1,0 +1,264 @@
+# -*- coding: utf-8 -*-
+"""Pipeline 声明。
+
+一套流程 = 数据源 + 协议 + 变换链 + 指标 + 输出，全部是声明：
+没有循环、没有 I/O、没有指标公式。真正执行它的是 ``pipeline/runner.py``。
+
+新增一个评测 = 新增一份声明（配置）；只有出现新的物理算法时才新增代码。
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta
+from typing import Any, Dict, List, Optional, Tuple
+
+from xmetai_evaluation.core.errors import ConfigError
+
+
+@dataclass
+class SourceSpec:
+    """一个数据源的声明：读什么、用哪个 Reader。"""
+
+    reader: str
+    params: Dict[str, Any] = field(default_factory=dict)
+
+    @classmethod
+    def from_config(cls, config: Dict[str, Any]) -> "SourceSpec":
+        """从 ``{"type": "<reader>", "root_dir": ...}`` 形式的配置构造。
+
+        数据源类型必须由配置显式声明，框架不猜默认模型。
+        """
+        config = dict(config or {})
+        reader = config.get("type") or config.get("reader")
+        if not reader:
+            raise ConfigError("数据源配置必须声明 type（或 reader）")
+        params = {
+            key: value
+            for key, value in config.items()
+            if key not in ("type", "reader")
+        }
+        params.setdefault("root_dir", config.get("root"))
+        return cls(reader=reader, params=params)
+
+
+@dataclass
+class TransformSpec:
+    """一个变换的声明。"""
+
+    name: str
+    params: Dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class MetricSpec:
+    """一个指标的声明。"""
+
+    name: str
+    params: Dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class PipelineTemplate:
+    """一套流程模板：只声明"怎么算"。
+
+    protocol / transforms / metrics / writers 与协议参数（区域、权重、窗口口径）
+    都属于流程；"数据从哪来、评哪段时间"属于配置（``--config``）。
+    """
+
+    name: str
+    protocol: str
+    description: str = ""
+    transforms: List[TransformSpec] = field(default_factory=list)
+    metrics: List[MetricSpec] = field(default_factory=list)
+    writers: List[str] = field(default_factory=lambda: ["csv_long"])
+    options: Dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class PipelineSpec:
+    """一次评测 = 流程模板（怎么算）+ 数据与时段（算什么）。
+
+    流程来自 ``pipeline/templates`` 里的具名模板（``--pipeline``）；数据来自配置
+    （``--config``）。两者正交，可以自由组合。
+    """
+
+    name: str
+    forecast: SourceSpec
+    observation: SourceSpec
+    #: 可选参考场（气候态等），供 ACC / 活跃度 / 功率谱等距平类指标使用
+    reference: Optional[SourceSpec] = None
+    description: str = ""
+    #: 流程模板名（注册在 pipeline/pipelines.py）
+    pipeline: str = ""
+    #: 解析后的流程模板；不显式给流程时由配置内联生成
+    template: Optional[PipelineTemplate] = None
+    start_date: Optional[str] = None
+    end_date: Optional[str] = None
+    limit: Optional[int] = None
+    output_dir: str = "evaluation_results"
+    #: 覆盖模板的输出视图（None 表示用模板的）
+    writers: Optional[List[str]] = None
+    log_level: str = "INFO"
+    #: 参与评测的变量：{"forecast": "tp", "observation": "precipitation"}
+    variables: Dict[str, str] = field(default_factory=dict)
+    #: 配置侧的协议参数覆盖（如观测是北京时 local_utc_offset_hours=8）
+    config_options: Dict[str, Any] = field(default_factory=dict)
+    #: 模板里变换参数的覆盖：{变换名: {参数: 值}}
+    transform_options: Dict[str, Dict[str, Any]] = field(default_factory=dict)
+    #: 模板里指标参数的覆盖：{指标名: {参数: 值}}
+    metric_options: Dict[str, Dict[str, Any]] = field(default_factory=dict)
+
+    @property
+    def protocol(self) -> str:
+        return self.template.protocol if self.template else "station_valid_time"
+
+    @property
+    def transforms(self) -> List[TransformSpec]:
+        if self.template is None:
+            return []
+        return [
+            TransformSpec(
+                name=item.name,
+                params={**item.params, **self.transform_options.get(item.name, {})},
+            )
+            for item in self.template.transforms
+        ]
+
+    @property
+    def metrics(self) -> List[MetricSpec]:
+        if self.template is None:
+            return []
+        return [
+            MetricSpec(
+                name=item.name,
+                params={**item.params, **self.metric_options.get(item.name, {})},
+            )
+            for item in self.template.metrics
+        ]
+
+    @property
+    def output_writers(self) -> List[str]:
+        if self.writers is not None:
+            return list(self.writers)
+        if self.template is not None:
+            return list(self.template.writers)
+        return ["csv_long"]
+
+    @property
+    def options(self) -> Dict[str, Any]:
+        """协议参数：模板默认口径 + 配置覆盖。"""
+        merged = dict(self.template.options) if self.template else {}
+        merged.update(self.config_options)
+        return merged
+
+    def use_pipeline(self, name: str) -> None:
+        """切换到具名流程模板（``--pipeline``）。"""
+        from xmetai_evaluation.pipeline.pipelines import get_template
+
+        self.pipeline = name
+        self.template = get_template(name)
+
+    def transform(self, name: str) -> Optional[TransformSpec]:
+        for item in self.transforms:
+            if item.name == name:
+                return item
+        return None
+
+    @property
+    def window_hours(self) -> int:
+        """时间窗口长度（小时）；优先取变换参数。"""
+        override = self.options.get("window_hours")
+        if override is not None:
+            return int(override)
+        item = self.transform("time_window_accumulator")
+        if item is not None:
+            return int(item.params.get("window_hours", 24))
+        return 24
+
+    @property
+    def local_utc_offset_hours(self) -> float:
+        """观测时刻相对 UTC 的偏移（北京时 = +8）。"""
+        return float(self.options.get("local_utc_offset_hours", 8.0))
+
+    def period(self) -> Tuple[datetime, datetime]:
+        """解析评测时间段。"""
+        if not self.start_date:
+            raise ValueError("评测配置必须提供 start_date")
+        start = _parse_date(self.start_date, "start_date")
+        end = _parse_date(self.end_date, "end_date") if self.end_date else start
+        return start, end
+
+    @classmethod
+    def from_config(cls, cfg: Any) -> "PipelineSpec":
+        """从 ``configs/*.py`` 的 ``EvalConfig`` 构造声明。
+
+        - 配置声明了 ``pipeline``：用该流程模板（推荐）；
+        - 否则：把配置里的 protocol/transforms/metrics 内联成一份临时模板（兼容旧配置）。
+        """
+        forecast_config = dict(cfg.forecast_reader)
+        observation_config = dict(cfg.observation_reader)
+        variables: Dict[str, str] = {}
+        for key, config in (("forecast", forecast_config), ("observation", observation_config)):
+            names = config.get("variables")
+            if names:
+                variables[key] = list(names)[0]
+            elif config.get("variable"):
+                variables[key] = config["variable"]
+
+        from xmetai_evaluation.pipeline.pipelines import get_template
+
+        pipeline_name = str(getattr(cfg, "pipeline", "") or "")
+        if not pipeline_name:
+            from xmetai_evaluation.pipeline.pipelines import list_pipelines
+
+            raise ConfigError(
+                f"配置 {cfg.name} 没有声明 pipeline（要走哪套流程）。"
+                f"可用流程: {', '.join(sorted(list_pipelines()))}"
+            )
+        template = get_template(pipeline_name)
+
+        return cls(
+            name=cfg.name,
+            description=cfg.description,
+            forecast=SourceSpec.from_config(forecast_config),
+            observation=SourceSpec.from_config(observation_config),
+            reference=(
+                SourceSpec.from_config(cfg.reference_reader)
+                if getattr(cfg, "reference_reader", None)
+                else None
+            ),
+            pipeline=pipeline_name,
+            template=template,
+            start_date=cfg.start_date,
+            end_date=cfg.end_date,
+            limit=cfg.limit,
+            output_dir=cfg.output_dir,
+            writers=(
+                list(cfg.writers) if getattr(cfg, "writers", None) is not None else None
+            ),
+            log_level=getattr(cfg, "log_level", "INFO"),
+            variables=variables,
+            config_options={},
+            transform_options=dict(getattr(cfg, "transform_options", None) or {}),
+            metric_options=dict(getattr(cfg, "metric_options", None) or {}),
+        )
+
+
+def _parse_date(value: str, field_name: str) -> datetime:
+    for fmt in ("%Y%m%d", "%Y%m%d%H", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d"):
+        try:
+            return datetime.strptime(str(value), fmt)
+        except ValueError:
+            continue
+    raise ValueError(f"无效的 {field_name}: {value}")
+
+
+def daily_times(start: datetime, end: datetime) -> List[datetime]:
+    """[start, end] 区间内逐日时刻列表。"""
+    times: List[datetime] = []
+    current = start
+    while current <= end:
+        times.append(current)
+        current += timedelta(days=1)
+    return times

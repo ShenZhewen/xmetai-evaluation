@@ -74,13 +74,17 @@ def regrid_to_target(
     )
 
 
-def compute_ensemble_mean(bundle: DataBundle, member_dim: str = "member") -> DataBundle:
+def compute_ensemble_mean(
+    bundle: DataBundle, member_dim: str = "member", skipna: bool = False
+) -> DataBundle:
     """
     计算集合均值
 
     Args:
         bundle: 包含集合成员的数据
         member_dim: 成员维度名（默认 'member'）
+        skipna: 是否跳过缺测成员。默认 False：任一成员缺测则整点缺测，
+            与参考实现 ``members.mean(axis=0)`` 的传播语义一致，避免"缺员还当有效"。
 
     Returns:
         集合均值 DataBundle（不含 member 维度）
@@ -92,7 +96,7 @@ def compute_ensemble_mean(bundle: DataBundle, member_dim: str = "member") -> Dat
         return bundle
 
     # 计算均值
-    mean_ds = ds.mean(dim=member_dim)
+    mean_ds = ds.mean(dim=member_dim, skipna=skipna)
 
     # 更新元数据
     new_semantic = bundle.semantic
@@ -112,6 +116,19 @@ def compute_ensemble_mean(bundle: DataBundle, member_dim: str = "member") -> Dat
         provenance=new_provenance,
         quality=bundle.quality,
     )
+
+
+class EnsembleMeanTransform:
+    """集合均值变换：输入和输出都是 DataBundle。
+
+    连续场评测在配对前先降到集合均值；确定性场原样返回。
+    """
+
+    def __init__(self, member_dim: str = "member"):
+        self.member_dim = member_dim
+
+    def transform(self, bundle: DataBundle) -> DataBundle:
+        return compute_ensemble_mean(bundle, member_dim=self.member_dim)
 
 
 def compute_latitude_weights(ds: xr.Dataset) -> xr.DataArray:

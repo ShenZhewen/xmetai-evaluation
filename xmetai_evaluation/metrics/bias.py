@@ -40,7 +40,6 @@ class Bias(Metric):
         return MetricRequirements(
             product_type=ProductType.DETERMINISTIC_FIELD,
             variables=["*"],  # 可用于任意变量
-            can_merge_along=["sample", "time", "init_time"],
         )
 
     def accumulate(self, batch: EvaluationBatch) -> MetricState:
@@ -57,12 +56,17 @@ class Bias(Metric):
         if isinstance(batch.forecast, xr.DataArray):
             forecast = batch.forecast
         else:
-            forecast = batch.forecast.payload
+            forecast = batch.forecast.payload if hasattr(batch.forecast, "payload") else batch.forecast
 
         if isinstance(batch.observation, xr.DataArray):
             observation = batch.observation
         else:
-            observation = batch.observation.payload
+            observation = batch.observation.payload if hasattr(batch.observation, "payload") else batch.observation
+
+        if isinstance(forecast, xr.Dataset):
+            forecast = forecast[list(forecast.data_vars)[0]]
+        if isinstance(observation, xr.Dataset):
+            observation = observation[list(observation.data_vars)[0]]
 
         # 计算误差
         error = forecast - observation
@@ -70,6 +74,11 @@ class Bias(Metric):
         # 应用掩码
         valid_mask = batch.valid_mask
         error_masked = error.where(valid_mask)
+
+        if isinstance(forecast, xr.Dataset):
+            forecast = forecast[list(forecast.data_vars)[0]]
+        if isinstance(observation, xr.Dataset):
+            observation = observation[list(observation.data_vars)[0]]
 
         # 计算误差和
         sum_error = float(error_masked.sum(skipna=True).values)
@@ -178,4 +187,5 @@ class Bias(Metric):
             n_valid=n_valid,
             weights_sum=weights_sum,
             aggregation="mean_over_samples",
+            product_kind=self.PRODUCT_KIND,
         )

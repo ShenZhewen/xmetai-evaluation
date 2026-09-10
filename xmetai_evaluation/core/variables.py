@@ -5,8 +5,6 @@
 """
 
 from enum import Enum
-from typing import Optional
-from dataclasses import dataclass
 
 
 class StandardVariable(Enum):
@@ -74,51 +72,3 @@ class DataKind(Enum):
     REFERENCE = "reference"  # 气候态、投影基底等
     DERIVED = "derived"  # 派生产品（如集合平均）
 
-
-@dataclass(frozen=True)
-class DimensionSpec:
-    """维度规范"""
-
-    name: str
-    description: str
-    required: bool = True
-
-
-# 标准维度定义（按照 README 第 4.1 节）
-STANDARD_DIMS = {
-    "init_time": DimensionSpec("init_time", "起报时间", required=False),
-    "valid_time": DimensionSpec("valid_time", "有效时间", required=False),
-    "lead_time": DimensionSpec("lead_time", "预报时效（小时）", required=False),
-    "member": DimensionSpec("member", "集合成员索引（0-based）", required=False),
-    "lat": DimensionSpec("lat", "纬度（N to S, degrees_north）", required=False),
-    "lon": DimensionSpec("lon", "经度（0-360 or -180-180, degrees_east）", required=False),
-    "station": DimensionSpec("station", "站点ID或索引", required=False),
-    "level": DimensionSpec("level", "垂直层次", required=False),
-    "threshold": DimensionSpec("threshold", "阈值", required=False),
-    "component": DimensionSpec("component", "向量分量或指数分量", required=False),
-    "wavenumber": DimensionSpec("wavenumber", "波数", required=False),
-    "sample": DimensionSpec("sample", "样本索引", required=False),
-}
-
-
-# CF标准单位示例（不完整，按需扩展）
-CF_UNITS = {
-    "temperature": ["K", "degC", "degree_Celsius"],
-    "precipitation": ["mm", "kg m-2", "m"],
-    "wind": ["m s-1", "m/s"],
-    "geopotential": ["m2 s-2", "m^2 s^-2"],
-    "geopotential_height": ["m"],
-    "pressure": ["Pa", "hPa", "mb"],
-    "radiation": ["W m-2", "J m-2"],
-}
-
-
-def validate_unit_compatible(value_unit: str, target_category: str) -> bool:
-    """
-    简单的单位兼容性检查
-
-    实际实现应使用 cf-units 或 pint 库
-    """
-    if target_category not in CF_UNITS:
-        return False
-    return value_unit in CF_UNITS[target_category]

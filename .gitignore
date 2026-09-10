@@ -20,3 +20,11 @@ dist/
 .DS_Store
 .idea/
 .vscode/
+# 参考实现（只读档案，不参与运行）
+ref/
+# 评测产物
+evaluation_results/
+reports/
+# 本地临时数据（开发用）
+tmp_data/
+*.idx

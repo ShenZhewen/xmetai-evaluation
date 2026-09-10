@@ -10,8 +10,16 @@ from datetime import datetime
 import numpy as np
 import xarray as xr
 
-from xmetai_evaluation.io.fengqing_reader import FengqingReader, FengqingCatalog
-from xmetai_evaluation.io.cra_reader import CRAReader, CRACatalog
+from functools import partial
+
+from xmetai_evaluation.io.gridded import GriddedCatalog, GriddedReader
+from xmetai_evaluation.io.layouts import CRA_LAYOUT, FENGQING_LAYOUT
+
+# 数据源 = 布局声明 + 通用 Reader（见 io/layouts.py）
+CRAReader = partial(GriddedReader, source_id="cra", layout=CRA_LAYOUT)
+CRACatalog = partial(GriddedCatalog, layout=CRA_LAYOUT)
+FengqingReader = partial(GriddedReader, source_id="fengqing", layout=FENGQING_LAYOUT)
+FengqingCatalog = partial(GriddedCatalog, layout=FENGQING_LAYOUT)
 from xmetai_evaluation.core.contracts import DataRequest
 from xmetai_evaluation.pipeline.matcher import Matcher
 from xmetai_evaluation.metrics.rmse import RMSE
@@ -229,34 +237,28 @@ class TestEndToEnd:
 
     @pytest.mark.skip(reason="Requires real data files")
     def test_full_evaluation_pipeline(self):
-        """测试完整评测流程"""
-        from xmetai_evaluation.pipeline.fdp_continuous import FDPContinuousEvaluator
+        """完整评测流程：流程模板（怎么算）+ 数据源（算什么）。"""
+        from xmetai_evaluation.pipeline.runner import Runner
+        from xmetai_evaluation.pipeline.spec import PipelineSpec, SourceSpec
 
-        config = {
-            "name": "test_z500",
-            "forecast": {
-                "reader": "fengqing",
-                "root": "test_data/fengqing",
-                "variables": ["z500"],
-                "init_times": ["2026-08-19T00:00:00"],
-                "lead_times": [24],
-            },
-            "observation": {
-                "reader": "cra",
-                "root": "test_data/cra",
-                "variables": ["z500"],
-            },
-            "metrics": [
-                {"name": "rmse", "params": {}},
-                {"name": "bias", "params": {}},
-            ],
-            "output": {
-                "path": "test_results/test_z500.json",
-            },
-        }
+        spec = PipelineSpec(
+            name="test_z500",
+            forecast=SourceSpec(
+                "fengqing",
+                {
+                    "root_dir": "test_data/fengqing",
+                    "variables": ["z500"],
+                    "init_times": ["2026-08-19T00:00:00"],
+                    "lead_times": [24],
+                },
+            ),
+            observation=SourceSpec(
+                "cra", {"root_dir": "test_data/cra", "variables": ["z500"]}
+            ),
+        )
+        spec.use_pipeline("fdp_field_scores")
 
-        evaluator = FDPContinuousEvaluator(config)
-        result_bundle = evaluator.run()
+        result_bundle = Runner(spec).run()
 
         assert len(result_bundle.results) > 0
         assert result_bundle.run_id == "test_z500"

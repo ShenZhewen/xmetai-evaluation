@@ -61,7 +61,3 @@ def configure_logging(
         file_handler.setFormatter(formatter)
         logger.addHandler(file_handler)
 
-
-def get_logger(name: str) -> logging.Logger:
-    """获取指定名称的 logger"""
-    return logging.getLogger(name)

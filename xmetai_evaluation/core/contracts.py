@@ -123,15 +123,21 @@ class EvaluationBatch:
 
     按照 README 第 13.1 节：Metric 不负责构造 EvaluationBatch。
     如果传入的数据没有 alignment 或 valid_mask，应在边界校验阶段失败。
+
+    sample_dim 是"配对样本单位"维度：格点评测用 lat/lon（或展平后的 sample），
+    站点评测用 station，台风路径评测用 storm。指标据此判断可以沿哪些维度聚合。
     """
 
     forecast: Union[DataBundle, xr.DataArray]  # 预报 DataBundle 或标准 DataArray
     observation: Union[DataBundle, xr.DataArray]  # 观测 DataBundle 或标准 DataArray
     sample_keys: List[Dict[str, Any]]  # 每个样本的稳定标识
     valid_mask: xr.DataArray  # 预报、观测和参考共同有效掩码
+    members: Optional[xr.DataArray] = None  # 集合成员（概率指标用）；确定性场景为 None
     reference: Optional[Union[DataBundle, xr.DataArray]] = None  # 气候态/概率/投影基底等
     weights: Optional[xr.DataArray] = None  # 空间/站点/样本权重
+    sample_dim: str = "sample"  # 样本单位维度：sample / station / storm / time
     alignment: Optional[Dict[str, Any]] = None  # 时间、空间、变量和单位对齐记录
+    protocol_id: Optional[str] = None  # 验证协议标识
 
     def __post_init__(self):
         """基础校验"""
@@ -175,6 +181,8 @@ class MetricResult:
     protocol_id: Optional[str] = None  # 验证协议ID
     provenance: Optional[Dict[str, Any]] = None  # 数据和参考来源
     warnings: List[str] = field(default_factory=list)  # 非致命问题列表
+    unit: Optional[str] = None  # 结果单位（无量纲指标写 "1"）
+    product_kind: Optional[str] = None  # 产品类型：deterministic/categorical/probabilistic/ensemble/index
 
     def __post_init__(self):
         """基础校验"""

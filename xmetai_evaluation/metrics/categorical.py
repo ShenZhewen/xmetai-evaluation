@@ -57,6 +57,8 @@ class TSScore(Metric):
     支持多个阈值同时计算。
     """
 
+    PRODUCT_KIND = "categorical"
+
     def __init__(self, thresholds: List[Tuple[str, float]], params: Dict[str, Any] = None):
         """
         Args:
@@ -72,7 +74,6 @@ class TSScore(Metric):
         return MetricRequirements(
             product_type=ProductType.DETERMINISTIC_FIELD,
             variables=["*"],
-            can_merge_along=["sample", "time", "init_time", "station"],
         )
 
     def accumulate(self, batch: EvaluationBatch) -> MetricState:
@@ -253,4 +254,6 @@ class TSScore(Metric):
             n_requested=total_n_valid,
             n_valid=total_n_valid,
             aggregation="contingency_table",
+            unit="1",
+            product_kind=self.PRODUCT_KIND,
         )

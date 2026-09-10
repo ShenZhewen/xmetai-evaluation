@@ -103,7 +103,6 @@ class TestMetricBase:
 
         assert reqs.product_type == ProductType.DETERMINISTIC_FIELD
         assert "*" in reqs.variables
-        assert "sample" in reqs.can_merge_along
 
     def test_rmse_compute_simple(self):
         """测试 RMSE 简单计算"""

@@ -232,3 +232,36 @@ class TestTSScore:
 
         assert result.status == ResultStatus.NO_VALID_DATA
         assert result.value["≥10"]["n_pairs"] == 0
+
+
+class TestEnsembleGuard:
+    """确定性指标不允许直接消费未降维的集合。"""
+
+    def _batch_with_members(self):
+        forecast = xr.DataArray(
+            np.array([[0.0, 5.0], [1.0, 6.0]]), dims=["member", "station"]
+        )
+        observation = xr.DataArray(np.array([1.0, 1.0]), dims=["station"])
+        valid_mask = xr.DataArray(
+            np.ones((2, 2), dtype=bool), dims=["member", "station"]
+        )
+        return EvaluationBatch(
+            forecast=forecast,
+            observation=observation,
+            sample_keys=[{"id": 0}, {"id": 1}],
+            valid_mask=valid_mask,
+            alignment={"method": "direct"},
+        )
+
+    def test_member_dimension_is_rejected(self):
+        from xmetai_evaluation.core.errors import MetricError
+
+        metric = TSScore(thresholds=[("≥0.1", 0.1)])
+        with pytest.raises(MetricError, match="ensemble_mean"):
+            metric.validate(self._batch_with_members())
+
+    def test_single_member_dimension_is_allowed(self):
+        batch = self._batch_with_members()
+        batch.forecast = batch.forecast.isel(member=[0])
+        batch.valid_mask = batch.valid_mask.isel(member=[0])
+        TSScore(thresholds=[("≥0.1", 0.1)]).validate(batch)  # 不抛异常

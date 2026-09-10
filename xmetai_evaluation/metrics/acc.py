@@ -43,8 +43,6 @@ class ACC(Metric):
         return MetricRequirements(
             product_type=ProductType.DETERMINISTIC_FIELD,
             variables=["*"],
-            reference_data=["climatology"],  # 需要气候态
-            can_merge_along=["sample", "time", "init_time"],
         )
 
     def accumulate(self, batch: EvaluationBatch) -> MetricState:
@@ -61,13 +59,17 @@ class ACC(Metric):
         if isinstance(batch.forecast, xr.DataArray):
             forecast = batch.forecast
         else:
-            forecast = batch.forecast.payload
+            forecast = batch.forecast.payload if hasattr(batch.forecast, "payload") else batch.forecast
 
         if isinstance(batch.observation, xr.DataArray):
             observation = batch.observation
         else:
-            observation = batch.observation.payload
+            observation = batch.observation.payload if hasattr(batch.observation, "payload") else batch.observation
 
+        if isinstance(forecast, xr.Dataset):
+            forecast = forecast[list(forecast.data_vars)[0]]
+        if isinstance(observation, xr.Dataset):
+            observation = observation[list(observation.data_vars)[0]]
         # 获取气候态
         if batch.reference is None:
             # 如果没有气候态，使用零场（临时方案）
@@ -77,7 +79,7 @@ class ACC(Metric):
             if isinstance(batch.reference, xr.DataArray):
                 climatology = batch.reference
             else:
-                climatology = batch.reference.payload
+                climatology = batch.reference.payload if hasattr(batch.reference, "payload") else batch.reference
             has_climatology = True
 
         # 计算距平
@@ -103,6 +105,15 @@ class ACC(Metric):
             .values
         )
 
+        # sum(w * f_anom) / sum(w * o_anom)：用于在 finalize 里做加权去均值
+        # （参考实现的 ACC 是"距平再减域加权均值"的相关系数，未去均值会偏大）
+        sum_weighted_forecast = float(
+            (weights_masked * forecast_anomaly_masked).sum(skipna=True).values
+        )
+        sum_weighted_observation = float(
+            (weights_masked * observation_anomaly_masked).sum(skipna=True).values
+        )
+
         # sum(w * f_anom^2)
         sum_weighted_forecast_sq = float(
             (weights_masked * forecast_anomaly_masked**2).sum(skipna=True).values
@@ -124,6 +135,8 @@ class ACC(Metric):
             metric_version=self.version,
             data={
                 "sum_weighted_product": sum_weighted_product,
+                "sum_weighted_forecast": sum_weighted_forecast,
+                "sum_weighted_observation": sum_weighted_observation,
                 "sum_weighted_forecast_sq": sum_weighted_forecast_sq,
                 "sum_weighted_obs_sq": sum_weighted_obs_sq,
                 "weights_sum": weights_sum,
@@ -162,6 +175,10 @@ class ACC(Metric):
 
         # 合并统计量
         total_sum_weighted_product = sum(s.data["sum_weighted_product"] for s in states)
+        total_sum_weighted_forecast = sum(s.data["sum_weighted_forecast"] for s in states)
+        total_sum_weighted_observation = sum(
+            s.data["sum_weighted_observation"] for s in states
+        )
         total_sum_weighted_forecast_sq = sum(s.data["sum_weighted_forecast_sq"] for s in states)
         total_sum_weighted_obs_sq = sum(s.data["sum_weighted_obs_sq"] for s in states)
         total_weights_sum = sum(s.data["weights_sum"] for s in states)
@@ -174,6 +191,8 @@ class ACC(Metric):
             metric_version=self.version,
             data={
                 "sum_weighted_product": total_sum_weighted_product,
+                "sum_weighted_forecast": total_sum_weighted_forecast,
+                "sum_weighted_observation": total_sum_weighted_observation,
                 "sum_weighted_forecast_sq": total_sum_weighted_forecast_sq,
                 "sum_weighted_obs_sq": total_sum_weighted_obs_sq,
                 "weights_sum": total_weights_sum,
@@ -212,11 +231,21 @@ class ACC(Metric):
                 warnings=warnings + ["No valid data points"],
             )
 
-        # 计算 ACC = sum(w * f * o) / sqrt(sum(w * f^2) * sum(w * o^2))
-        numerator = state.data["sum_weighted_product"]
-        denominator = np.sqrt(
-            state.data["sum_weighted_forecast_sq"] * state.data["sum_weighted_obs_sq"]
+        # 加权去均值后的距平相关（与参考实现一致）：
+        #   ACC = Σw(f-mf)(o-mo) / sqrt(Σw(f-mf)² · Σw(o-mo)²)
+        # 展开为可合并统计量，mf/mo 为距平场的域加权均值。
+        total_weight = weights_sum
+        sum_product = state.data["sum_weighted_product"]
+        sum_forecast = state.data["sum_weighted_forecast"]
+        sum_observation = state.data["sum_weighted_observation"]
+        numerator = sum_product - sum_forecast * sum_observation / total_weight
+        forecast_variance = (
+            state.data["sum_weighted_forecast_sq"] - sum_forecast**2 / total_weight
         )
+        observation_variance = (
+            state.data["sum_weighted_obs_sq"] - sum_observation**2 / total_weight
+        )
+        denominator = np.sqrt(forecast_variance * observation_variance)
 
         # 处理零方差
         if denominator == 0 or np.isnan(denominator):
@@ -242,4 +271,6 @@ class ACC(Metric):
             weights_sum=weights_sum,
             aggregation="spatial_correlation",
             warnings=warnings,
+            unit="1",
+            product_kind=self.PRODUCT_KIND,
         )

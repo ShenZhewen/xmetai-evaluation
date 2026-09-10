@@ -23,12 +23,8 @@ class EvalConfig:
     # 数据源
     forecast_reader: Dict[str, Any]  # 预报数据读取器配置
     observation_reader: Dict[str, Any]  # 观测数据读取器配置
-
-    # 变换链
-    transforms: List[Dict[str, Any]] = field(default_factory=list)
-
-    # 指标计算
-    metrics: List[Dict[str, Any]] = field(default_factory=list)
+    # 可选参考场（气候态等）：ACC / 活跃度 / 功率谱等距平类指标需要
+    reference_reader: Optional[Dict[str, Any]] = None
 
     # 时间范围
     start_date: Optional[str] = None  # YYYYMMDD or YYYYMMDDHH
@@ -37,7 +33,22 @@ class EvalConfig:
 
     # 输出
     output_dir: str = "evaluation_results"  # 输出目录
-    output_format: str = "csv"  # 输出格式（csv, json, netcdf）
+
+    # 结果输出视图：统一长表（csv_long）始终写出；
+    # None = 用流程模板的视图，显式给列表则覆盖模板
+    writers: Optional[List[str]] = None
+
+    # 流程名（pipeline/pipelines.py 里的模板）；给了就用它的协议/变换/指标
+    pipeline: str = ""
+
+    # 协议口径覆盖（如观测为北京时：local_utc_offset_hours=8）
+    options: Dict[str, Any] = field(default_factory=dict)
+
+    # 流程模板里"变换参数"的覆盖：{"time_window_accumulator": {"window_hours": 6}}
+    transform_options: Dict[str, Dict[str, Any]] = field(default_factory=dict)
+
+    # 流程模板里"指标参数"的覆盖：{"ts_score": {"thresholds": [0.1, 10, 25]}}
+    metric_options: Dict[str, Dict[str, Any]] = field(default_factory=dict)
 
     # 运行配置
     log_level: str = "INFO"  # 日志级别

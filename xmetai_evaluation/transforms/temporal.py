@@ -6,7 +6,58 @@
 
 import numpy as np
 import xarray as xr
+import pandas as pd
+import warnings
+from datetime import datetime, timedelta
 from typing import Literal
+
+
+def window_sum_at(
+    dataset: xr.Dataset,
+    variable: str,
+    end_time: datetime,
+    window_hours: int,
+    time_dim: str = "time",
+    require_complete: bool = True,
+) -> xr.DataArray:
+    """取闭合窗口 [end_time - window_hours + 1h, end_time] 内的累计量。
+
+    用于把逐时实况聚合到预报窗口（如 24h 累积降水），保证预报与观测口径一致。
+    窗口缺任一时次即整样本剔除；0 是有效记录，不参与缺测判定。
+
+    Args:
+        dataset: 含时间维的观测数据。
+        variable: 需要累计的变量名。
+        end_time: 窗口结束时刻。
+        window_hours: 窗口长度（小时）。
+        time_dim: 时间维度名。
+        require_complete: True 时缺任一时次即整样本剔除；
+            False 时缺测按 0 参与累计，但只保留窗口末端时次存在的样本
+            （与参考实现 ``read_rain_obs`` 的 fillna(0) 口径一致）。
+
+    Returns:
+        窗口累计值，缺失窗口为 NaN。
+
+    Raises:
+        ValueError: 观测缺少窗口内的任一时次。
+    """
+    expected = [end_time - timedelta(hours=i) for i in range(window_hours - 1, -1, -1)]
+    available = pd.DatetimeIndex(dataset[time_dim].values)
+    positions = available.get_indexer(np.asarray(expected, dtype="datetime64[ns]"))
+    if np.any(positions < 0):
+        missing = [str(expected[i]) for i, position in enumerate(positions) if position < 0]
+        raise ValueError(f"观测窗口不完整，缺少 {len(missing)} 个时次（如 {missing[:3]}）")
+
+    values = dataset[variable].isel({time_dim: positions})
+    complete = np.isfinite(values).all(dim=time_dim)
+    if require_complete:
+        return values.sum(dim=time_dim, skipna=False).where(complete)
+    present = np.isfinite(values.isel({time_dim: -1}))
+    # 与参考实现同序累加（从有效时刻往前）：浮点求和顺序会影响恰好落在阈值上的站点，
+    # 参考口径下必须同序才能逐位一致。
+    ordered = values.isel({time_dim: slice(None, None, -1)})
+    warnings.warn("观测窗口按缺测计 0 累计（参考实现口径），请确认与评测协议一致")
+    return ordered.sum(dim=time_dim, skipna=True).where(present)
 
 
 class TimeWindowAccumulator:

@@ -10,19 +10,19 @@
 
 import pytest
 from pathlib import Path
+import pandas as pd
 import xarray as xr
 import numpy as np
 from datetime import datetime
 
 from xmetai_evaluation.io.netcdf_reader import SimpleNetCDFReader
 from xmetai_evaluation.metrics.rmse import RMSE
-from xmetai_evaluation.pipeline.executor import PipelineExecutor
 from xmetai_evaluation.core.contracts import (
     DataRequest,
     EvaluationBatch,
     DataKind,
 )
-from xmetai_evaluation.core.registry import Registry
+from xmetai_evaluation.results import SCORE_COLUMNS, ResultStore, RunContext
 
 
 @pytest.fixture
@@ -305,93 +305,76 @@ class TestEndToEndDeterministicRMSE:
         assert result_full.n_valid == result_chunked.n_valid
 
 
-class TestEndToEndProtocolExecution:
-    """测试通过 Pipeline 执行完整协议"""
+class TestEndToEndResultsTable:
+    """测试"指标结果 -> 统一长表 -> 标准产物"的完整输出链路"""
 
-    def test_simple_protocol_execution(self, tmp_path, synthetic_forecast_obs_pair):
-        """
-        测试简单协议执行
-
-        Change 6 范围：不实现真实的数据读取步骤，只测试 Pipeline 能正确编排。
-        """
-        registry = Registry()
-
-        # 创建 Pipeline
-        executor = PipelineExecutor(
-            registry=registry,
-            cache_dir=tmp_path / "cache",
-            output_dir=tmp_path / "outputs",
+    def test_results_are_written_as_canonical_long_table(self, tmp_path, synthetic_forecast_obs_pair):
+        """任意评测的结果都应落成同一种长表"""
+        fcst_reader = SimpleNetCDFReader.with_root_dir(
+            root_dir=synthetic_forecast_obs_pair["forecast_dir"],
+            source_id="synthetic_forecast",
+        )
+        obs_reader = SimpleNetCDFReader.with_root_dir(
+            root_dir=synthetic_forecast_obs_pair["observation_dir"],
+            source_id="synthetic_obs",
         )
 
-        # 定义协议（模拟）
-        protocol = {
-            "protocol_id": "deterministic_rmse_test",
-            "steps": [
-                {
-                    "id": "read_forecast",
-                    "type": "read",
-                    "params": {
-                        "source": "synthetic_forecast",
-                        "variables": ["t2m"],
-                    },
-                },
-                {
-                    "id": "read_observation",
-                    "type": "read",
-                    "params": {
-                        "source": "synthetic_obs",
-                        "variables": ["t2m"],
-                    },
-                },
-                {
-                    "id": "compute_rmse",
-                    "type": "metric",
-                    "params": {
-                        "metric": "rmse",
-                        "variable": "t2m",
-                    },
-                },
-            ],
-        }
+        fcst_request = DataRequest(source_id="synthetic_forecast", variables=["t2m"])
+        obs_request = DataRequest(source_id="synthetic_obs", variables=["t2m"])
+        fcst_bundle = fcst_reader.load(fcst_request)
+        obs_bundle = obs_reader.load(obs_request)
 
-        # 执行
-        result = executor.execute(protocol, enable_cache=True)
-
-        # 验证执行成功
-        assert result.state.value == "succeeded"
-        assert len(result.steps) == 3
-        assert result.steps["read_forecast"].status.value == "completed"
-        assert result.steps["read_observation"].status.value == "completed"
-        assert result.steps["compute_rmse"].status.value == "completed"
-
-        # 验证缓存
-        assert result.steps["read_forecast"].fingerprint is not None
-
-        # 验证输出目录
-        output_dir = tmp_path / "outputs" / "deterministic_rmse_test"
-        assert output_dir.exists()
-
-    def test_protocol_with_cache_hit(self, tmp_path, synthetic_forecast_obs_pair):
-        """测试协议缓存命中"""
-        registry = Registry()
-        executor = PipelineExecutor(
-            registry=registry,
-            cache_dir=tmp_path / "cache",
-            output_dir=tmp_path / "outputs",
+        fcst_array = fcst_bundle.payload["t2m"]
+        obs_array = obs_bundle.payload["t2m"]
+        valid_mask = xr.DataArray(
+            np.ones_like(fcst_array.values, dtype=bool),
+            dims=fcst_array.dims,
+            coords=fcst_array.coords,
         )
 
-        protocol = {
-            "protocol_id": "cache_test",
-            "steps": [
-                {"id": "step1", "type": "read", "params": {"var": "t2m"}},
-            ],
-        }
+        batch = EvaluationBatch(
+            forecast=fcst_array,
+            observation=obs_array,
+            sample_keys=[{"sample_id": index} for index in range(fcst_array.shape[0])],
+            valid_mask=valid_mask,
+            sample_dim="grid",
+            alignment={"method": "direct"},
+            protocol_id="grid_valid_time",
+        )
 
-        # 第一次执行
-        result1 = executor.execute(protocol, enable_cache=True)
-        assert result1.steps["step1"].cache_hit is False
+        result = RMSE().compute(batch)
+        result.coordinates = {"variable": "t2m", "lead_h": 24, "sample_unit": "grid"}
+        result.product_kind = result.product_kind or "deterministic"
 
-        # 第二次执行（应该命中缓存）
-        result2 = executor.execute(protocol, enable_cache=True)
-        assert result2.steps["step1"].cache_hit is True
-        assert result2.steps["step1"].status.value == "cached"
+        output_dir = tmp_path / "results"
+        store = ResultStore(
+            output_dir,
+            RunContext(
+                run_id="synthetic_rmse",
+                model_id="synthetic_forecast",
+                dataset_id="synthetic_obs",
+                protocol_id="grid_valid_time",
+            ),
+        )
+        artifacts = store.write(
+            [result],
+            resolved_config={"schema_version": 1},
+            writers=("csv_long", "json", "coverage"),
+        )
+
+        scores = pd.read_csv(artifacts["scores"])
+        assert list(scores.columns) == SCORE_COLUMNS
+        assert scores.loc[0, "metric"] == "rmse"
+        assert scores.loc[0, "variable"] == "t2m"
+        assert scores.loc[0, "lead_h"] == 24
+        assert scores.loc[0, "model_id"] == "synthetic_forecast"
+        assert scores.loc[0, "dataset_id"] == "synthetic_obs"
+        assert scores.loc[0, "protocol_id"] == "grid_valid_time"
+        assert scores.loc[0, "status"] == "success"
+        assert scores.loc[0, "value"] == pytest.approx(result.value)
+
+        # 标准产物齐备
+        assert artifacts["coverage"].exists()
+        assert artifacts["manifest"].exists()
+        assert artifacts["json"].exists()
+        assert (output_dir / "coverage.csv").exists()

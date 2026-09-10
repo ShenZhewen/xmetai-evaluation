@@ -246,20 +246,3 @@ class TestSimpleNetCDFReader:
 
         with pytest.raises(DecodeError, match="Failed to read NetCDF"):
             reader.read(request, index)
-
-
-class TestReaderBase:
-    """测试 Reader 基类"""
-
-    def test_reader_base_load_not_implemented(self):
-        """测试基类 load 方法未实现"""
-        # 创建一个最小的 Reader 子类
-        class MinimalReader(Reader):
-            def read(self, request, index):
-                pass
-
-        reader = MinimalReader(source_id="test", version="1.0.0")
-        request = DataRequest(source_id="test", variables=["var"])
-
-        with pytest.raises(NotImplementedError, match="does not implement load"):
-            reader.load(request)

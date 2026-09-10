@@ -52,6 +52,10 @@ class DiamondStationCatalog(DataCatalog):
         self.station_dir = Path(station_dir)
         self.station_whitelist = set(station_whitelist) if station_whitelist else None
 
+    def file_time(self, path) -> datetime:
+        """文件对应的观测时刻（供调用方按时间窗口筛选文件）。"""
+        return parse_station_file_time(path)
+
     def discover(self, request: DataRequest) -> DataIndex:
         """
         发现指定时间范围的站点文件
@@ -123,8 +127,18 @@ class DiamondStationReader(Reader):
     data_vars: precipitation (mm)
     """
 
-    def __init__(self, source_id: str = "diamond_station", version: str = "1.0.0"):
+    def __init__(
+        self,
+        source_id: str = "diamond_station",
+        version: str = "1.0.0",
+        station_whitelist: Optional[List[int]] = None,
+    ):
         super().__init__(source_id=source_id, version=version)
+        self.station_whitelist = (
+            set(int(station_id) for station_id in station_whitelist)
+            if station_whitelist
+            else None
+        )
 
     def read(self, request: DataRequest, index: DataIndex) -> DataBundle:
         """
@@ -176,12 +190,15 @@ class DiamondStationReader(Reader):
 
         n_times = len(parsed)
         n_stations = len(station_index)
-        precip_data = np.full((n_times, n_stations), np.nan, dtype="f4")
-        lat_data = np.full(n_stations, np.nan, dtype="f4")
-        lon_data = np.full(n_stations, np.nan, dtype="f4")
-        alt_data = np.full(n_stations, np.nan, dtype="f4")
+        # 用 float64：站点降水量在阈值附近需要与参考实现同等精度
+        # （float32 会让个别站点在 4mm 之类的阈值上翻转，进而影响 BSS/AROC）
+        precip_data = np.full((n_times, n_stations), np.nan, dtype="f8")
+        lat_data = np.full(n_stations, np.nan, dtype="f8")
+        lon_data = np.full(n_stations, np.nan, dtype="f8")
+        alt_data = np.full(n_stations, np.nan, dtype="f8")
         station_map = {int(sid): i for i, sid in enumerate(station_index)}
 
+        filled = np.zeros(n_stations, dtype=bool)
         for time_idx, item in enumerate(parsed):
             source_positions = np.asarray(
                 [i for i, sid in enumerate(item["station_id"]) if int(sid) in station_map],
@@ -192,10 +209,16 @@ class DiamondStationReader(Reader):
                 dtype="i8",
             )
             precip_data[time_idx, positions] = item["precipitation"][source_positions]
-            if time_idx == 0:
-                lat_data[positions] = item["lat"][source_positions]
-                lon_data[positions] = item["lon"][source_positions]
-                alt_data[positions] = item["altitude"][source_positions]
+            # 站点元数据取"首次出现的时次"，而不是只看第一个时次：
+            # 否则晚出现（或首时次缺报）的站点经纬度会是 NaN，被区域筛选误剔除。
+            pending = ~filled[positions]
+            if pending.any():
+                source_keep = source_positions[pending]
+                targets = positions[pending]
+                lat_data[targets] = item["lat"][source_keep]
+                lon_data[targets] = item["lon"][source_keep]
+                alt_data[targets] = item["altitude"][source_keep]
+                filled[targets] = True
 
         # 统一按时间排序；Catalog 通常已经排序，但不能依赖文件系统顺序。
         order = np.argsort(np.asarray(time_index))
@@ -278,16 +301,20 @@ class DiamondStationReader(Reader):
                 raise ValueError("数据列不足 5 列")
             if rows.shape[0] == 0:
                 return None
+            if self.station_whitelist is not None:
+                rows = rows[np.isin(rows[:, 0].astype("i8"), list(self.station_whitelist))]
+                if rows.shape[0] == 0:
+                    return None
             order = np.argsort(rows[:, 0].astype("i8"))
             rows = rows[order]
             return {
                 "path": fpath,
                 "time": obs_time,
                 "station_id": rows[:, 0].astype("i8"),
-                "lon": rows[:, 1].astype("f4"),
-                "lat": rows[:, 2].astype("f4"),
-                "altitude": rows[:, 3].astype("f4"),
-                "precipitation": rows[:, 4].astype("f4"),
+                "lon": rows[:, 1].astype("f8"),
+                "lat": rows[:, 2].astype("f8"),
+                "altitude": rows[:, 3].astype("f8"),
+                "precipitation": rows[:, 4].astype("f8"),
             }
 
         except Exception as e:
@@ -308,9 +335,50 @@ class DiamondStationReader(Reader):
         Returns:
             (reader, catalog) tuple
         """
-        reader = cls(source_id=source_id)
+        reader = cls(
+            source_id=source_id,
+            station_whitelist=station_whitelist,
+        )
         catalog = DiamondStationCatalog(
             station_dir=station_dir,
             station_whitelist=station_whitelist,
         )
         return reader, catalog
+
+
+def parse_station_file_time(path: Path) -> datetime:
+    """解析 Diamond 站点文件的观测时刻。
+
+    支持两种命名：``station_dir/YYYYMMDDHH.000`` 与 ``station_dir/YYYYMMDD/HH.000``。
+    """
+    path = Path(path)
+    name = path.stem
+    if len(name) == 10 and name.isdigit():
+        return datetime.strptime(name, "%Y%m%d%H")
+    if len(name) == 2 and name.isdigit() and path.parent.name.isdigit():
+        return datetime.strptime(path.parent.name + name, "%Y%m%d%H")
+    raise ValueError(f"无法解析观测文件时间: {path}")
+
+
+def load_station_whitelist(value: Optional[Any]) -> Optional[List[int]]:
+    """读取站点白名单；配置可直接给站号列表或清单文件路径。"""
+    if value is None:
+        return None
+    if isinstance(value, (list, tuple, set)):
+        return [int(station_id) for station_id in value]
+    path = Path(value)
+    if not path.exists():
+        raise ValueError(f"站点白名单文件不存在: {path}")
+    station_ids = set()
+    with path.open(encoding="utf-8") as stream:
+        for line in stream:
+            fields = line.split()
+            if not fields:
+                continue
+            try:
+                station_ids.add(int(float(fields[0])))
+            except (TypeError, ValueError):
+                continue
+    if not station_ids:
+        raise ValueError(f"站点白名单为空或格式无效: {path}")
+    return sorted(station_ids)
