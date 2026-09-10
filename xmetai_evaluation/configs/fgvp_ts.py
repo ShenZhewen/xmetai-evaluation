@@ -57,7 +57,7 @@ cfg = EvalConfig(
 
     # 时间范围（可通过命令行覆盖）
     start_date="20250101",
-    end_date="20250131",
+    end_date="20251231",
     limit=None,  # 设为 5 可只处理前 5 个初始化时间（调试用）
 
     # 输出配置
