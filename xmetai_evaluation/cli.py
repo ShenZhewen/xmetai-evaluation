@@ -16,6 +16,7 @@ from typing import Any, Dict, List, Tuple
 import numpy as np
 import pandas as pd
 import xarray as xr
+from tqdm import tqdm
 
 from xmetai_evaluation.configs.base import load_config
 from xmetai_evaluation.core.contracts import DataIndex, DataRequest, EvaluationBatch
@@ -208,6 +209,7 @@ def run_evaluation(cfg) -> int:
     source_obs = observation_cfg.get("source_id", "diamond_station")
 
     # 一次读取全部所需预报，避免每个起报重复打开文件。
+    log.info("正在读取预报数据...")
     t0 = perf_counter()
     forecast_request = _make_request(source_fcst, forecast_var, init_times)
     forecast_index = forecast_catalog.discover(forecast_request)
@@ -225,6 +227,7 @@ def run_evaluation(cfg) -> int:
     obs_start = min(init_times) + timedelta(hours=8) + timedelta(hours=1 - window_hours)
     obs_end = max(init_times) + timedelta(hours=8 + lead_max)
     obs_files = []
+    log.info("正在扫描观测文件...")
     t0 = perf_counter()
     obs_request = _make_request(source_obs, obs_var)
     obs_index_all = observation_catalog.discover(obs_request)
@@ -237,6 +240,7 @@ def run_evaluation(cfg) -> int:
     if not obs_files:
         raise ValueError("没有找到评估所需的观测文件")
     observation_index = DataIndex(source_id=source_obs, available=obs_files)
+    log.info("正在读取观测数据...")
     observation_bundle = observation_reader.read(obs_request, observation_index)
     observation_ds = observation_bundle.payload
     log.info("观测读取完成: %s，耗时 %.2fs", observation_ds.sizes, perf_counter() - t0)
@@ -261,8 +265,19 @@ def run_evaluation(cfg) -> int:
     window_leads = None
     processed = 0
     skipped = 0
-    for init_idx, init_time in enumerate(init_times):
-        log.info("[%d/%d] 处理起报 %s", init_idx + 1, len(init_times), init_time)
+
+    # 添加进度条
+    pbar = tqdm(
+        enumerate(init_times),
+        total=len(init_times),
+        desc="评估进度",
+        unit="起报",
+        ncols=100,
+        bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]"
+    )
+
+    for init_idx, init_time in pbar:
+        pbar.set_description(f"处理 {init_time.strftime('%Y-%m-%d')}")
         forecast_init = forecast_ds[forecast_var].isel(init_time=init_idx)
         forecast_windows = forecast_accumulator.transform(forecast_init)
         if window_leads is None:
@@ -290,7 +305,6 @@ def run_evaluation(cfg) -> int:
                 n_valid = int(valid_mask.sum())
                 if n_valid == 0:
                     skipped += 1
-                    log.warning("  lead=%sh 无有效站点，跳过", lead)
                     continue
                 batch = EvaluationBatch(
                     forecast=forecast_at_station,
@@ -308,10 +322,11 @@ def run_evaluation(cfg) -> int:
                     metric.validate(batch)
                     states[metric_idx].setdefault(int(lead), []).append(metric.accumulate(batch))
                 processed += 1
-                log.info("  lead=%sh 完成，有效站点=%d", lead, n_valid)
             except Exception as exc:
                 skipped += 1
-                log.exception("  lead=%sh 失败: %s", lead, exc)
+                log.debug("  lead=%sh 失败: %s", lead, exc)
+
+    pbar.close()
 
     if processed == 0:
         log.error("没有成功处理任何评测批次")

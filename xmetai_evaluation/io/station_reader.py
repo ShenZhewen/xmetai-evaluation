@@ -21,6 +21,7 @@ import re
 import xarray as xr
 import numpy as np
 import pandas as pd
+from tqdm import tqdm
 
 from xmetai_evaluation.io.base import Reader, DataCatalog
 from xmetai_evaluation.core.contracts import (
@@ -142,15 +143,17 @@ class DiamondStationReader(Reader):
         # 使用参考实现同样的 NumPy 路径组装二维站点数组。
         # 不把所有时次拼成超大 DataFrame，也不使用 pandas Python engine。
         parsed = []
-        for file_no, fpath in enumerate(index.available, 1):
+        pbar = tqdm(
+            index.available,
+            desc="解析站点文件",
+            unit="文件",
+            ncols=100,
+        )
+        for fpath in pbar:
             try:
                 item = self._parse_diamond_file(fpath)
                 if item is not None:
                     parsed.append(item)
-                if file_no == 1 or file_no % 24 == 0 or file_no == len(index.available):
-                    import logging
-                    logging.getLogger(__name__).info(
-                        "站点文件解析进度: %d/%d", file_no, len(index.available))
             except Exception as exc:
                 raise DecodeError(
                     f"Failed to parse station file {fpath}: {exc}",
@@ -158,6 +161,7 @@ class DiamondStationReader(Reader):
                     path=str(fpath),
                     cause=exc,
                 ) from exc
+        pbar.close()
 
         if not parsed:
             raise DecodeError("No valid station data parsed", source_id=request.source_id)
