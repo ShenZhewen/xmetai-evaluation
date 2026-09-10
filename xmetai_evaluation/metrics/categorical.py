@@ -29,8 +29,8 @@ class ContingencyTable:
 
     @property
     def n_total(self) -> int:
-        """总样本数"""
-        return self.hits + self.misses + self.false_alarms + self.correct_negatives
+        """有效配对数（不含 correct_negatives，符合气象业务规范）"""
+        return self.hits + self.misses + self.false_alarms
 
     def to_dict(self) -> Dict[str, int]:
         """转为字典"""

@@ -24,7 +24,8 @@ class TestContingencyTable:
             correct_negatives=82,
         )
 
-        assert table.n_total == 100
+        # n_total 不含 correct_negatives（符合气象业务规范）
+        assert table.n_total == 18  # hits + misses + false_alarms
         assert table.to_dict()["hits"] == 10
 
 
@@ -172,9 +173,11 @@ class TestTSScore:
         ts_metric = TSScore(thresholds=[("≥10", 10.0)])
         result = ts_metric.compute(batch)
 
-        # 只有 4 个有效点（第 3 个被掩码）
+        # 只有 4 个有效点（第 3 个被掩码），但 n_pairs 不含 correct_negatives
+        # hits=3, misses=0, false_alarms=0, correct_negatives=1
+        # n_pairs = 3（不含 CN）
         metrics = result.value["≥10"]
-        assert metrics["n_pairs"] == 4
+        assert metrics["n_pairs"] == 3
 
     def test_ts_merge_states(self):
         """测试状态合并"""
@@ -212,8 +215,11 @@ class TestTSScore:
         merged_state = ts_metric.merge([state1, state2])
         merged_result = ts_metric.finalize(merged_state)
 
-        # 验证合并结果
-        assert merged_result.value["≥10"]["n_pairs"] == 5
+        # 验证合并结果（n_pairs 不含 correct_negatives）
+        # batch1: hits=2, misses=0, false_alarms=0, CN=1 -> n_pairs=2
+        # batch2: hits=2, misses=0, false_alarms=0, CN=0 -> n_pairs=2
+        # merged: hits=4, misses=0, false_alarms=0, CN=1 -> n_pairs=4
+        assert merged_result.value["≥10"]["n_pairs"] == 4
 
     def test_ts_no_valid_data(self):
         """测试无有效数据"""
