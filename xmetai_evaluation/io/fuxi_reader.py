@@ -114,7 +114,70 @@ class FuXiReader(Reader):
         super().__init__(source_id=source_id, version=version)
         self.step_hours = step_hours
 
-    def read(self, request: DataRequest, index: DataIndex) -> DataBundle:
+    def read_one(self, request: DataRequest, index: DataIndex, init_time: datetime) -> DataBundle:
+        """只读取单个起报，避免全年预报同时驻留内存。"""
+        if not index.available:
+            raise DecodeError("No files in index", source_id=request.source_id)
+        files_by_init = index.available[0]
+        if init_time not in files_by_init:
+            raise DecodeError(
+                f"No forecast files for init time {init_time}",
+                source_id=request.source_id,
+            )
+
+        lead_datasets = []
+        input_files = []
+        for i, fpath in enumerate(files_by_init[init_time]):
+            try:
+                with xr.open_dataset(fpath) as source:
+                    ds = source.load()
+                if request.variables and request.variables != ["*"]:
+                    var_map = {v.upper(): v for v in request.variables}
+                    rename = {
+                        file_var: var_map[file_var.upper()]
+                        for file_var in ds.data_vars
+                        if file_var.upper() in var_map
+                    }
+                    if not rename:
+                        raise DecodeError(
+                            f"None of requested variables {request.variables} found in {fpath}",
+                            source_id=request.source_id, path=str(fpath),
+                        )
+                    ds = ds.rename(rename)[list(rename.values())]
+                ds = ds.expand_dims(lead_time=[(i + 1) * self.step_hours])
+                lead_datasets.append(ds)
+                input_files.append(str(fpath))
+            except DecodeError:
+                raise
+            except Exception as exc:
+                raise DecodeError(
+                    f"Failed to read {fpath}: {exc}",
+                    source_id=request.source_id, path=str(fpath), cause=exc,
+                ) from exc
+
+        combined = xr.concat(lead_datasets, dim="lead_time").expand_dims(init_time=[init_time])
+        units = {
+            var: combined[var].attrs.get("units", "mm" if var.upper() == "TP" else "unknown")
+            for var in combined.data_vars
+        }
+        semantic = SemanticMetadata(
+            units=units,
+            temporal_kind=TemporalKind.INTERVAL_ACCUMULATION if "tp" in units else TemporalKind.INSTANTANEOUS,
+            grid_type="regular_latlon",
+        )
+        return DataBundle(
+            payload=combined,
+            kind=DataKind.GRIDDED_FORECAST,
+            source_id=request.source_id,
+            standard_vars={var: var for var in combined.data_vars},
+            semantic=semantic,
+            provenance=Provenance(
+                input_files=input_files,
+                reader_id=self.source_id,
+                reader_version=self.version,
+            ),
+        )
+
         """
         读取所有时效文件并拼接
 

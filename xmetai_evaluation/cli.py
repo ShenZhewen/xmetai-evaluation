@@ -6,6 +6,7 @@ CLI 只负责加载配置和启动任务；数据读取、时间窗口、空间�
 都遵守 xmetai_evaluation 的核心契约。
 """
 import argparse
+import gc
 import logging
 import sys
 from datetime import datetime, timedelta
@@ -208,17 +209,20 @@ def run_evaluation(cfg) -> int:
     source_fcst = forecast_cfg.get("source_id", "fuxi")
     source_obs = observation_cfg.get("source_id", "diamond_station")
 
-    # 一次读取全部所需预报，避免每个起报重复打开文件。
-    log.info("正在读取预报数据...")
+    # 预报按起报逐个读取，避免全年数据同时驻留内存。
+    log.info("采用流式读取预报：每次处理一个起报")
     t0 = perf_counter()
     forecast_request = _make_request(source_fcst, forecast_var, init_times)
     forecast_index = forecast_catalog.discover(forecast_request)
-    forecast_bundle = forecast_reader.read(forecast_request, forecast_index)
-    forecast_ds = forecast_bundle.payload
-    log.info("预报读取完成: %s，耗时 %.2fs", forecast_ds.sizes, perf_counter() - t0)
+    lead_max = max(
+        len(paths) * float(getattr(forecast_reader, "step_hours", 6.0))
+        for paths in forecast_index.available[0].values()
+    )
+    log.info("预报文件发现完成：%d 个起报，最大时效 %.0fh，耗时 %.2fs",
+             len(init_times), lead_max, perf_counter() - t0)
 
     # 一次读取覆盖所有起报和时效的观测；后续窗口只做内存索引。
-    lead_max = int(float(forecast_ds.lead_time.max()))
+    lead_max = int(lead_max)
     window_hours = int(next(
         (t.get("window_hours", 24) for t in cfg.transforms
          if t.get("type") == "time_window_accumulator"),
@@ -278,8 +282,15 @@ def run_evaluation(cfg) -> int:
 
     for init_idx, init_time in pbar:
         pbar.set_description(f"处理 {init_time.strftime('%Y-%m-%d')}")
-        forecast_init = forecast_ds[forecast_var].isel(init_time=init_idx)
-        forecast_windows = forecast_accumulator.transform(forecast_init)
+        try:
+            forecast_bundle = forecast_reader.read_one(forecast_request, forecast_index, init_time)
+            forecast_ds = forecast_bundle.payload
+            forecast_init = forecast_ds[forecast_var].isel(init_time=0)
+            forecast_windows = forecast_accumulator.transform(forecast_init)
+        except Exception as exc:
+            skipped += 1
+            log.exception("起报 %s 预报读取失败: %s", init_time, exc)
+            continue
         if window_leads is None:
             window_leads = [
                 float(lead) for lead in forecast_windows.lead_time.values
@@ -327,6 +338,8 @@ def run_evaluation(cfg) -> int:
                 log.debug("  lead=%sh 失败: %s", lead, exc)
 
     pbar.close()
+    del forecast_ds, forecast_bundle
+    gc.collect()
 
     if processed == 0:
         log.error("没有成功处理任何评测批次")
