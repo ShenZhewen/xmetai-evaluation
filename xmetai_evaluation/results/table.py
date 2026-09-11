@@ -118,6 +118,7 @@ _SCORE_FIELDS: Dict[str, str] = {
     "activity_ratio": "activity_ratio",
     "fc_activity": "activity_forecast",
     "obs_activity": "activity_observation",
+    "fc_obs_bias": "activity_bias",
     "power_ratio": "spectrum_power_ratio",
 }
 

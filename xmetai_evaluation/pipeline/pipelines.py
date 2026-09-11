@@ -114,13 +114,17 @@ PIPELINE_TEMPLATES: Dict[str, PipelineTemplate] = {
         description=(
             "确定性连续量检验：RMSE / ACC / 预报活跃度 / 纬向谱\n"
             "  用途  四个角度：误差量级、距平空间型、平滑程度、能量谱分布\n"
-            "  数据  预报 fuxi（如 z500；输入 m²/s²，按 1/g 换算为 m）\n"
-            "        观测 cra（CRA40，如 gh@500hPa）\n"
-            "        参考 climatology —— ACC / 活跃度必需，纬向谱不需要\n"
+            "  数据  预报 格点预报（如 z500）/ 观测 格点实况（如 era5_zarr、CRA40）\n"
+            "        参考 气候态 —— ACC / 活跃度必需，纬向谱不需要\n"
+            "        单位跟着数据源的 layout 走：*_phys 保持 m²/s²，\n"
+            "        老 layout（fuxi / fengqing）按 1/g 换算成 m\n"
             "  计算  grid_valid_time：格点有效时刻配对；集合先取平均\n"
-            "        缺气候态时用零场兜底，状态标 partial 且结果无意义\n"
-            "  指标  rmse、acc、activity、zonal_spectrum（max_k=30）\n"
-            "        产出 scores.csv"
+            "        缺气候态：ACC 用零场兜底、状态标 partial 且结果无意义；\n"
+            "        活跃度是距平统计，直接报错（不是静默出假数）\n"
+            "  指标  rmse、acc、activity、zonal_spectrum\n"
+            "        （max_k 由 metric_options 给，默认 30）\n"
+            "        产出 scores.csv、diagnostics/scores_detail.csv\n"
+            "        （逐波数谱曲线落在明细表里，group=k=<波数>）"
         ),
         transforms=[TransformSpec("ensemble_mean")],
         metrics=[
@@ -129,7 +133,7 @@ PIPELINE_TEMPLATES: Dict[str, PipelineTemplate] = {
             MetricSpec("activity"),
             MetricSpec("zonal_spectrum"),
         ],
-        writers=["csv_long"],
+        writers=["csv_long", "details"],
         options={"ensemble_reduction": "mean"},
     ),
     "weather_ens_crps": PipelineTemplate(
@@ -158,12 +162,13 @@ PIPELINE_TEMPLATES: Dict[str, PipelineTemplate] = {
             "集合场检验：RMSE / CRPS / ACC / 预报活跃度 / 纬向谱\n"
             "  用途  同一批集合样本上既看确定性误差（集合均值 vs 实况），\n"
             "        也看集合分布本身的质量（CRPS）\n"
-            "  数据  预报 fuxi_ens（集合）/ 观测 era5_zarr\n"
-            "        参考 daily_climatology —— ACC / 活跃度必需，纬向谱不需要\n"
+            "  数据  预报 集合预报（fuxi_ens / fengqing 等）/ 观测 格点实况（era5_zarr）\n"
+            "        参考 日气候态 —— ACC / 活跃度必需，纬向谱不需要\n"
             "  计算  grid_valid_time：格点有效时刻配对；集合均值另算\n"
             "        CRPS 直接吃原始成员，不走均值\n"
             "  指标  rmse、crps、acc、activity、zonal_spectrum\n"
-            "        产出 scores.csv"
+            "        产出 scores.csv、diagnostics/scores_detail.csv\n"
+            "        （逐波数谱曲线落在明细表里，group=k=<波数>）"
         ),
         transforms=[TransformSpec("ensemble_mean")],
         metrics=[
@@ -173,7 +178,7 @@ PIPELINE_TEMPLATES: Dict[str, PipelineTemplate] = {
             MetricSpec("activity"),
             MetricSpec("zonal_spectrum"),
         ],
-        writers=["csv_long"],
+        writers=["csv_long", "details"],
         options={"ensemble_reduction": "mean"},
     ),
     "fdp_ens_crps": PipelineTemplate(

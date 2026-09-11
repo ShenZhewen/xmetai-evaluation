@@ -1,16 +1,10 @@
 # -*- coding: utf-8 -*-
 """评估配置基础设施：EvalConfig + load_config()"""
 import importlib.util
-import os
 import sys
 from dataclasses import dataclass, field
-from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
-
-
-# 项目根目录
-ROOT = Path(__file__).parent.parent.parent.resolve()
 
 
 @dataclass
@@ -57,36 +51,6 @@ class EvalConfig:
 
     # 内部字段
     _source_path: str = field(init=False, repr=False, default="")
-
-    def resolve_path(self, value: str) -> str:
-        """相对外部 config 所在目录解析本地路径；URL 和绝对路径保持不变"""
-        if not value or os.path.isabs(value) or "://" in value:
-            return value
-        base = os.path.dirname(self._source_path) if self._source_path else ROOT
-        return str(Path(base) / value)
-
-    def parse_date_range(self) -> tuple[Optional[datetime], Optional[datetime]]:
-        """解析起止日期"""
-        start = None
-        end = None
-        if self.start_date:
-            if len(self.start_date) == 8:
-                start = datetime.strptime(self.start_date, "%Y%m%d")
-            elif len(self.start_date) == 10:
-                start = datetime.strptime(self.start_date, "%Y%m%d%H")
-            else:
-                raise ValueError(f"无效的起始日期格式: {self.start_date}")
-
-        if self.end_date:
-            if len(self.end_date) == 8:
-                end = datetime.strptime(self.end_date, "%Y%m%d")
-            elif len(self.end_date) == 10:
-                end = datetime.strptime(self.end_date, "%Y%m%d%H")
-            else:
-                raise ValueError(f"无效的结束日期格式: {self.end_date}")
-
-        return start, end
-
 
 def metric_options_from_var_metrics(
     var_metrics: Dict[str, List[str]],

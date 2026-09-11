@@ -7,18 +7,14 @@
 import pytest
 import numpy as np
 import xarray as xr
-from datetime import datetime
 
 from xmetai_evaluation.metrics.base import (
-    Metric,
-    MetricRequirements,
     MetricState,
     ProductType,
 )
 from xmetai_evaluation.metrics.rmse import RMSE
 from xmetai_evaluation.core.contracts import (
     EvaluationBatch,
-    MetricResult,
     ResultStatus,
 )
 from xmetai_evaluation.core.errors import MetricError

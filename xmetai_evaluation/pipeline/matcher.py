@@ -11,7 +11,6 @@ Matcher：预报与观测配对
 
 from dataclasses import replace
 from typing import Dict, Any, List, Optional
-from datetime import datetime, timedelta
 import logging
 import xarray as xr
 import numpy as np
@@ -21,11 +20,7 @@ from xmetai_evaluation.core.contracts import (
     EvaluationBatch,
 )
 from xmetai_evaluation.core.errors import AlignmentError
-from xmetai_evaluation.transforms.regrid import (
-    regrid_to_target,
-    compute_ensemble_mean,
-    compute_latitude_weights,
-)
+from xmetai_evaluation.transforms.regrid import compute_latitude_weights
 
 log = logging.getLogger(__name__)
 

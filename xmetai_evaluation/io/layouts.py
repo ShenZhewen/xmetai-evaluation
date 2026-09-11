@@ -367,6 +367,11 @@ ERA5_ZARR_LAYOUT = GriddedLayout(
         "q2m": VarSpec(source="q2m", unit="g/kg", scale=1000.0, source_unit="kg/kg"),
         "u10m": VarSpec(source="u10m", unit="m/s"),
         "v10m": VarSpec(source="v10m", unit="m/s"),
+        # store 自带 10m 风速通道。不声明也能读到（``era5_zarr_reader`` 在
+        # ``spec is None`` 时把单位兜底成 "unknown"），但那样长表的 unit 列就空着；
+        # 声明只为拿单位，数值取的是 store 里那一份，与现状一致。
+        # ws850 / ws200 store 里没有，仍由 ``matcher`` 从分量现合成。
+        "ws10m": VarSpec(source="ws10m", unit="m/s"),
         "tp": VarSpec(
             source="tp",
             unit="mm",

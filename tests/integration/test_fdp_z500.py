@@ -12,13 +12,11 @@ import xarray as xr
 
 from functools import partial
 
-from xmetai_evaluation.io.gridded import GriddedCatalog, GriddedReader
+from xmetai_evaluation.io.gridded import GriddedCatalog
 from xmetai_evaluation.io.layouts import CRA_LAYOUT, FENGQING_LAYOUT
 
 # 数据源 = 布局声明 + 通用 Reader（见 io/layouts.py）
-CRAReader = partial(GriddedReader, source_id="cra", layout=CRA_LAYOUT)
 CRACatalog = partial(GriddedCatalog, layout=CRA_LAYOUT)
-FengqingReader = partial(GriddedReader, source_id="fengqing", layout=FENGQING_LAYOUT)
 FengqingCatalog = partial(GriddedCatalog, layout=FENGQING_LAYOUT)
 from xmetai_evaluation.core.contracts import DataRequest
 from xmetai_evaluation.pipeline.matcher import Matcher

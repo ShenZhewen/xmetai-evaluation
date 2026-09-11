@@ -15,9 +15,7 @@ import xarray as xr
 from xmetai_evaluation.core.contracts import (
     EvaluationBatch,
     MetricResult,
-    ResultStatus,
 )
-from xmetai_evaluation.core.variables import ForecastKind
 from xmetai_evaluation.core.errors import MetricError
 
 
@@ -238,3 +236,29 @@ def single_variable(data: Any, side: str) -> xr.DataArray:
             '{"rmse": {"variables": ["z500", "t2m"]}}'
         )
     return data[names[0]]
+
+
+def field_unit(*sources: Any) -> str:
+    """取变量的物理单位，按给定顺序找第一个标注了的。
+
+    指标层是唯一同时看得到"这一路评的是哪个变量"和"它带什么单位"的地方：
+    路由到单变量后，协议层 ``defaults()`` 里那个单位是给整批用的、这时候是空的。
+    所以单位在 ``accumulate`` 里取、随 ``MetricState`` 带到 ``finalize``，
+    再写进长表的 ``unit`` 列。
+
+    传 ``(observation, forecast)``：报实况那一侧的单位（与参考实现一致），
+    实况没标注时退回预报。都拿不到就返回空串——空单位比编一个单位好。
+    """
+    for source in sources:
+        if source is None:
+            continue
+        field = source
+        if isinstance(field, xr.Dataset):
+            names = list(field.data_vars)
+            if len(names) != 1:
+                continue
+            field = field[names[0]]
+        unit = str(getattr(field, "attrs", {}).get("units") or "")
+        if unit:
+            return unit
+    return ""

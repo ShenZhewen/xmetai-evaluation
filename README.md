@@ -94,17 +94,19 @@ cli → load_config(EvalConfig) → PipelineSpec(流程模板+数据)
 | **确定性降水分类检验**<br>`weather_ts_det` | 确定性格点降水预报（`fuxi`，tp）+ Diamond 站点降水观测 | `scores.csv`、`diagnostics/categorical_wide.csv` | `ts`、`pod`、`far`、`miss_rate`、`frequency_bias`<br>逐 阈值（0.1/10/25/50/100 mm）× 24h 时效 |
 | **集合降水分类检验（24h）**<br>`weather_ts_ens` | 集合格点降水预报（`fuxi_ens`，tp）+ Diamond 站点降水观测 | `scores.csv`、`diagnostics/categorical_wide.csv` | `ts`、`pod`、`far`、`miss_rate`、`frequency_bias`（集合平均场）<br>逐 阈值（0.1/10/25/50/100 mm）× 24h 时效；明细 `hits`/`misses`/`false_alarms`/`correct_negatives`/`n_pairs` |
 | **集合降水概率评分（6h）**<br>`weather_ts_ens_prob` | 集合格点降水预报（`fuxi_ens`，tp）+ Diamond 站点降水观测 + 气候概率参考 `ref_probability` | `scores.csv`、`diagnostics/probability_wide.csv` | `aroc`、`bs`、`bss`（逐成员概率，不做集合平均）<br>逐 阈值（0.1/4/13/25 mm）× 6h 时效；明细 `BS_ref`/`base_rate`/`n_points` |
-| **确定性连续量检验**<br>`weather_field_scores` | 格点场预报（`fuxi`，z500 等）+ 格点实况 + 气候态（ACC/活跃度必需） | `scores.csv` | `rmse`、`acc`、`activity_ratio`、`activity_forecast`、`spectrum_power_ratio`（纬向谱）<br>明细 `OBS_ACTIVITY`/`FC_OBS_BIAS` + 逐波数谱曲线 |
+| **确定性连续量检验**<br>`weather_field_scores` | 格点场预报（`fuxi`，z500 等）+ 格点实况 + 气候态（ACC/活跃度必需） | `scores.csv`、`diagnostics/scores_detail.csv` | `rmse`、`acc`、`activity_ratio`、`activity_forecast`、`activity_observation`、`activity_bias`、`spectrum_power_ratio`（纬向谱）<br>明细 逐波数谱曲线 |
 | **集合连续评分**<br>`weather_ens_crps` | 集合格点场预报（`fuxi_ens`）+ 格点实况 | `scores.csv` | `crps`、`spread`、`rmse`（集合平均场）、`spread_error_ratio` |
-| **集合场检验**<br>`weather_ens_field_scores` | 集合格点场预报（`fuxi_ens`）+ 格点实况（ERA5）+ 气候态（ACC/活跃度必需） | `scores.csv` | `rmse`、`crps`、`acc`、`activity_ratio`、`activity_forecast`、`spectrum_power_ratio`<br>明细同 `weather_field_scores` |
+| **集合场检验**<br>`weather_ens_field_scores` | 集合格点场预报（`fuxi_ens`）+ 格点实况（ERA5）+ 气候态（ACC/活跃度必需） | `scores.csv`、`diagnostics/scores_detail.csv` | `rmse`、`crps`、`acc`、`activity_ratio`、`activity_forecast`、`activity_observation`、`activity_bias`、`spectrum_power_ratio`<br>明细同 `weather_field_scores` |
 | **集合连续评分**<br>`fdp_ens_crps` | 集合格点场预报（`fengqing`）+ CRA40 再分析实况 | `scores.csv` | `crps`、`spread`、`rmse`（集合平均场）、`spread_error_ratio` |
 | **要素场检验**<br>`fdp_field_scores` | 格点场预报（`fengqing`，z500 等）+ CRA40 实况 + 气候态（可选，ACC 必需） | `scores.csv` | `rmse`、`bias`、`acc` |
 | **中国区站点降水检验**<br>`fdp_precip_ts` | 格点降水预报 + Diamond 站点降水观测（中国区，cos 纬度加权） | `scores.csv`、`diagnostics/categorical_wide.csv` | `ts`、`pod`、`far`、`miss_rate`、`frequency_bias`<br>逐 阈值（0.1/13/25 mm）× 6h 时效（UTC 对齐，窗口不要求观测完整） |
 | **降水空间检验**<br>`fdp_precip_fss` | 格点降水预报 + 格点降水实况（CRA / CMPAS） | `scores.csv` | `fss`（阈值 13 mm × 邻域窗口 1/3/5/15/31/63，每个组合一行）<br>明细 `window`/`n_points` |
-| **活跃度比 / 功率谱**<br>`fdp_activity_spectrum` | 格点场预报（z500）+ 格点实况 + 气候态（活跃度比必需） | `scores.csv` | `activity_ratio`、`activity_forecast`、`spectrum_power_ratio`（二维谱，不减纬向均值）<br>明细 `OBS_ACTIVITY`/`FC_OBS_BIAS` + 逐波数谱曲线 |
+| **活跃度比 / 功率谱**<br>`fdp_activity_spectrum` | 格点场预报（z500）+ 格点实况 + 气候态（活跃度比必需） | `scores.csv` | `activity_ratio`、`activity_forecast`、`activity_observation`、`activity_bias`、`spectrum_power_ratio`（二维谱，不减纬向均值）<br>明细 逐波数谱曲线 |
 
 内置配置里 `weather_field_scores_fuxi` 与 `fdp_field_scores_fengqing` 另外声明了 `json` writer，
 会多写一份 `scores.json`；那是配置的选择，不属于流程模板的产出。
+注意配置里的 `writers` 是**替换**模板自带的那一份、不是追加，所以
+`weather_field_scores_fuxi` 要把模板的 `details` 一并写上，谱曲线才有落盘的地方。
 
 ### 评估指标说明
 
@@ -140,16 +142,23 @@ cli → load_config(EvalConfig) → PipelineSpec(流程模板+数据)
 | `spread` | 集合离散度 | `sqrt(Σᵢ(mᵢ − m̄)² / (M − 1))` | 与 `rmse` 同量级才有意义 |
 | `spread_error_ratio` | 离散度-误差比 | `SPREAD / RMSE(集合平均场)` | ≈1 标定良好，<1 过度自信，>1 欠自信 |
 | `activity_ratio` | 活跃度比：预报的距平变化幅度相对实况 | `std(预报距平) / std(实况距平)`，面积加权 | <1 偏平滑（系统性偏弱），>1 偏噪；**缺气候态时无意义** |
-| `activity_forecast` | 预报距平标准差 | 同上分子 | 诊断用；实况侧 `OBS_ACTIVITY` 与两者之差 `FC_OBS_BIAS` 在明细表 |
+| `activity_forecast` | 预报距平标准差 | 同 `activity_ratio` 的分子 | 诊断用，与实况侧同看 |
+| `activity_observation` | 实况距平标准差 | 同 `activity_ratio` 的分母 | 诊断用 |
+| `activity_bias` | 活跃度偏差：预报距平标准差 − 实况距平标准差 | `std(预报距平) − std(实况距平)` | 0 为无偏，<0 预报偏平滑；单位同 `activity_forecast` |
 | `fss` | 邻域分数技巧评分：邻域平滑后再比「有/无」 | `1 − Σ(p_f − p_o)² / Σ(p_f² + p_o²)`，`p` 为邻域内超过阈值的格点占比 | 越大越好；窗口越大越接近随机基准，看技巧随尺度衰减 |
 | `spectrum_power_ratio` | 总功率比：预报能量相对实况 | 预报功率谱总量 / 实况功率谱总量；逐波数曲线在明细表 | 1 表示总能量不偏；单看总量会掩盖分布失真，需与谱曲线同看 |
 
 几个读表要点：
 
 - **长表只放标量。** 列联表计数（`hits`/`misses`/`false_alarms`/`correct_negatives`/`n_pairs`）、
-  `BS_ref`/`base_rate`/`n_points`、`OBS_ACTIVITY`/`FC_OBS_BIAS`、逐波数谱曲线都不占
-  `scores.csv` 的列，只进明细表 `diagnostics/scores_detail.csv`（声明 `details` writer 时写出）；
+  `BS_ref`/`base_rate`/`n_points`、逐波数谱曲线都不占 `scores.csv` 的列，
+  只进明细表 `diagnostics/scores_detail.csv`（声明 `details` writer 时写出）；
   其中前两组会被 `categorical_wide` / `probability_wide` 各自透视成表头列。
+  活跃度的四个量（`activity_ratio`/`activity_forecast`/`activity_observation`/`activity_bias`）
+  都是标量，**都在长表里**。
+- **谱曲线是明细表里的一组长表行**：`group` 列形如 `k=<波数>`，
+  `field` 取 `power_forecast`/`power_observation`，一行一个波数——不是参考实现那种
+  每个变量一份宽 CSV。
 - **同名不同口径靠 `aggregation` 区分。** 例如集合场检验里 `spread_error` 顺带输出的 `rmse`
   是**集合平均场的域加权**口径（`area_weighted`），`rmse` 指标是逐样本平均口径（`mean_over_samples`）。
 - **空 `value` 不是 0。** NaN/Inf 一律写空字符串，该档有没有数看 `status` 列
@@ -165,7 +174,7 @@ cli → load_config(EvalConfig) → PipelineSpec(流程模板+数据)
 |---|---|
 | `scores.csv` | 统一评分长表（始终写出），每行 = 一个 变量×指标×阈值×时效×样本 的评分 |
 | `coverage.csv` | 请求/有效样本覆盖率（显式声明 `coverage` writer 时写出） |
-| `diagnostics/scores_detail.csv` | 诊断明细：列联表计数、`BS_ref`/`base_rate`/`n_points`、逐波数谱曲线、`OBS_ACTIVITY`/`FC_OBS_BIAS` |
+| `diagnostics/scores_detail.csv` | 诊断明细：列联表计数、`BS_ref`/`base_rate`/`n_points`、逐波数谱曲线（`group=k=<波数>`） |
 | `diagnostics/categorical_wide.csv` | 分类检验宽表（阈值 × 时效：TS/POD/FAR/漏报率/BIAS + `hits`/`misses`/`false_alarms`/`n_pairs` 计数） |
 | `diagnostics/probability_wide.csv` | 概率评分宽表（阈值 × 时效：AROC/BS/BSS + `BS_ref`/`base_rate`/`n_points`） |
 | `scores.json` | 评分 JSON 快照 |

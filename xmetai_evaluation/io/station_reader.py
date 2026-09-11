@@ -15,12 +15,10 @@ diamond  3 2025年1月1日0时1小时降水(逐时)
 
 from pathlib import Path
 from typing import List, Dict, Any, Optional
-from datetime import datetime, timedelta
-import re
+from datetime import datetime
 
 import xarray as xr
 import numpy as np
-import pandas as pd
 from tqdm import tqdm
 
 from xmetai_evaluation.io.base import Reader, DataCatalog
@@ -321,30 +319,6 @@ class DiamondStationReader(Reader):
             # 调试：可以打开这行看哪些文件解析失败
             # print(f"Failed to parse {fpath}: {e}")
             return None
-
-    @classmethod
-    def with_catalog(
-        cls,
-        station_dir: Path,
-        source_id: str = "diamond_station",
-        station_whitelist: Optional[List[int]] = None,
-    ):
-        """
-        便捷构造器：自动创建配套的 Catalog
-
-        Returns:
-            (reader, catalog) tuple
-        """
-        reader = cls(
-            source_id=source_id,
-            station_whitelist=station_whitelist,
-        )
-        catalog = DiamondStationCatalog(
-            station_dir=station_dir,
-            station_whitelist=station_whitelist,
-        )
-        return reader, catalog
-
 
 def parse_station_file_time(path: Path) -> datetime:
     """解析 Diamond 站点文件的观测时刻。

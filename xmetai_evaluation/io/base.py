@@ -5,20 +5,12 @@ Reader 基类和 Catalog 协议
 """
 
 from abc import ABC, abstractmethod
-from typing import List, Dict, Any, Optional
-from pathlib import Path
-
-import xarray as xr
 
 from xmetai_evaluation.core.contracts import (
     DataRequest,
     DataIndex,
     DataBundle,
-    DataKind,
-    SemanticMetadata,
-    Provenance,
 )
-from xmetai_evaluation.core.errors import DiscoveryError, DecodeError
 
 
 class DataCatalog(ABC):

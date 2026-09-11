@@ -17,12 +17,11 @@ from xmetai_evaluation.core.contracts import (
     EvaluationBatch,
     MetricResult,
     ResultBundle,
-    AvailabilityStatus,
     ResultStatus,
     SemanticMetadata,
     Provenance,
 )
-from xmetai_evaluation.core.variables import DataKind, TemporalKind, ForecastKind
+from xmetai_evaluation.core.variables import DataKind, TemporalKind
 
 
 def test_data_request_minimal():

@@ -13,9 +13,7 @@ from enum import Enum
 import xarray as xr
 
 from xmetai_evaluation.core.variables import (
-    StandardVariable,
     TemporalKind,
-    ForecastKind,
     DataKind,
 )
 
@@ -43,15 +41,6 @@ class DataRequest:
             raise ValueError("source_id is required")
         if not self.variables:
             raise ValueError("variables is required")
-
-
-class AvailabilityStatus(Enum):
-    """数据可用性状态"""
-
-    AVAILABLE = "available"
-    MISSING = "missing"
-    AMBIGUOUS = "ambiguous"  # 多个候选文件，无法自动选择
-    INVALID = "invalid"  # 文件存在但不可用
 
 
 @dataclass

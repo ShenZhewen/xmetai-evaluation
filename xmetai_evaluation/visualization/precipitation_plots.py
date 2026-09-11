@@ -28,8 +28,14 @@ import matplotlib.font_manager as fm
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
+from matplotlib.patches import Patch
 
-from xmetai_evaluation.visualization.ts_report import _grade_sort_key, build_ts_report
+from xmetai_evaluation.visualization.ts_report import (
+    box_stats,
+    build_ts_report,
+    collect_box_models,
+    ordered_grades,
+)
 
 try:  # seaborn 只用于热力图配色，缺了也能跑
     import seaborn as sns
@@ -74,6 +80,10 @@ THRESHOLD_COLORS = {
 }
 
 _FALLBACK_COLORS = ("#1f77b4", "#2ca02c", "#ff7f0e", "#d62728", "#9467bd", "#8c564b")
+
+#: 多模型图的配色，按"模型在字典里的次序"取。箱线图和差值图共用一份——
+#: 两张图吃的都是 ``{主模型: data, **baselines}``，所以同一个模型在两处颜色一致。
+MODEL_COLORS = ("#d62728", "#1f77b4", "#2ca02c", "#ff7f0e", "#9467bd", "#8c564b")
 
 
 def setup_chinese_font() -> Optional[str]:
@@ -351,46 +361,83 @@ class PrecipitationPlotter:
         self._save(fig, save_path)
         return fig
 
-    def plot_multi_model_comparison(
+    def plot_metric_boxplot(
         self,
         model_dfs: Dict[str, pd.DataFrame],
         metric: str = "TS",
-        lead_h: Optional[float] = None,
         figsize: Tuple[int, int] = (12, 6),
         save_path: Optional[Path] = None,
     ):
-        """多模型对比：按（各模型共有的）阈值分组柱状图。"""
-        grades: List[str] = []
-        tables: Dict[str, pd.Series] = {}
-        for model, frame in model_dfs.items():
-            data = prepare_ts_dataframe(frame)
-            leads = available_leads(data)
-            lead = float(lead_h) if lead_h is not None else leads[0]
-            subset = data[data["lead_h"] == lead].sort_values("threshold_mm")
-            tables[model] = subset.set_index("grade")[metric]
-            for grade in subset["grade"].astype(str):
-                if grade not in grades:
-                    grades.append(grade)
+        """各模型、各降水等级的**跨时效分布**（箱线图）。
 
+        一个箱体 = 同一模型、同一量级在**全部时效**上的取值组成的样本：
+        箱体是四分位距（IQR），箱中横线是中位数，须线延伸到 1.5×IQR 内最远的点，
+        空心圆是离群时效。横坐标是降水等级，每个量级下并排各模型一个箱体。
+        """
+        prepared = {name: prepare_ts_dataframe(frame) for name, frame in model_dfs.items()}
+        names = list(prepared)
+        grades = ordered_grades(list(prepared.values()))
+        if not names or not grades:
+            raise ValueError("箱线图没有可画的数据（模型列表或降水等级为空）")
+
+        width = 0.8 / len(names)
         fig, ax = plt.subplots(figsize=figsize)
-        x = np.arange(len(grades))
-        width = 0.8 / max(len(tables), 1)
-        for index, (model, values) in enumerate(tables.items()):
-            heights = [values.get(grade, np.nan) for grade in grades]
-            offset = (index - len(tables) / 2 + 0.5) * width
-            ax.bar(x + offset, heights, width, label=model, alpha=0.85)
 
-        ax.set_xticks(x)
+        for grade_index, grade in enumerate(grades):
+            for model_index, name in enumerate(names):
+                frame = prepared[name]
+                subset = frame[frame["grade"].astype(str) == grade]
+                stats = box_stats(subset, metric=metric) if len(subset) else {"n": 0}
+                position = grade_index + (model_index - len(names) / 2 + 0.5) * width
+                color = MODEL_COLORS[model_index % len(MODEL_COLORS)]
+                if stats["n"] == 0:
+                    # 该模型没有这个量级（或全无有效值）。**不能把空数组喂给 boxplot**：
+                    # 它随 matplotlib 版本时好时坏，还会吐 RuntimeWarning。画个字说明空缺。
+                    ax.text(
+                        position, 0.02, "无有效值", rotation=90,
+                        ha="center", va="bottom", fontsize=8, color="gray",
+                    )
+                    continue
+                # 一次调用只画一个箱体：这样每个箱子能单独上色，缺值也能按格跳过。
+                ax.boxplot(
+                    subset[metric].dropna().to_numpy(dtype=float),
+                    positions=[position],
+                    widths=width * 0.85,
+                    patch_artist=True,
+                    showfliers=True,
+                    whis=1.5,
+                    manage_ticks=False,  # 否则每次调用都重设刻度定位器，最后一次说了算
+                    boxprops=dict(facecolor=color, edgecolor="#333333", linewidth=1.0, alpha=0.85),
+                    medianprops=dict(color="black", linewidth=1.6),
+                    whiskerprops=dict(color="#333333", linewidth=1.2),
+                    capprops=dict(color="#333333", linewidth=1.2),
+                    flierprops=dict(
+                        marker="o", markerfacecolor="none", markeredgecolor=color,
+                        markersize=5, markeredgewidth=1.0, linestyle="none",
+                    ),
+                )
+
+        ax.set_xticks(range(len(grades)))
         ax.set_xticklabels(grades)
+        ax.set_xlim(-0.5, len(grades) - 0.5)
         ax.set_xlabel("降水等级")
         ax.set_ylabel(metric)
-        ax.set_title(f"多模型 {metric} 对比")
+        ax.set_title(f"各模型 {metric} 跨时效分布")
         ax.grid(True, axis="y", alpha=0.3, linestyle="--")
         if metric in ("TS", "POD", "FAR", "漏报率"):
-            ax.set_ylim(0, 1)
+            ax.set_ylim(0, 1)  # 比率型指标锁 0–1，见 references/precipitation-evaluation.md §6.1
         elif metric == "BIAS":
             ax.axhline(1.0, color="k", linestyle="--", linewidth=1, alpha=0.6)
-        ax.legend(title="模型", loc="best", frameon=True)
+        if len(names) > 1:
+            # 手工拼图例：直接 ax.legend() 会给每次 boxplot 调用各留一个条目
+            ax.legend(
+                handles=[
+                    Patch(facecolor=MODEL_COLORS[i % len(MODEL_COLORS)],
+                          edgecolor="#333333", label=name)
+                    for i, name in enumerate(names)
+                ],
+                title="模型", loc="best", frameon=True,
+            )
         fig.tight_layout()
         self._save(fig, save_path)
         return fig
@@ -411,6 +458,9 @@ class PrecipitationPlotter:
         output_dir = Path(output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
         data = prepare_ts_dataframe(df)
+        # 对比表统一在这里规范化一次：差值图、箱线图、报告表格读的是同一份，
+        # spec 有问题的对比表也会在这里就报出清晰的缺列错误。
+        baselines = {name: prepare_ts_dataframe(frame) for name, frame in (baselines or {}).items()}
         lead = float(lead_h) if lead_h is not None else available_leads(data)[0]
         window = None
         if "window_h" in data.columns and data["window_h"].notna().any():
@@ -442,6 +492,20 @@ class PrecipitationPlotter:
         plt.close()
         artifacts["TS_heatmap"] = heatmap_path
 
+        # 箱线图的模型集合与报告第五节表格**必须是同一个 dict**，
+        # 否则"表里的中位数和图上的线对不上"会从后门溜回来。
+        box_models = collect_box_models(
+            model_name,
+            data,
+            baseline_df=baseline_df,
+            baseline_name=baseline_name,
+            baselines=baselines,
+        )
+        box_path = output_dir / f"{prefix}TS_boxplot.png"
+        self.plot_metric_boxplot(box_models, metric="TS", save_path=box_path)
+        plt.close()
+        artifacts["TS_boxplot"] = box_path
+
         if {"POD", "FAR"}.issubset(data.columns) and data[["POD", "FAR"]].notna().any().all():
             perf_path = output_dir / f"{prefix}performance_diagram_{lead:g}h.png"
             self.plot_performance_diagram(data, lead_h=lead, save_path=perf_path)
@@ -451,7 +515,7 @@ class PrecipitationPlotter:
         if baselines:
             decay_path = output_dir / f"{prefix}multi_model_TS_delta_vs_{model_name}.png"
             self.plot_multi_model_vs_lead(
-                {model_name: data, **baselines},
+                box_models,
                 metric="TS",
                 mode="delta",
                 reference=model_name,
@@ -472,6 +536,7 @@ class PrecipitationPlotter:
             change_description=change_description,
             artifacts=artifacts,
             lead_h=lead,
+            box_models=box_models,
         )
         artifacts["report"] = report_path
         print(f"✓ 报告完成：{report_path}（{len(artifacts) - 1} 张图 + 1 份报告）")
@@ -502,32 +567,13 @@ class PrecipitationPlotter:
         reference = reference or (names[0] if names else None)
         if mode == "delta" and reference not in prepared:
             raise ValueError(f"差值基准 '{reference}' 不在模型列表 {names} 里")
-        grades: List[str] = []
-        for frame in prepared.values():
-            for grade in frame["grade"].astype(str):
-                if grade not in grades:
-                    grades.append(grade)
-        grades.sort(
-            key=lambda grade: _grade_sort_key(
-                grade,
-                next(
-                    (
-                        float(frame["threshold_mm"].dropna().iloc[0])
-                        for frame in prepared.values()
-                        if (frame["grade"].astype(str) == grade).any()
-                        and "threshold_mm" in frame.columns
-                        and frame["threshold_mm"].notna().any()
-                    ),
-                    None,
-                ),
-            )
-        )
+        grades = ordered_grades(list(prepared.values()))
 
         columns = min(len(grades), 3)
         rows = int(np.ceil(len(grades) / columns)) if grades else 1
         fig, axes = plt.subplots(rows, columns, figsize=figsize, sharex=True, sharey=True)
         axes = np.atleast_1d(axes).ravel()
-        palette = ("#d62728", "#1f77b4", "#2ca02c", "#ff7f0e", "#9467bd", "#8c564b")
+        palette = MODEL_COLORS
         styles = ("-", "--", "-.", ":")
 
         def _curve(frame: pd.DataFrame, grade: str) -> pd.DataFrame:

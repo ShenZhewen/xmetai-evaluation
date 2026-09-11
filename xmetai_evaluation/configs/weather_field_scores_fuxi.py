@@ -45,6 +45,8 @@ cfg = EvalConfig(
         "EVAL_OUTPUT",
         "/workspace/szwCode/xmetai-evaluate/evaluation_results/weather_field_scores_fuxi",
     ),
-    writers=["csv_long", "json"],
+    # 配置里的 writers 会**替换**模板自带的那一份，所以要把模板的 details 一起写上，
+    # 否则逐波数谱曲线没有落盘的地方
+    writers=["csv_long", "details", "json"],
     log_level="INFO",
 )

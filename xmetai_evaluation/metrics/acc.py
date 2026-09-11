@@ -9,7 +9,7 @@ ACC = correlation(forecast_anomaly, observation_anomaly)
 
 import numpy as np
 import xarray as xr
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any
 
 from xmetai_evaluation.metrics.base import (
     Metric,

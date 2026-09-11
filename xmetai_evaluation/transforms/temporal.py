@@ -9,7 +9,6 @@ import xarray as xr
 import pandas as pd
 import warnings
 from datetime import datetime, timedelta
-from typing import Literal
 
 
 def window_sum_at(

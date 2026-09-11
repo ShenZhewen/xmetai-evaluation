@@ -6,7 +6,6 @@ Bias = mean(forecast - observation)
 按照 README 第 13.2 节实现 Metric 接口。
 """
 
-import numpy as np
 import xarray as xr
 from typing import List, Dict, Any
 

@@ -4,7 +4,6 @@
 验证错误类别能够正确携带上下文信息，符合 README 第 14.2 节要求。
 """
 
-import pytest
 from xmetai_evaluation.core.errors import (
     EvaluationError,
     ConfigError,

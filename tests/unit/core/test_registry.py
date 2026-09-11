@@ -11,7 +11,6 @@ import pytest
 from xmetai_evaluation.core.registry import (
     Registry,
     ComponentType,
-    ComponentDescriptor,
     register_reader,
     register_metric,
     get_registry,

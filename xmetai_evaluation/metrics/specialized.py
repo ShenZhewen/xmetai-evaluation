@@ -321,7 +321,7 @@ class PowerSpectrum(Metric):
             n_requested=count,
             n_valid=count,
             aggregation="wavenumber_spectrum",
-            unit="",
+            unit="1",  # 进长表的是无量纲的 power_ratio
             product_kind=self.PRODUCT_KIND,
         )
 
@@ -477,6 +477,6 @@ class ZonalSpectrum(Metric):
             n_requested=count,
             n_valid=count,
             aggregation="wavenumber_spectrum",
-            unit="",
+            unit="1",  # 进长表的是无量纲的 power_ratio
             product_kind=self.PRODUCT_KIND,
         )

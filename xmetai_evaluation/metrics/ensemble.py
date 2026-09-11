@@ -29,6 +29,7 @@ from xmetai_evaluation.metrics.base import (
     MetricRequirements,
     MetricState,
     ProductType,
+    field_unit,
     single_variable,
 )
 
@@ -103,6 +104,8 @@ class CRPS(Metric):
                 "weighted_crps": float(np.nansum(np.where(okg, crps_field, 0.0) * weight_field)),
                 "weights_sum": float(np.nansum(np.where(okg, weight_field, 0.0))),
                 "n_valid": int(okg.sum()),
+                # 单位随变量走（见 field_unit 的说明）
+                "unit": field_unit(batch.observation, batch.members),
             },
             n_accumulated=1,
         )
@@ -118,6 +121,9 @@ class CRPS(Metric):
                 "weighted_crps": sum(state.data["weighted_crps"] for state in states),
                 "weights_sum": sum(state.data["weights_sum"] for state in states),
                 "n_valid": sum(state.data["n_valid"] for state in states),
+                "unit": next(
+                    (s.data.get("unit") for s in states if s.data.get("unit")), ""
+                ),
             },
             n_accumulated=sum(state.n_accumulated for state in states),
         )
@@ -144,6 +150,7 @@ class CRPS(Metric):
             n_valid=n_valid,
             weights_sum=float(weights_sum),
             aggregation="area_weighted",
+            unit=str(state.data.get("unit") or ""),
             product_kind=self.PRODUCT_KIND,
         )
 
@@ -188,6 +195,8 @@ class SpreadError(Metric):
                 "weighted_error": _weighted_sum(error, weight_field),
                 "weights_sum": float(np.nansum(weight_field)),
                 "n_valid": int((np.isfinite(deviation) & np.isfinite(error)).sum()),
+                # 单位随变量走（见 field_unit 的说明）
+                "unit": field_unit(batch.observation, batch.members),
             },
             n_accumulated=1,
         )
@@ -212,6 +221,9 @@ class SpreadError(Metric):
                 "weighted_error": sum(state.data["weighted_error"] for state in states),
                 "weights_sum": sum(state.data["weights_sum"] for state in states),
                 "n_valid": sum(state.data["n_valid"] for state in states),
+                "unit": next(
+                    (s.data.get("unit") for s in states if s.data.get("unit")), ""
+                ),
             },
             n_accumulated=sum(state.n_accumulated for state in states),
         )
@@ -248,7 +260,7 @@ class SpreadError(Metric):
             n_valid=n_valid,
             weights_sum=float(weights_sum),
             aggregation="area_weighted",
-            unit="",
+            unit=str(state.data.get("unit") or ""),
             product_kind=self.PRODUCT_KIND,
         )
 

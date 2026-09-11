@@ -17,7 +17,7 @@ import json
 from dataclasses import asdict, dataclass, is_dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Sequence
+from typing import Any, Dict, List, Optional, Sequence
 
 from xmetai_evaluation.core.contracts import MetricResult
 from xmetai_evaluation.core.errors import OutputError

@@ -13,6 +13,7 @@ from xmetai_evaluation.metrics.base import (
     MetricRequirements,
     MetricState,
     ProductType,
+    field_unit,
     single_variable,
 )
 from xmetai_evaluation.core.contracts import (
@@ -67,6 +68,9 @@ class RMSE(Metric):
         if isinstance(observation, xr.Dataset):
             observation = single_variable(observation, "观测")
 
+        # 单位随变量走（见 field_unit 的说明），实况侧优先
+        unit = field_unit(observation, forecast)
+
         # 计算误差
         error = forecast - observation
 
@@ -97,6 +101,7 @@ class RMSE(Metric):
                 "sum_squared_error": sum_squared_error,
                 "weights_sum": weights_sum,
                 "n_valid": n_valid,
+                "unit": unit,
             },
             n_accumulated=1,
         )
@@ -133,6 +138,8 @@ class RMSE(Metric):
         total_weights_sum = sum(s.data["weights_sum"] for s in states)
         total_n_valid = sum(s.data["n_valid"] for s in states)
         total_n_accumulated = sum(s.n_accumulated for s in states)
+        # 同一次运行里各样本的单位必然一致，取第一个非空的即可
+        unit = next((s.data.get("unit") for s in states if s.data.get("unit")), "")
 
         return MetricState(
             metric_name=self.name,
@@ -141,6 +148,7 @@ class RMSE(Metric):
                 "sum_squared_error": total_sum_squared_error,
                 "weights_sum": total_weights_sum,
                 "n_valid": total_n_valid,
+                "unit": unit,
             },
             n_accumulated=total_n_accumulated,
         )
@@ -182,6 +190,7 @@ class RMSE(Metric):
             n_requested=n_valid,  # 简化：假设所有有效点都被请求
             n_valid=n_valid,
             weights_sum=weights_sum,
+            unit=str(state.data.get("unit") or ""),
             aggregation="mean_over_samples",
             product_kind=self.PRODUCT_KIND,
         )

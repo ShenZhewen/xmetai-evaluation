@@ -25,6 +25,8 @@ ref/
 # 评测产物
 evaluation_results/
 reports/
+# 运行日志（--log-file 落盘处）
+logs/
 # 本地临时数据（开发用）
 tmp_data/
 *.idx
