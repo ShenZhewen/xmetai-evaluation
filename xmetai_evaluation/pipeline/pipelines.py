@@ -11,7 +11,7 @@
 
 9 条流程按三大业务块统一前缀：``fdp_``（业务天气评测）、``weather_``（天气模型
 验证）、``clim_``（气候，待落地）。每条模板的 ``description`` 就是
-``--list-pipelines`` 打印的内容（含用途、数据、计算链、指标阈值与对标实现），
+``--list-pipelines`` 打印的内容（含用途、输入数据、计算口径、指标阈值与产出文件），
 所以这里不再另抄一份流程清单。阈值之类的数字直接引用本文件的常量，改常量即生效。
 """
 
@@ -44,8 +44,7 @@ PIPELINE_TEMPLATES: Dict[str, PipelineTemplate] = {
             "        时区按默认 +8 对齐观测（Diamond 站点观测是北京时）\n"
             f"  指标  ts_score  thresholds={TS_THRESHOLDS}\n"
             "        逐阈值逐时效给 TS / POD / FAR / 漏报率 / 频率偏差 BIAS\n"
-            "  输出  scores.csv、diagnostics/categorical_wide.csv\n"
-            "  对标  ref/tiqnqi/xmetai_model_verification/run_categorical(1).py"
+            "        产出 scores.csv、diagnostics/categorical_wide.csv"
         ),
         transforms=[
             TransformSpec("time_window_accumulator", {"window_hours": 24}),
@@ -67,9 +66,8 @@ PIPELINE_TEMPLATES: Dict[str, PipelineTemplate] = {
             f"        ensemble_probability  thresholds={PROB_THRESHOLDS}\n"
             "        概率按超越式口径（x ≥ 阈值）；BS_ref 默认样本气候频率 r(1-r)，\n"
             "        有外部气候概率时改为 mean((p_clim-o)^2)（仅 6h 窗口生效）\n"
-            "  输出  scores.csv、diagnostics/categorical_wide.csv、\n"
-            "        diagnostics/probability_wide.csv\n"
-            "  对标  ref/tiqnqi/xmetai_model_verification/run_categorical(1).py"
+            "        产出 scores.csv、diagnostics/categorical_wide.csv、\n"
+            "        diagnostics/probability_wide.csv"
         ),
         transforms=[
             TransformSpec("ensemble_mean"),
@@ -86,7 +84,7 @@ PIPELINE_TEMPLATES: Dict[str, PipelineTemplate] = {
         name="weather_field_scores",
         protocol="grid_valid_time",
         description=(
-            "确定性连续量检验：RMSE / ACC / 预报活跃度 / 纬向谱（对标 xu 库）\n"
+            "确定性连续量检验：RMSE / ACC / 预报活跃度 / 纬向谱\n"
             "  用途  四个角度：误差量级、距平空间型、平滑程度、能量谱分布\n"
             "  数据  预报 fuxi（如 z500；输入 m²/s²，按 1/g 换算为 m）\n"
             "        观测 cra（CRA40，如 gh@500hPa）\n"
@@ -94,9 +92,7 @@ PIPELINE_TEMPLATES: Dict[str, PipelineTemplate] = {
             "  计算  grid_valid_time：格点有效时刻配对；集合先取平均\n"
             "        缺气候态时用零场兜底，状态标 partial 且结果无意义\n"
             "  指标  rmse、acc、activity、zonal_spectrum（max_k=30）\n"
-            "  输出  scores.csv\n"
-            "  对标  ref/tiqnqi/xmetai_model_verification_xu/run_rmse.py、\n"
-            "        verify_pangu.py（指标实现见 vfc/metrics/）"
+            "        产出 scores.csv"
         ),
         transforms=[TransformSpec("ensemble_mean")],
         metrics=[
@@ -112,16 +108,15 @@ PIPELINE_TEMPLATES: Dict[str, PipelineTemplate] = {
         name="weather_ens_crps",
         protocol="grid_valid_time",
         description=(
-            "集合检验：CRPS / Spread-Error Ratio（对标 xu 库）\n"
+            "集合检验：CRPS / Spread-Error Ratio\n"
             "  用途  CRPS 看集合分布离实况多远；Spread-Error 比看离散度是否标定\n"
             "        ≈1 标定良好，<1 过度自信，>1 欠自信\n"
             "  数据  预报 fuxi_ens / 观测 cra（CRA40）/ 参考 无\n"
             "  计算  grid_valid_time：格点有效时刻配对，纬度加权、全球\n"
             "        CRPS 用闭式解，逐点只统计有限成员，缺测成员不参与\n"
             "        不做非负截断\n"
-            "  指标  crps、spread_error（含 Spread 与集合平均 RMSE）\n"
-            "  输出  scores.csv\n"
-            "  对标  ref/tiqnqi/xmetai_model_verification_xu/run_rmse.py --summarize-ens"
+            "  指标  crps、spread_error（Spread / 集合平均 RMSE / 两者之比）\n"
+            "        产出 scores.csv"
         ),
         transforms=[TransformSpec("ensemble_mean")],
         metrics=[MetricSpec("crps"), MetricSpec("spread_error")],
@@ -138,8 +133,7 @@ PIPELINE_TEMPLATES: Dict[str, PipelineTemplate] = {
             "  数据  预报 fengqing（集合）/ 观测 cra（CRA40）/ 参考 无\n"
             "  计算  grid_valid_time：格点有效时刻配对；集合先取平均\n"
             "  指标  crps、spread_error\n"
-            "  输出  scores.csv\n"
-            "  对标  ref/fdp/verify/verify/ensemble_verifier.py（已不在仓库）"
+            "        产出 scores.csv"
         ),
         transforms=[TransformSpec("ensemble_mean")],
         metrics=[MetricSpec("crps"), MetricSpec("spread_error")],
@@ -158,8 +152,7 @@ PIPELINE_TEMPLATES: Dict[str, PipelineTemplate] = {
             "        ACC 为经典皮尔逊口径（距平场再减域加权均值）；\n"
             "        FDP/WeatherBench2 的 uncentered 口径是 acc_uncentered\n"
             "  指标  rmse、bias、acc\n"
-            "  输出  scores.csv\n"
-            "  对标  ref/fdp/verify/verify/multi_model_verifier_fix.py（已不在仓库）"
+            "        产出 scores.csv"
         ),
         transforms=[TransformSpec("ensemble_mean")],
         metrics=[MetricSpec("rmse"), MetricSpec("bias"), MetricSpec("acc")],
@@ -178,8 +171,7 @@ PIPELINE_TEMPLATES: Dict[str, PipelineTemplate] = {
             "        窗口不要求观测完整；按 UTC 对齐\n"
             "        （local_utc_offset_hours=0；默认是北京时 +8）\n"
             "  指标  ts_score  thresholds=[0.1, 13.0, 25.0]\n"
-            "  输出  scores.csv、diagnostics/categorical_wide.csv\n"
-            "  对标  ref/fdp/verify/verify/tp_deterministic_verifier.py（已不在仓库）"
+            "        产出 scores.csv、diagnostics/categorical_wide.csv"
         ),
         transforms=[TransformSpec("grid_to_station", {"method": "bilinear"})],
         metrics=[MetricSpec("ts_score", {"thresholds": [0.1, 13.0, 25.0]})],
@@ -203,8 +195,7 @@ PIPELINE_TEMPLATES: Dict[str, PipelineTemplate] = {
             "        这条流程不吃站点观测\n"
             "  计算  grid_valid_time：格点有效时刻配对；集合先取平均\n"
             "  指标  fss  thresholds=[13.0]、windows=[1, 3, 5, 15, 31, 63]\n"
-            "  输出  scores.csv\n"
-            "  对标  —"
+            "        产出 scores.csv"
         ),
         transforms=[TransformSpec("ensemble_mean")],
         metrics=[
@@ -228,8 +219,7 @@ PIPELINE_TEMPLATES: Dict[str, PipelineTemplate] = {
             "        谱口径与 weather_field_scores 的 zonal_spectrum 不同：\n"
             "        这里对原始场做二维 FFT、不减纬向均值\n"
             "  指标  activity（含 FC/OBS 活跃度与 BIAS）、spectrum（max_k=30）\n"
-            "  输出  scores.csv\n"
-            "  对标  ref/fdp/verify/verify/activity_spectrum_verifier.py（已不在仓库）"
+            "        产出 scores.csv"
         ),
         transforms=[TransformSpec("ensemble_mean")],
         metrics=[MetricSpec("activity"), MetricSpec("spectrum")],
