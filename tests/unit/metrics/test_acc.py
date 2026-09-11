@@ -74,3 +74,26 @@ def test_zero_variance_is_undefined():
 
     assert result.status == ResultStatus.UNDEFINED
     assert np.isnan(result.value)
+
+
+def test_acc_uncentered_matches_hand_formula():
+    """uncentered = sab / sqrt(saa·sbb)，不减域加权均值。"""
+    forecast = [[1.0, 2.0], [3.0, 4.0]]
+    observation = [[11.0, 12.0], [13.0, 14.0]]
+
+    result = ACC({"centered": False}).compute(_batch(forecast, observation)).value
+
+    sab, saa, sbb = 130.0, 30.0, 630.0
+    assert result == pytest.approx(sab / np.sqrt(saa * sbb))
+
+
+def test_acc_uncentered_differs_from_centered_under_constant_shift():
+    """常数偏移：centered 去均值后完全相关，uncentered 会被偏移压低。"""
+    forecast = [[1.0, 2.0], [3.0, 4.0]]
+    observation = [[11.0, 12.0], [13.0, 14.0]]
+
+    centered = ACC().compute(_batch(forecast, observation)).value
+    uncentered = ACC({"centered": False}).compute(_batch(forecast, observation)).value
+
+    assert centered == pytest.approx(1.0)
+    assert uncentered < 1.0

@@ -73,7 +73,7 @@ def _config(paths, writers):
     return EvalConfig(
         name="synthetic_station_ts",
         description="合成站点降水 TS 端到端测试",
-        pipeline="ts_det",
+        pipeline="weather_ts_det",
         forecast_reader={
             "type": "fuxi",
             "root_dir": str(paths["forecast"]),
@@ -155,7 +155,7 @@ from xmetai_evaluation.configs.base import EvalConfig
 cfg = EvalConfig(
     name="synthetic_station_ts_cli",
     description="CLI 端到端",
-    pipeline="ts_det",
+    pipeline="weather_ts_det",
     forecast_reader={{
         "type": "fuxi",
         "root_dir": r"{forecast}",
@@ -232,7 +232,7 @@ def _ensemble_config(paths):
     return EvalConfig(
         name="synthetic_fuxi_ens_ts",
         description="集合平均 TS 端到端测试",
-        pipeline="ts_ens",
+        pipeline="weather_ts_ens",
         forecast_reader={
             "type": "fuxi_ens",
             "root_dir": str(paths["forecast"]),
@@ -316,7 +316,7 @@ def test_ensemble_probability_scores_are_written(tmp_path):
     config = EvalConfig(
         name="synthetic_ensemble_prob",
         description="集合概率评分端到端",
-        pipeline="ts_ens",
+        pipeline="weather_ts_ens",
         forecast_reader={
             "type": "fuxi_ens",
             "root_dir": str(forecast_root),

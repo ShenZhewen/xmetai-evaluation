@@ -82,3 +82,29 @@ def test_missing_members_are_rejected():
                 spread.accumulate(_batch([[[0.0, 2.0]]], OBSERVATION, WEIGHTS)),
             ]
         )
+
+
+def test_crps_uses_per_point_valid_member_count():
+    """成员缺测时按逐点有效成员数：m=1 的点退化为 MAE，不被整点丢弃。"""
+    members = [[[0.0, 5.0]], [[2.0, np.nan]]]
+    observation = [[1.0, 1.0]]
+
+    result = CRPS().compute(_batch(members, observation))
+
+    # 格点0（成员 [0,2] vs 1）：CRPS=0.5；格点1（成员 [5] vs 1）：MAE=4
+    # 无权重 → 平均 (0.5 + 4) / 2 = 2.25
+    assert result.value == pytest.approx(2.25)
+    assert result.n_valid == 2
+
+
+def test_crps_excludes_nan_observation_points_from_weight_denominator():
+    """观测缺测点的权重不入分母，只按有效点归一化。"""
+    members = [[[0.0, 2.0]], [[2.0, 4.0]]]
+    observation = [[1.5, np.nan]]
+    weights = [[1.0, 1.0]]
+
+    result = CRPS().compute(_batch(members, observation, weights))
+
+    # 格点0 CRPS=0.5（权重1）；格点1 观测 NaN → m=0，不参与
+    assert result.value == pytest.approx(0.5)
+    assert result.n_valid == 1

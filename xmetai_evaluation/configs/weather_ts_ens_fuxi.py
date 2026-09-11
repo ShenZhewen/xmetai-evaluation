@@ -1,8 +1,10 @@
 # -*- coding: utf-8 -*-
 """集合降水分类检验（FuXi 集合 × Diamond 站点）。
 
-流程：``ts_ens``（集合平均 → 窗口累积 → 插值到站点；TS 系列 + 概率评分 AROC/BS/BSS）。
+流程：``weather_ts_ens``（集合平均 → 窗口累积 → 插值到站点；TS 系列 + 概率评分 AROC/BS/BSS）。
 数据：``{FUXI_ENS_OUTPUT}/YYYYMMDD/member_*/001.nc…``（TP，逐 6h）。
+BSS 参考：设 ``BSS_REF``（ref/MMDDHH.000 目录）且 ``WINDOW_HOURS=6`` 时用外部气候概率，
+否则回退样本气候频率 r(1-r)。
 """
 import os
 
@@ -42,10 +44,22 @@ PROB_THRESHOLDS = {
     24.0: [0.1, 4.0, 13.0, 25.0],
 }.get(WINDOW, [0.1, 4.0, 13.0, 25.0])
 
+
+def _reference_reader():
+    """BSS 外部气候概率参考（可选，仅 6h 窗口径，对标原版 ``--ref``）。
+
+    设 ``BSS_REF`` 指向 ref/MMDDHH.000 目录、且 ``WINDOW_HOURS=6`` 时才启用；
+    否则 BSS 回退样本气候频率 r(1-r)。
+    """
+    if WINDOW == 6.0 and os.environ.get("BSS_REF"):
+        return {"type": "ref_probability", "root_dir": os.environ["BSS_REF"]}
+    return None
+
+
 cfg = EvalConfig(
-    name="ts_ens_fuxi",
+    name="weather_ts_ens_fuxi",
     description="FuXi 集合降水评估：集合平均 TS + 概率评分 AROC/BS/BSS",
-    pipeline="ts_ens",
+    pipeline="weather_ts_ens",
 
     forecast_reader={
         "type": "fuxi_ens",
@@ -64,6 +78,7 @@ cfg = EvalConfig(
             "STATION_LIST", "/workspace/data/worm/r0/zd_sta_10285.dat"
         ) or None,
     },
+    reference_reader=_reference_reader(),
 
     transform_options={"time_window_accumulator": {"window_hours": WINDOW}},
     metric_options={
@@ -74,7 +89,7 @@ cfg = EvalConfig(
     start_date=os.environ.get("START_DATE", "20250101"),
     end_date=os.environ.get("END_DATE", "20251231"),
 
-    output_dir=os.environ.get("EVAL_OUTPUT", "evaluation_results/ts_ens_fuxi"),
+    output_dir=os.environ.get("EVAL_OUTPUT", "evaluation_results/weather_ts_ens_fuxi"),
     writers=_writers(),
     log_level="INFO",
 )

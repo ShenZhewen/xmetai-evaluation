@@ -121,6 +121,7 @@ FUXI_LAYOUT = GriddedLayout(
     variables={
         "tp": VarSpec(source="tp", unit="mm", temporal_kind=TemporalKind.INTERVAL_ACCUMULATION),
         "t2m": VarSpec(source="t2m", unit="K"),
+        "z500": VarSpec(source="z500", unit="m", scale=1.0 / GRAVITY, source_unit="m^2/s^2"),
     },
     kind=DataKind.GRIDDED_FORECAST,
     lead_from="index",
@@ -136,6 +137,7 @@ FUXI_ENS_LAYOUT = GriddedLayout(
     variables={
         "tp": VarSpec(source="tp", unit="mm", temporal_kind=TemporalKind.INTERVAL_ACCUMULATION),
         "t2m": VarSpec(source="t2m", unit="K"),
+        "z500": VarSpec(source="z500", unit="m", scale=1.0 / GRAVITY, source_unit="m^2/s^2"),
     },
     kind=DataKind.GRIDDED_FORECAST,
     lead_from="index",

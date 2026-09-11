@@ -37,6 +37,9 @@ class ACC(Metric):
     def __init__(self, params: Dict[str, Any] = None):
         super().__init__(name="acc", version="1.0.0", params=params or {})
         self.climatology_path = params.get("climatology_path") if params else None
+        # centered=True 为经典皮尔逊（减域加权均值）；False 为 uncentered
+        # （FDP/WeatherBench2 口径，距平场直接二阶矩，不减均值）
+        self.centered = bool(params.get("centered", True)) if params else True
 
     def requirements(self) -> MetricRequirements:
         """ACC 需要确定性场和气候态参考"""
@@ -238,13 +241,20 @@ class ACC(Metric):
         sum_product = state.data["sum_weighted_product"]
         sum_forecast = state.data["sum_weighted_forecast"]
         sum_observation = state.data["sum_weighted_observation"]
-        numerator = sum_product - sum_forecast * sum_observation / total_weight
-        forecast_variance = (
-            state.data["sum_weighted_forecast_sq"] - sum_forecast**2 / total_weight
-        )
-        observation_variance = (
-            state.data["sum_weighted_obs_sq"] - sum_observation**2 / total_weight
-        )
+        if self.centered:
+            # 经典皮尔逊：距平场再减域加权均值
+            numerator = sum_product - sum_forecast * sum_observation / total_weight
+            forecast_variance = (
+                state.data["sum_weighted_forecast_sq"] - sum_forecast**2 / total_weight
+            )
+            observation_variance = (
+                state.data["sum_weighted_obs_sq"] - sum_observation**2 / total_weight
+            )
+        else:
+            # uncentered：距平场直接二阶矩，不减域加权均值
+            numerator = sum_product
+            forecast_variance = state.data["sum_weighted_forecast_sq"]
+            observation_variance = state.data["sum_weighted_obs_sq"]
         denominator = np.sqrt(forecast_variance * observation_variance)
 
         # 处理零方差

@@ -6,17 +6,20 @@
 
 两条用法::
 
-    python -m xmetai_evaluation --pipeline fdp_ens_crps --config my_data.py
-    python -m xmetai_evaluation --config my_data.py          # 配置自己声明 pipeline
+    python -m xmetai_evaluation --list-pipelines            # 看能力清单
+    python -m xmetai_evaluation --config my_config.py       # 配置自己声明 pipeline
 
-目前 6 条流程：
+目前 9 条流程，按三大业务块统一前缀（fdp_ / weather_ / clim_）：
 
-    ts_det                  确定性降水分类检验（站点，TS/POD/FAR/BIAS）
-    ts_ens                  集合降水分类检验（集合平均 TS + AROC/BS/BSS）
-    fdp_ens_crps            集合检验：CRPS / Spread-Error Ratio
-    fdp_field_scores        要素检验：RMSE / Bias / ACC（ACC 需气候态）
-    fdp_precip_ts           降水检验：TS/Bias（FSS 待实现）
-    fdp_activity_spectrum   活跃度比 / 功率谱（待实现）
+    weather_ts_det           确定性降水分类检验（站点，TS/POD/FAR/BIAS）
+    weather_ts_ens           集合降水分类检验（站点）：集合平均 TS/POD/FAR + 逐成员概率 AROC/BS/BSS
+    weather_field_scores     确定性连续量检验：RMSE / ACC / 活跃度 / 纬向谱（对标 xu 库）
+    weather_ens_crps         集合检验：CRPS / Spread-Error Ratio（对标 xu 库）
+    fdp_ens_crps             集合检验：CRPS / Spread-Error Ratio
+    fdp_field_scores         要素检验：RMSE / Bias / ACC（ACC 需气候态）
+    fdp_precip_ts            降水检验：TS/Bias（FSS 待实现）
+    fdp_precip_fss           降水空间检验：FSS（多邻域窗口）
+    fdp_activity_spectrum    活跃度比 / 功率谱（二维谱）
 """
 
 from __future__ import annotations
@@ -37,8 +40,8 @@ CHINA_REGION = {"lat": [15.0, 55.0], "lon": [70.0, 140.0], "name": "china"}
 
 
 PIPELINE_TEMPLATES: Dict[str, PipelineTemplate] = {
-    "ts_det": PipelineTemplate(
-        name="ts_det",
+    "weather_ts_det": PipelineTemplate(
+        name="weather_ts_det",
         protocol="station_valid_time",
         description="确定性降水分类检验（站点）：TS/POD/FAR/频率偏差",
         transforms=[
@@ -48,10 +51,10 @@ PIPELINE_TEMPLATES: Dict[str, PipelineTemplate] = {
         metrics=[MetricSpec("ts_score", {"thresholds": TS_THRESHOLDS})],
         writers=["csv_long", "categorical_wide"],
     ),
-    "ts_ens": PipelineTemplate(
-        name="ts_ens",
+    "weather_ts_ens": PipelineTemplate(
+        name="weather_ts_ens",
         protocol="station_valid_time",
-        description="集合降水分类检验：集合平均 TS + 概率评分 AROC/BS/BSS",
+        description="集合降水分类检验（站点）：集合平均 TS/POD/FAR + 逐成员概率 AROC/BS/BSS",
         transforms=[
             TransformSpec("ensemble_mean"),
             TransformSpec("time_window_accumulator", {"window_hours": 24}),
@@ -62,6 +65,29 @@ PIPELINE_TEMPLATES: Dict[str, PipelineTemplate] = {
             MetricSpec("ensemble_probability", {"thresholds": PROB_THRESHOLDS}),
         ],
         writers=["csv_long", "categorical_wide", "probability_wide"],
+    ),
+    "weather_field_scores": PipelineTemplate(
+        name="weather_field_scores",
+        protocol="grid_valid_time",
+        description="确定性连续量检验：RMSE / ACC / 预报活跃度 / 纬向谱（对标 xu 库）",
+        transforms=[TransformSpec("ensemble_mean")],
+        metrics=[
+            MetricSpec("rmse"),
+            MetricSpec("acc"),
+            MetricSpec("activity"),
+            MetricSpec("zonal_spectrum"),
+        ],
+        writers=["csv_long"],
+        options={"ensemble_reduction": "mean"},
+    ),
+    "weather_ens_crps": PipelineTemplate(
+        name="weather_ens_crps",
+        protocol="grid_valid_time",
+        description="集合检验：CRPS / Spread-Error Ratio（对标 xu 库）",
+        transforms=[TransformSpec("ensemble_mean")],
+        metrics=[MetricSpec("crps"), MetricSpec("spread_error")],
+        writers=["csv_long"],
+        options={"ensemble_reduction": "mean"},
     ),
     "fdp_ens_crps": PipelineTemplate(
         name="fdp_ens_crps",

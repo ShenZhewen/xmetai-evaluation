@@ -12,13 +12,15 @@
 * 每个阈值维护 ``(M+1, 2)`` 直方图：行 = 超阈值成员数，列 = 观测事件 0/1；
 * 观测或**任一成员**非有限时该站点不参与统计；站点等权；
 * ``BS = sum(hist[0]*p^2 + hist[1]*(1-p)^2) / N``；
-* ``BS_ref = r*(1-r)``（r = 观测事件频率），``BSS = 1 - BS/BS_ref``；
+* 缺省 ``BS_ref = r*(1-r)``（r = 观测事件频率）；给了外部气候概率参考
+  （``batch.reference``，逐站×阈值概率）时改用 ``BS_ref = mean((p_clim - o)^2)``
+  （缺 ref 站按 0 兜底），``BSS = 1 - BS/BS_ref``；
 * ``AROC`` 用 ROC 曲线梯形面积，事件与非事件都出现才可算。
 """
 
 from __future__ import annotations
 
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import xarray as xr
@@ -51,6 +53,18 @@ def _values(data: Any) -> np.ndarray:
             payload = payload[list(payload.data_vars)[0]]
         return np.asarray(payload.values, dtype="f8")
     return np.asarray(data, dtype="f8")
+
+
+def _threshold_index(
+    threshold: float, ref_thresholds: Optional[List[float]]
+) -> Optional[int]:
+    """在参考概率的阈值坐标里找与 threshold 相同的列下标；找不到返回 None。"""
+    if ref_thresholds is None:
+        return None
+    for index, value in enumerate(ref_thresholds):
+        if abs(float(value) - float(threshold)) < 1e-9:
+            return index
+    return None
 
 
 class EnsembleProbabilityScore(Metric):
@@ -112,7 +126,11 @@ class EnsembleProbabilityScore(Metric):
         members_ok = members[:, ok]
         observation_ok = observation[ok]
 
+        # 外部 BSS 气候概率参考（可选）：batch.reference = (station, threshold)
+        ref_probs, ref_thresholds = self._reference_values(batch.reference, ok)
+
         histograms: Dict[str, np.ndarray] = {}
+        bs_ref_sums: Dict[str, Tuple[float, int]] = {}
         for name, threshold in self.thresholds:
             exceeded = (members_ok >= threshold).sum(axis=0).astype("i8")
             event = (observation_ok >= threshold).astype("i8")
@@ -127,16 +145,51 @@ class EnsembleProbabilityScore(Metric):
                     index, weights=weights_ok, minlength=2 * (member_count + 1)
                 ).reshape(member_count + 1, 2)
 
+            if ref_probs is not None:
+                ti = _threshold_index(threshold, ref_thresholds)
+                if ti is not None:
+                    # 缺 ref 站气候概率按 0 兜底（与参考实现 RefProb 口径一致）
+                    p_clim = np.nan_to_num(ref_probs[:, ti], nan=0.0)
+                    event_f = (observation_ok >= threshold).astype("f8")
+                    bs_ref_sums[name] = (
+                        float(((p_clim - event_f) ** 2).sum()),
+                        int(event_f.size),
+                    )
+
         return MetricState(
             metric_name=self.name,
             metric_version=self.version,
             data={
                 "member_count": member_count,
                 "histograms": histograms,
+                "bs_ref_sums": bs_ref_sums or None,
                 "n_points": int(ok.sum()),
             },
             n_accumulated=1,
         )
+
+    @staticmethod
+    def _reference_values(reference: Any, ok: np.ndarray):
+        """取出外部 BSS 参考概率并按 ok 掩码。
+
+        返回 ``(概率矩阵 (n_valid, n_thr) 或 None, 阈值坐标值或 None)``。
+        无参考、或参考不是 DataArray 且无阈值坐标时，调用方回退样本气候频率。
+        """
+        if reference is None:
+            return None, None
+        if isinstance(reference, xr.DataArray):
+            thresholds = (
+                [float(value) for value in reference["threshold"].values]
+                if "threshold" in reference.coords
+                else None
+            )
+            values = np.asarray(reference.values, dtype="f8")
+        else:
+            values = _values(reference)
+            thresholds = None
+        if ok is not None and values.shape[0] == ok.shape[0]:
+            values = values[ok]
+        return values, thresholds
 
     def merge(self, states: List[MetricState]) -> MetricState:
         if not states:
@@ -147,6 +200,7 @@ class EnsembleProbabilityScore(Metric):
             name: np.zeros_like(histogram)
             for name, histogram in first.data["histograms"].items()
         }
+        bs_ref_sums: Optional[Dict[str, Tuple[float, int]]] = None
         for state in states:
             if state.metric_name != first.metric_name:
                 raise MetricError(
@@ -161,12 +215,17 @@ class EnsembleProbabilityScore(Metric):
                 )
             for name, histogram in state.data["histograms"].items():
                 merged[name] = merged.get(name, np.zeros_like(histogram)) + histogram
+            for name, sums in (state.data.get("bs_ref_sums") or {}).items():
+                bs_ref_sums = bs_ref_sums or {}
+                total, count = bs_ref_sums.get(name, (0.0, 0))
+                bs_ref_sums[name] = (total + sums[0], count + sums[1])
         return MetricState(
             metric_name=self.name,
             metric_version=self.version,
             data={
                 "member_count": member_count,
                 "histograms": merged,
+                "bs_ref_sums": bs_ref_sums,
                 "n_points": sum(state.data.get("n_points", 0) for state in states),
             },
             n_accumulated=sum(state.n_accumulated for state in states),
@@ -175,10 +234,16 @@ class EnsembleProbabilityScore(Metric):
     def finalize(self, state: MetricState) -> MetricResult:
         member_count = int(state.data["member_count"])
         n_points = int(state.data.get("n_points", 0))
+        bs_ref_sums = state.data.get("bs_ref_sums") or {}
         results: Dict[str, Any] = {}
         for name, threshold in self.thresholds:
             results[name] = self._score(
-                state.data["histograms"][name], member_count, name, threshold, n_points
+                state.data["histograms"][name],
+                member_count,
+                name,
+                threshold,
+                n_points,
+                bs_ref=bs_ref_sums.get(name),
             )
 
         total = n_points
@@ -208,6 +273,7 @@ class EnsembleProbabilityScore(Metric):
         name: str,
         threshold: float,
         n_points: int = 0,
+        bs_ref: Optional[Tuple[float, int]] = None,
     ) -> Dict[str, Any]:
         total = float(histogram.sum())
         if total <= 0:
@@ -234,7 +300,12 @@ class EnsembleProbabilityScore(Metric):
             / total
         )
         base_rate = event / total
-        brier_reference = base_rate * (1 - base_rate)
+        if bs_ref is not None:
+            # 外部气候概率参考：BS_ref = mean((p_clim − o)²)，与 BS 同批样本
+            ref_sum, ref_count = bs_ref
+            brier_reference = ref_sum / ref_count if ref_count else float("nan")
+        else:
+            brier_reference = base_rate * (1 - base_rate)
 
         if event > 0 and non_event > 0:
             hit = np.array(

@@ -138,6 +138,18 @@ def _climatology_source(**params) -> SourceHandle:
     )
 
 
+def _ref_probability_source(**params) -> SourceHandle:
+    from xmetai_evaluation.io.ref_probability_reader import RefProbabilityReader
+
+    source_id = params.get("source_id", "ref_probability")
+    root = _require_root(params, "ref_probability")
+    return SourceHandle(
+        reader=RefProbabilityReader(root_dir=root, source_id=source_id),
+        catalog=None,
+        config=params,
+    )
+
+
 # --------------------------------------------------------------------------
 # Transform：只负责"怎么把两个数据集变成可比的"
 # --------------------------------------------------------------------------
@@ -182,6 +194,12 @@ def _metric_acc(climatology_path: Optional[str] = None, **params):
     from xmetai_evaluation.metrics.acc import ACC
 
     return ACC({"climatology_path": climatology_path, **params})
+
+
+def _metric_acc_uncentered(climatology_path: Optional[str] = None, **params):
+    from xmetai_evaluation.metrics.acc import ACC
+
+    return ACC({"climatology_path": climatology_path, "centered": False, **params})
 
 
 def _normalize_thresholds(thresholds: Optional[List[Any]]) -> List[Any]:
@@ -241,6 +259,12 @@ def _metric_spectrum(max_wavenumber: int = 30, **params):
     from xmetai_evaluation.metrics.specialized import PowerSpectrum
 
     return PowerSpectrum(max_wavenumber=int(max_wavenumber), params=params)
+
+
+def _metric_zonal_spectrum(max_wavenumber: int = 30, **params):
+    from xmetai_evaluation.metrics.specialized import ZonalSpectrum
+
+    return ZonalSpectrum(max_wavenumber=int(max_wavenumber), params=params)
 
 
 # --------------------------------------------------------------------------
@@ -351,6 +375,12 @@ def register_builtin_components() -> None:
         _climatology_source,
         "CRA CLI_6HOUR 气候态参考场（按 月日+时次 索引）",
     )
+    register_reader(
+        "ref_probability",
+        "1.0.0",
+        _ref_probability_source,
+        "BSS 逐 6h 气候概率参考（ref/MMDDHH.000，站号+4阈值概率）",
+    )
 
     register_transform(
         "grid_to_station", "1.0.0", _transform_grid_to_station, "网格场插值到站点"
@@ -366,6 +396,12 @@ def register_builtin_components() -> None:
     register_metric("rmse", "1.0.0", _metric_rmse, "均方根误差")
     register_metric("bias", "1.0.0", _metric_bias, "平均误差")
     register_metric("acc", "1.0.0", _metric_acc, "距平相关系数")
+    register_metric(
+        "acc_uncentered",
+        "1.0.0",
+        _metric_acc_uncentered,
+        "距平相关系数（uncentered，FDP/WeatherBench2 口径）",
+    )
     register_metric("ts_score", "1.0.0", _metric_ts_score, "分类检验 TS/POD/FAR/BIAS")
     register_metric(
         "ensemble_probability",
@@ -384,7 +420,13 @@ def register_builtin_components() -> None:
         "activity", "1.0.0", _metric_activity, "活跃度比（距平加权标准差之比，需气候态）"
     )
     register_metric(
-        "spectrum", "1.0.0", _metric_spectrum, "纬向功率谱（对原始场，0-max_k 波）"
+        "spectrum", "1.0.0", _metric_spectrum, "功率谱（二维 FFT，对原始场，0-max_k 波）"
+    )
+    register_metric(
+        "zonal_spectrum",
+        "1.0.0",
+        _metric_zonal_spectrum,
+        "纬向功率谱（去纬向均值 rfft，cos 纬度加权）",
     )
 
     register_protocol(

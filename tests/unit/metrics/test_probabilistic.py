@@ -92,3 +92,65 @@ def test_requires_members_and_rejects_missing_event_class():
     result = metric.compute(_batch([[10.0, 10.0], [10.0, 10.0]], [10.0, 10.0]))
     assert np.isnan(result.value["≥0.1"]["AROC"])
     assert result.status == ResultStatus.PARTIAL
+
+
+def test_external_reference_bs_ref():
+    """给了外部气候概率参考时，BSS 用 BS_ref=mean((p_clim-o)²) 而非样本频率。"""
+    metric = EnsembleProbabilityScore(thresholds=[("≥0.1", 0.1)])
+    batch = _batch(MEMBERS, OBSERVATION)
+    batch.reference = xr.DataArray(
+        np.full((4, 1), 0.2),
+        dims=["station", "threshold"],
+        coords={"station": [0, 1, 2, 3], "threshold": [0.1]},
+    )
+
+    entry = metric.compute(batch).value["≥0.1"]
+
+    # o = [0,1,1,0]，p_clim 全 0.2 → BS_ref = (0.04+0.64+0.64+0.04)/4 = 0.34
+    assert entry["BS_ref"] == pytest.approx(0.34)
+    # 与样本频率回退（base_rate*(1-base_rate)=0.25）不同，证明外部参考确实生效
+    assert entry["BSS"] == pytest.approx(1 - 0.3125 / 0.34)
+
+
+def test_external_reference_missing_station_uses_zero():
+    """缺 ref 站（NaN 气候概率）按 0 兜底，与参考实现 RefProb 口径一致。"""
+    metric = EnsembleProbabilityScore(thresholds=[("≥0.1", 0.1)])
+    batch = _batch(MEMBERS, OBSERVATION)
+    ref = np.full((4, 1), 0.2)
+    ref[0, 0] = np.nan
+    batch.reference = xr.DataArray(
+        ref, dims=["station", "threshold"], coords={"threshold": [0.1]}
+    )
+
+    entry = metric.compute(batch).value["≥0.1"]
+
+    # 站 0 p_clim=0 → BS_ref = (0 + 0.64 + 0.64 + 0.04)/4 = 0.33
+    assert entry["BS_ref"] == pytest.approx(0.33)
+
+
+def test_external_reference_merges_across_batches():
+    """外部参考的 bs_ref 累加（sum/count）与逐批计算一致。"""
+    metric = EnsembleProbabilityScore(thresholds=[("≥0.1", 0.1)])
+    ref = np.full((4, 1), 0.2)
+
+    whole = _batch(MEMBERS, OBSERVATION)
+    whole.reference = xr.DataArray(
+        ref, dims=["station", "threshold"], coords={"threshold": [0.1]}
+    )
+    whole_bs_ref = metric.compute(whole).value["≥0.1"]["BS_ref"]
+
+    # 让两个 batch 也带上各自的外部参考（各 2 站）
+    first_batch = _batch([[0.0, 0.0], [0.0, 10.0]], [0.0, 10.0])
+    first_batch.reference = xr.DataArray(
+        ref[:2], dims=["station", "threshold"], coords={"threshold": [0.1]}
+    )
+    second_batch = _batch([[10.0, 10.0], [10.0, 10.0]], [10.0, 0.0])
+    second_batch.reference = xr.DataArray(
+        ref[2:], dims=["station", "threshold"], coords={"threshold": [0.1]}
+    )
+    first = metric.accumulate(first_batch)
+    second = metric.accumulate(second_batch)
+
+    merged_bs_ref = metric.finalize(metric.merge([first, second])).value["≥0.1"]["BS_ref"]
+
+    assert merged_bs_ref == pytest.approx(whole_bs_ref)

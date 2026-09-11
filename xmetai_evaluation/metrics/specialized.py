@@ -210,6 +210,7 @@ class ActivityRatio(Metric):
                 "ACTIVITY_RATIO": ratio,
                 "FC_ACTIVITY": forecast_std,
                 "OBS_ACTIVITY": observation_std,
+                "FC_OBS_BIAS": float(forecast_std - observation_std),
             },
             status=status,
             n_requested=int(state.data["n_valid"]),
@@ -288,6 +289,162 @@ class PowerSpectrum(Metric):
         observation_power = state.data["observation_power"] / count
 
         # 曲线进 diagnostics（details 表），总功率比作为标量进长表
+        value: Dict[str, Any] = {}
+        for k in range(forecast_power.size):
+            value[f"k={k}"] = {
+                "wavenumber": int(k),
+                "power_forecast": float(forecast_power[k]),
+                "power_observation": float(observation_power[k]),
+            }
+        forecast_total = float(forecast_power.sum())
+        observation_total = float(observation_power.sum())
+        value["summary"] = {
+            "total_power_forecast": forecast_total,
+            "total_power_observation": observation_total,
+            "power_ratio": (
+                float(forecast_total / observation_total)
+                if observation_total > 0
+                else float("nan")
+            ),
+        }
+
+        return MetricResult(
+            metric_name=self.name,
+            metric_version=self.version,
+            value=value,
+            status=ResultStatus.SUCCESS,
+            n_requested=count,
+            n_valid=count,
+            aggregation="wavenumber_spectrum",
+            unit="",
+            product_kind=self.PRODUCT_KIND,
+        )
+
+
+def zonal_spectrum(
+    field: np.ndarray,
+    lat: np.ndarray,
+    weighted: bool = True,
+    remove_zonal_mean: bool = True,
+) -> np.ndarray:
+    """纬向功率谱（去纬向均值 → rfft → cos 纬度加权平均）。
+
+    口径与参考实现 ``vfc/metrics/spectrum.py::zonal_spectrum`` 一致。
+
+    Args:
+        field: (..., lat, lon) 场，最后两维为 (lat, lon)。
+        lat: 纬度数组（度），长度 = field 的 lat 维。
+        weighted: True 时按 cos(lat) 加权平均。
+        remove_zonal_mean: True 时先去除纬向均值、k=0 置零。
+
+    Returns:
+        (..., nlon // 2 + 1) 纬向功率谱。
+    """
+    x = np.asarray(field, dtype="f8")
+    nlon = x.shape[-1]
+    if remove_zonal_mean:
+        x = x - x.mean(axis=-1, keepdims=True)
+    F = np.fft.rfft(x, axis=-1)
+    psd = (F.real**2 + F.imag**2) / (nlon**2)
+    if remove_zonal_mean:
+        psd[..., 0] = 0.0
+    w = (
+        np.cos(np.deg2rad(np.asarray(lat, dtype="f8")))
+        if weighted
+        else np.ones(lat.size, dtype="f8")
+    )
+    wshape = (1,) * (psd.ndim - 2) + (lat.size, 1)
+    return (psd * w.reshape(wshape)).sum(axis=-2) / w.sum()
+
+
+class ZonalSpectrum(Metric):
+    """纬向功率谱（去纬向均值后 rfft，cos 纬度加权），逐样本平均曲线。"""
+
+    PRODUCT_KIND = "specialized"
+
+    def __init__(self, max_wavenumber: int = DEFAULT_MAX_WAVENUMBER, params=None):
+        super().__init__(name="zonal_spectrum", version="1.0.0", params=params or {})
+        self.max_wavenumber = int(max_wavenumber)
+
+    def requirements(self) -> MetricRequirements:
+        return MetricRequirements(
+            product_type=ProductType.DETERMINISTIC_FIELD,
+            variables=["*"],
+        )
+
+    @staticmethod
+    def _lat(batch: EvaluationBatch) -> np.ndarray:
+        src = batch.forecast
+        if hasattr(src, "payload"):
+            src = src.payload
+        if isinstance(src, (xr.DataArray, xr.Dataset)):
+            lat = src.coords.get("lat")
+            if lat is not None:
+                return np.asarray(
+                    lat.values if hasattr(lat, "values") else lat, dtype="f8"
+                )
+        raise MetricError(
+            "纬向谱需要 forecast 携带 lat 坐标（用于 cos 纬度加权）",
+            variable="zonal_spectrum",
+        )
+
+    def _spectra(self, batch: EvaluationBatch):
+        forecast = _values(batch.forecast)
+        observation = _values(batch.observation)
+        if forecast.ndim < 2 or observation.ndim < 2:
+            raise MetricError(
+                f"纬向谱需要 (..., lat, lon) 场，实际 ndim={forecast.ndim}",
+                variable=self.name,
+            )
+        lat = self._lat(batch)
+        f = forecast.reshape(-1, forecast.shape[-2], forecast.shape[-1])
+        o = observation.reshape(-1, observation.shape[-2], observation.shape[-1])
+        forecast_psd = zonal_spectrum(f, lat).sum(axis=0)
+        observation_psd = zonal_spectrum(o, lat).sum(axis=0)
+        max_k = min(self.max_wavenumber, forecast_psd.size - 1)
+        return (
+            forecast_psd[: max_k + 1],
+            observation_psd[: max_k + 1],
+            int(f.shape[0]),
+        )
+
+    def accumulate(self, batch: EvaluationBatch) -> MetricState:
+        forecast_power, observation_power, n_samples = self._spectra(batch)
+        return MetricState(
+            metric_name=self.name,
+            metric_version=self.version,
+            data={
+                "forecast_power": forecast_power,
+                "observation_power": observation_power,
+                "n_samples": n_samples,
+            },
+            n_accumulated=1,
+        )
+
+    def merge(self, states: List[MetricState]) -> MetricState:
+        if not states:
+            raise MetricError("Cannot merge empty states list")
+        forecast_total = np.zeros_like(states[0].data["forecast_power"])
+        observation_total = np.zeros_like(states[0].data["observation_power"])
+        for state in states:
+            forecast_total = forecast_total + state.data["forecast_power"]
+            observation_total = observation_total + state.data["observation_power"]
+        return MetricState(
+            metric_name=self.name,
+            metric_version=self.version,
+            data={
+                "forecast_power": forecast_total,
+                "observation_power": observation_total,
+                "n_samples": sum(state.data["n_samples"] for state in states),
+            },
+            n_accumulated=sum(state.n_accumulated for state in states),
+        )
+
+    def finalize(self, state: MetricState) -> MetricResult:
+        count = max(int(state.data["n_samples"]), 1)
+        forecast_power = state.data["forecast_power"] / count
+        observation_power = state.data["observation_power"] / count
+
         value: Dict[str, Any] = {}
         for k in range(forecast_power.size):
             value[f"k={k}"] = {

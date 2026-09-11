@@ -76,23 +76,33 @@ class CRPS(Metric):
                 variable=self.name,
             )
 
-        member_count = int(members.shape[0])
-        term1 = np.mean(np.abs(members - observation[np.newaxis, ...]), axis=0)
-        ordered = np.sort(members, axis=0)
-        k = np.arange(member_count, dtype="f8")
-        coefficients = (2.0 * k + 1.0 - member_count) / (member_count**2)
-        coefficient_shape = (member_count,) + (1,) * (ordered.ndim - 1)
-        term2 = np.sum(ordered * coefficients.reshape(coefficient_shape), axis=0)
-        crps_field = np.clip(term1 - term2, 0.0, None)
+        obs = observation[np.newaxis, ...]
+        ok = np.isfinite(members) & np.isfinite(obs)
+        m = ok.sum(axis=0).astype("f8")
 
+        # 逐点平均 |f - o|（仅有效成员，缺测成员不参与）
+        d = np.where(ok, np.abs(members - obs), 0.0)
+        term1 = d.sum(axis=0) / np.maximum(m, 1.0)
+
+        # 排序线性系数项（NaN 排末位，逐点有效成员数 m，分母 m²）
+        n = members.shape[0]
+        ordered = np.sort(np.where(ok, members, np.nan), axis=0)
+        kk = np.arange(n, dtype="f8") + 1.0
+        coeff_shape = (n,) + (1,) * (ordered.ndim - 1)
+        coeff = 2.0 * kk.reshape(coeff_shape) - m[np.newaxis] - 1.0
+        term2 = np.nansum(ordered * coeff, axis=0) / np.maximum(m * m, 1.0)
+
+        # 闭式 CRPS 本就非负，不 clip（与参考实现/业界一致）；分母只统计有效点权重
+        crps_field = term1 - term2
         weight_field = weights if weights is not None else np.ones_like(observation)
+        okg = (m > 0) & np.isfinite(crps_field)
         return MetricState(
             metric_name=self.name,
             metric_version=self.version,
             data={
-                "weighted_crps": _weighted_sum(crps_field, weight_field),
-                "weights_sum": float(np.nansum(weight_field)),
-                "n_valid": int(np.isfinite(crps_field).sum()),
+                "weighted_crps": float(np.nansum(np.where(okg, crps_field, 0.0) * weight_field)),
+                "weights_sum": float(np.nansum(np.where(okg, weight_field, 0.0))),
+                "n_valid": int(okg.sum()),
             },
             n_accumulated=1,
         )

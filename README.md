@@ -24,11 +24,11 @@ pip install -e .
 xmetai-eval --list-pipelines
 
 # 跑内置任务（数据路径由环境变量提供，见 configs/*.py）
-xmetai-eval --config ts_ens_fuxi
+xmetai-eval --config weather_ts_ens_fuxi
 
 # 或指向自定义配置
 xmetai-eval --config /path/to/my_eval.py
-# 等价写法：python -m xmetai_evaluation --config ts_ens_fuxi
+# 等价写法：python -m xmetai_evaluation --config weather_ts_ens_fuxi
 ```
 
 ## 目录结构
@@ -42,9 +42,11 @@ xmetai-evaluation/
 │   ├── logging_util.py
 │   ├── configs/                    # EvalConfig + 任务配置（环境变量驱动）
 │   │   ├── base.py                 # EvalConfig 定义 + load_config()
-│   │   ├── ts_det_fgvp.py          # FuXi 确定性降水分类检验
-│   │   ├── ts_ens_fuxi.py          # FuXi 集合降水分类 + 概率评分
-│   │   └── fdp_field_scores_fengqing.py  # 要素场检验（RMSE/Bias/ACC）
+│   │   ├── weather_ts_det_fgvp.py       # FuXi 确定性降水分类检验
+│   │   ├── weather_ts_ens_fuxi.py       # FuXi 集合降水分类 + 概率评分
+│   │   ├── weather_field_scores_fuxi.py # FuXi 确定性连续量检验（RMSE/ACC/FA/谱）
+│   │   ├── weather_ens_crps_fuxi.py     # FuXi 集合连续评分（CRPS/Spread-Error）
+│   │   └── fdp_field_scores_fengqing.py # 要素场检验（RMSE/Bias/ACC）
 │   ├── core/                       # contracts / errors / registry / variables
 │   ├── io/                         # gridded / layouts / station_reader / climatology_reader / netcdf_reader / base
 │   ├── transforms/                 # interpolation / temporal / regrid
@@ -75,23 +77,44 @@ cli → load_config(EvalConfig) → PipelineSpec(流程模板+数据)
 
 | 类型 | 注册名 |
 |---|---|
-| Reader | `fuxi`、`fuxi_ens`、`fengqing`、`cra`、`station`（`diamond_station` 别名）、`climatology` |
+| Reader | `fuxi`、`fuxi_ens`、`fengqing`、`cra`、`station`（`diamond_station` 别名）、`climatology`、`ref_probability` |
 | Transform | `grid_to_station`、`time_window_accumulator`、`ensemble_mean` |
-| Metric | `rmse`、`bias`、`acc`、`ts_score`、`ensemble_probability`、`crps`、`spread_error`、`fss`、`activity`、`spectrum` |
+| Metric | `rmse`、`bias`、`acc`、`acc_uncentered`、`ts_score`、`ensemble_probability`、`crps`、`spread_error`、`fss`、`activity`、`spectrum`、`zonal_spectrum` |
 | Protocol | `station_valid_time`（插值到站点，按有效时刻配对）、`grid_valid_time`（插值到实况网格） |
 | Writer | `csv_long`（始终写出）、`coverage`、`details`、`json`、`categorical_wide`、`probability_wide` |
 
-## 内置流程
+## 评测能力清单
 
-| 流程名 | 协议 | 指标 | 说明 |
-|---|---|---|---|
-| `ts_det` | station_valid_time | `ts_score` | 确定性降水 TS/POD/FAR/频率偏差 |
-| `ts_ens` | station_valid_time | `ts_score` + `ensemble_probability` | 集合降水：集合平均 TS + AROC/BS/BSS |
-| `fdp_ens_crps` | grid_valid_time | `crps` + `spread_error` | 集合 CRPS / 离散度-误差比 |
-| `fdp_field_scores` | grid_valid_time | `rmse` + `bias` + `acc` | 要素检验（ACC 需气候态参考） |
-| `fdp_precip_ts` | station_valid_time | `ts_score` | 中国区站点降水 TS/Bias |
-| `fdp_precip_fss` | grid_valid_time | `fss` | 降水邻域分数技巧评分 |
-| `fdp_activity_spectrum` | grid_valid_time | `activity` + `spectrum` | Z500 活跃度比 / 功率谱 |
+每行是一个可直接跑的评测能力（流程名 `pipeline`），输入/输出文件相对 `output_dir`。
+
+流程与配置按三大业务块统一前缀命名：`fdp_`（业务天气评测，参考 `ref/fdp`）、`weather_`（天气模型验证，参考 `ref/tiqnqi` 两个库）、`clim_`（气候，参考 `ref/qihou`，待落地）。fdp 与 weather 的连续量/集合指标有重叠，属正常——两者是不同业务线，共用同一套 metric 实现。
+
+| 评测能力 | 流程名 | 输入数据 | 输出 CSV | 评估指标 |
+|---|---|---|---|---|
+| 确定性降水分类检验 | `weather_ts_det` | 确定性格点降水预报（`fuxi`，tp）+ Diamond 站点降水观测 | `scores.csv`、`diagnostics/categorical_wide.csv` | TS / POD / FAR / 漏报率 / 频率偏差（BIAS） |
+| 集合降水分类 + 概率检验 | `weather_ts_ens` | 集合格点降水预报（`fuxi_ens`，tp）+ Diamond 站点降水观测（可选 BSS 外部气候概率 `ref_probability`） | `scores.csv`、`diagnostics/categorical_wide.csv`、`diagnostics/probability_wide.csv` | 集合平均 TS / POD / FAR + 逐成员概率 AROC / BS / BSS |
+| 确定性连续量检验 | `weather_field_scores` | 格点场预报（`fuxi`，z500 等）+ 格点实况 + 气候态（ACC/活跃度必需） | `scores.csv` | RMSE / ACC / 预报活跃度（FA）+ 纬向功率谱 |
+| 集合连续评分 | `weather_ens_crps` | 集合格点场预报（`fuxi_ens`）+ 格点实况 | `scores.csv` | CRPS / Spread / 集合平均 RMSE / Spread-Error 比 |
+| 集合连续评分 | `fdp_ens_crps` | 集合格点场预报（`fengqing`）+ CRA40 再分析实况 | `scores.csv` | CRPS / Spread / 集合平均 RMSE / Spread-Error 比 |
+| 要素场检验 | `fdp_field_scores` | 格点场预报（`fengqing`，z500 等）+ CRA40 实况 + 气候态（可选，ACC 必需） | `scores.csv`、`scores.json` | RMSE / Bias / ACC |
+| 中国区站点降水检验 | `fdp_precip_ts` | 格点降水预报 + Diamond 站点降水观测（中国区，cos 纬度加权） | `scores.csv`、`diagnostics/categorical_wide.csv` | TS / 频率偏差（BIAS） |
+| 降水空间检验 | `fdp_precip_fss` | 格点降水预报 + 格点降水实况（CRA / CMPAS） | `scores.csv` | FSS（多邻域窗口） |
+| 活跃度比 / 功率谱 | `fdp_activity_spectrum` | 格点场预报（z500）+ 格点实况 + 气候态 | `scores.csv` | 活跃度比（AR / FC / OBS / BIAS）+ 功率谱（谱曲线 + 功率比） |
+
+> 台风路径/强度检验（`ref/tiqnqi/xmetai_model_verification_xu/run_tc.py`：台风中心诊断 + babj 实况配对 + 路径/强度误差）尚未吸收进框架，属待办 gap。
+
+输出文件口径：
+
+| 文件 | 说明 |
+|---|---|
+| `scores.csv` | 统一评分长表（始终写出），每行 = 一个 变量×指标×阈值×时效×样本 的评分 |
+| `coverage.csv` | 请求/有效样本覆盖率（显式声明 `coverage` writer 时写出） |
+| `diagnostics/scores_detail.csv` | 列联表计数等诊断明细 |
+| `diagnostics/categorical_wide.csv` | 分类检验宽表（阈值 × 时效：TS/POD/FAR/BIAS + hits/misses/false_alarms） |
+| `diagnostics/probability_wide.csv` | 概率评分宽表（阈值 × 时效：AROC/BS/BSS + base_rate） |
+| `scores.json` | 评分 JSON 快照 |
+
+当前已接好的内置任务配置（`configs/`）：`weather_ts_det_fgvp`（FGVP 确定性降水）、`weather_ts_ens_fuxi`（FuXi 集合降水）、`weather_field_scores_fuxi`（FuXi 确定性连续量）、`weather_ens_crps_fuxi`（FuXi 集合连续评分）、`fdp_field_scores_fengqing`（Fengqing 要素场）。
 
 ## 配置
 
@@ -115,7 +138,7 @@ from xmetai_evaluation.configs.base import EvalConfig
 cfg = EvalConfig(
     name="my_eval",
     description="FuXi 集合降水分类检验",
-    pipeline="ts_ens",
+    pipeline="weather_ts_ens",
     forecast_reader={"type": "fuxi_ens", "root_dir": "/data/fuxi_ens", "variable": "tp", "step_hours": 6.0},
     observation_reader={"type": "station", "root_dir": "/data/station", "variable": "precipitation"},
     start_date="20250101",
@@ -124,7 +147,7 @@ cfg = EvalConfig(
 )
 ```
 
-内置配置用环境变量覆盖数据路径与时段，例如 `ts_ens_fuxi` 支持 `FUXI_ENS_OUTPUT`、`STATION_OBS`、`STATION_LIST`、`WINDOW_HOURS`、`LEAD_TIMES`、`START_DATE`、`END_DATE`、`EVAL_OUTPUT`、`WRITERS`。
+内置配置用环境变量覆盖数据路径与时段，例如 `weather_ts_ens_fuxi` 支持 `FUXI_ENS_OUTPUT`、`STATION_OBS`、`STATION_LIST`、`BSS_REF`（BSS 外部气候概率目录，仅 `WINDOW_HOURS=6` 生效）、`WINDOW_HOURS`、`LEAD_TIMES`、`START_DATE`、`END_DATE`、`EVAL_OUTPUT`、`WRITERS`；`weather_field_scores_fuxi` / `weather_ens_crps_fuxi` 支持 `FUXI_OUTPUT` / `FUXI_ENS_OUTPUT`、`CRA_ROOT`、`CRA_CLI_ROOT`（前者 ACC/活跃度需要）、`START_DATE`、`END_DATE`、`EVAL_OUTPUT`。
 
 ## 如何扩展
 

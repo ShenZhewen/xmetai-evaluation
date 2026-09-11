@@ -27,7 +27,7 @@ def _station_config(tmp_path) -> EvalConfig:
             "root_dir": str(tmp_path / "stations"),
             "variable": "precipitation",
         },
-        pipeline="ts_det",
+        pipeline="weather_ts_det",
         transform_options={"time_window_accumulator": {"window_hours": 12}},
         metric_options={"ts_score": {"thresholds": [0.1]}},
         start_date="20250101",
@@ -65,9 +65,9 @@ def test_spec_window_hours_falls_back_to_option(tmp_path):
 
 def test_builtin_pipelines_resolve_to_declarations():
     presets = list_pipelines()
-    assert {"ts_det", "ts_ens", "fdp_ens_crps", "fdp_field_scores"}.issubset(set(presets))
+    assert {"weather_ts_det", "weather_ts_ens", "weather_field_scores", "weather_ens_crps", "fdp_ens_crps", "fdp_field_scores"}.issubset(set(presets))
 
-    station = get_template("ts_det")
+    station = get_template("weather_ts_det")
     assert station.protocol == "station_valid_time"
     assert [item.name for item in station.transforms] == [
         "time_window_accumulator",
@@ -83,9 +83,9 @@ def test_builtin_pipelines_resolve_to_declarations():
 def test_pipeline_template_composes_with_data_config(tmp_path):
     """--config 给数据、--pipeline 给算法：两者正交。"""
     spec = PipelineSpec.from_config(_station_config(tmp_path))
-    spec.use_pipeline("ts_ens")
+    spec.use_pipeline("weather_ts_ens")
 
-    assert spec.pipeline == "ts_ens"
+    assert spec.pipeline == "weather_ts_ens"
     assert [item.name for item in spec.metrics] == ["ts_score", "ensemble_probability"]
     # 数据仍来自配置
     assert spec.forecast.reader == "fuxi"
@@ -139,8 +139,8 @@ def test_cli_lists_builtin_pipelines(capsys):
 
     assert main(["--list-pipelines"]) == 0
     output = capsys.readouterr().out
-    assert "ts_det" in output
-    assert "ts_ens" in output
+    assert "weather_ts_det" in output
+    assert "weather_ts_ens" in output
     assert "fdp_ens_crps" in output
 
 

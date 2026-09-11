@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """确定性降水分类检验（FGVP 模型 × Diamond 站点）。
 
-流程：``ts_det``（站点有效时刻配对 + 24h 累积 + 网格到站点插值 + TS 系列）。
+流程：``weather_ts_det``（站点有效时刻配对 + 24h 累积 + 网格到站点插值 + TS 系列）。
 本文件只声明"数据从哪来、评哪段时间、写到哪"，算法口径全在流程模板里。
 """
 import os
@@ -12,9 +12,9 @@ from xmetai_evaluation.configs.base import EvalConfig
 TS_THRESHOLDS = [0.1, 10.0, 25.0, 50.0, 100.0, 250.0]
 
 cfg = EvalConfig(
-    name="ts_det_fgvp",
+    name="weather_ts_det_fgvp",
     description="FGVP 确定性降水 TS 评估（与站点观测对比）",
-    pipeline="ts_det",
+    pipeline="weather_ts_det",
 
     forecast_reader={
         "type": "fuxi",
@@ -39,7 +39,7 @@ cfg = EvalConfig(
     end_date=os.environ.get("END_DATE", "20251231"),
     limit=None,
 
-    output_dir=os.environ.get("EVAL_OUTPUT", "evaluation_results/ts_det_fgvp"),
+    output_dir=os.environ.get("EVAL_OUTPUT", "evaluation_results/weather_ts_det_fgvp"),
     writers=["csv_long", "categorical_wide"],
     log_level="INFO",
 )

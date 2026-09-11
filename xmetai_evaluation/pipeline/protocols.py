@@ -130,6 +130,7 @@ class StationValidTimeProtocol(Protocol):
         self.station_lons: Optional[np.ndarray] = None
         self.window_leads: Optional[List[float]] = None
         self.skipped_inits = 0
+        self.ref_reader = None
         self._diagnostics_left = 3
 
     def prepare(self, context: PipelineContext) -> None:
@@ -211,6 +212,16 @@ class StationValidTimeProtocol(Protocol):
         if str(self.spec.options.get("weights", "none")) == "cos_lat":
             self.station_weights = np.cos(np.deg2rad(np.abs(self.station_lats)))
         log.info("观测读取完成: %s", self.observation_ds.sizes)
+
+        # 外部 BSS 气候概率参考（可选）：站点协议只认 ref_probability 这类逐站参考
+        if context.reference is not None:
+            self.ref_reader = getattr(context.reference, "reader", None)
+            if self.ref_reader is None or not hasattr(self.ref_reader, "probabilities"):
+                log.warning(
+                    "站点协议忽略参考源 %s：不是逐站气候概率参考（需 ref_probability）",
+                    context.reference.source_id,
+                )
+                self.ref_reader = None
 
     def samples(self, context: PipelineContext) -> Iterator[Sample]:
         accumulator = context.transform("time_window_accumulator")
@@ -330,6 +341,18 @@ class StationValidTimeProtocol(Protocol):
                 dims=["station"],
                 coords={"station": forecast_at_station["station"].values},
             )
+        reference = None
+        if self.ref_reader is not None:
+            station_ids = self.observation_ds["station"].values
+            probs = self.ref_reader.probabilities(valid_time, station_ids)  # (n, 4)
+            reference = xr.DataArray(
+                probs,
+                dims=("station", "threshold"),
+                coords={
+                    "station": station_ids,
+                    "threshold": list(self.ref_reader.thresholds),
+                },
+            )
         if int(valid_mask.sum()) == 0:
             return None
         if self._diagnostics_left > 0:
@@ -352,6 +375,7 @@ class StationValidTimeProtocol(Protocol):
             * len(self.station_lats),
             valid_mask=valid_mask,
             members=members,
+            reference=reference,
             weights=weights,
             sample_dim=self.sample_unit,
             alignment={

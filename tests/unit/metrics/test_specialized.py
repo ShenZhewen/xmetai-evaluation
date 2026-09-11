@@ -7,7 +7,13 @@ import xarray as xr
 from xmetai_evaluation.core.contracts import EvaluationBatch, ResultStatus
 from xmetai_evaluation.core.errors import MetricError
 from xmetai_evaluation.metrics.spatial import FractionsSkillScore, neighborhood_fraction
-from xmetai_evaluation.metrics.specialized import ActivityRatio, PowerSpectrum, power_spectrum
+from xmetai_evaluation.metrics.specialized import (
+    ActivityRatio,
+    PowerSpectrum,
+    ZonalSpectrum,
+    power_spectrum,
+    zonal_spectrum,
+)
 
 
 def _batch(forecast, observation, reference=None, weights=None):
@@ -144,3 +150,60 @@ def test_power_spectrum_fills_nan_with_field_mean():
     field = np.array([[1.0, np.nan], [3.0, 4.0]])
     _, power = power_spectrum(field)
     assert np.all(np.isfinite(power))
+
+
+def test_activity_ratio_reports_bias_column():
+    metric = ActivityRatio()
+    result = metric.compute(
+        _batch(
+            [[1.0, 2.0], [3.0, 4.0]],
+            [[2.0, 4.0], [6.0, 8.0]],
+            reference=[[0.0, 0.0], [0.0, 0.0]],
+        )
+    )
+    assert result.value["FC_OBS_BIAS"] == pytest.approx(
+        result.value["FC_ACTIVITY"] - result.value["OBS_ACTIVITY"]
+    )
+
+
+def test_zonal_spectrum_peaks_at_sinusoid_wavenumber():
+    """纯 k0 纬向余弦场，去纬向均值后能量集中在 k0，k=0 置零。"""
+    nlon, nlat, k0 = 16, 4, 2
+    lon = np.arange(nlon)
+    field = np.tile(np.cos(2 * np.pi * k0 * lon / nlon), (nlat, 1))
+    lat = np.linspace(-60.0, 60.0, nlat)
+
+    spec = zonal_spectrum(field[None, ...], lat)[0]
+
+    assert spec[0] == 0.0
+    assert int(np.argmax(spec[1:])) + 1 == k0
+
+
+def test_zonal_spectrum_metric_reports_curve_and_ratio():
+    nlon, nlat = 12, 3
+    lat = np.linspace(-60.0, 60.0, nlat)
+    forecast = xr.DataArray(
+        np.tile(np.arange(nlon, dtype="f8"), (nlat, 1)),
+        dims=["lat", "lon"],
+        coords={"lat": lat},
+    )
+    observation = xr.DataArray(
+        np.tile(np.arange(nlon, dtype="f8"), (nlat, 1)) * 2.0,
+        dims=["lat", "lon"],
+        coords={"lat": lat},
+    )
+    batch = EvaluationBatch(
+        forecast=forecast,
+        observation=observation,
+        sample_keys=[{"sample": 0}],
+        valid_mask=xr.DataArray(
+            np.ones((nlat, nlon), dtype=bool), dims=["lat", "lon"]
+        ),
+        alignment={"method": "direct"},
+    )
+
+    result = ZonalSpectrum(max_wavenumber=4).compute(batch)
+
+    assert "summary" in result.value
+    assert result.value["summary"]["power_ratio"] > 0
+    assert {f"k={k}" for k in range(5)}.issubset(set(result.value))
