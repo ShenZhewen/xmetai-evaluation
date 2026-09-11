@@ -122,6 +122,8 @@ FUXI_LAYOUT = GriddedLayout(
         "tp": VarSpec(source="tp", unit="mm", temporal_kind=TemporalKind.INTERVAL_ACCUMULATION),
         "t2m": VarSpec(source="t2m", unit="K"),
         "z500": VarSpec(source="z500", unit="m", scale=1.0 / GRAVITY, source_unit="m^2/s^2"),
+        "q700": VarSpec(source="q700", unit="g/kg", source_unit="g/kg"),
+        "q2m": VarSpec(source="q2m", unit="g/kg", source_unit="g/kg"),
     },
     kind=DataKind.GRIDDED_FORECAST,
     lead_from="index",
@@ -138,7 +140,57 @@ FUXI_ENS_LAYOUT = GriddedLayout(
         "tp": VarSpec(source="tp", unit="mm", temporal_kind=TemporalKind.INTERVAL_ACCUMULATION),
         "t2m": VarSpec(source="t2m", unit="K"),
         "z500": VarSpec(source="z500", unit="m", scale=1.0 / GRAVITY, source_unit="m^2/s^2"),
+        "q700": VarSpec(source="q700", unit="g/kg", source_unit="g/kg"),
+        "q2m": VarSpec(source="q2m", unit="g/kg", source_unit="g/kg"),
     },
+    kind=DataKind.GRIDDED_FORECAST,
+    lead_from="index",
+    step_hours=6.0,
+    case_insensitive=True,
+    member_glob="member_*",
+    member_dim="member",
+    key_kind="init_member_lead",
+)
+
+#: xu 复刻口径的要素表：标准名与 xu 的 ``--vars`` 逐字一致，值是**报告单位**。
+#:
+#: 与 ``FUXI_LAYOUT`` 只有一处实质差别——z500 **不除 g**，直接报 m²/s²
+#: （xu 的 z500 单位就是 ``m2 s-2``）。q 源文件已是 g/kg，两边都不换算：
+#: xu 内部转 kg/kg、报告层再 ×1000，两步相消，落点仍是 g/kg。
+FUXI_PHYS_VARIABLES: Dict[str, VarSpec] = {
+    "z500": VarSpec(source="z500", unit="m^2/s^2", source_unit="m^2/s^2"),
+    "t700": VarSpec(source="t700", unit="K"),
+    "t850": VarSpec(source="t850", unit="K"),
+    "q700": VarSpec(source="q700", unit="g/kg", source_unit="g/kg"),
+    "q2m": VarSpec(source="q2m", unit="g/kg", source_unit="g/kg"),
+    "u200": VarSpec(source="u200", unit="m/s"),
+    "v200": VarSpec(source="v200", unit="m/s"),
+    "u850": VarSpec(source="u850", unit="m/s"),
+    "v850": VarSpec(source="v850", unit="m/s"),
+    "u10m": VarSpec(source="u10m", unit="m/s"),
+    "v10m": VarSpec(source="v10m", unit="m/s"),
+    "t2m": VarSpec(source="t2m", unit="K"),
+    "msl": VarSpec(source="msl", unit="Pa"),
+    "tp": VarSpec(source="tp", unit="mm", temporal_kind=TemporalKind.INTERVAL_ACCUMULATION),
+}
+
+#: FuXi 单卡（xu ``single_fuxi.sh`` 口径）
+FUXI_PHYS_LAYOUT = GriddedLayout(
+    name="fuxi_phys",
+    patterns=FUXI_LAYOUT.patterns,
+    variables=dict(FUXI_PHYS_VARIABLES),
+    kind=DataKind.GRIDDED_FORECAST,
+    lead_from="index",
+    step_hours=6.0,
+    case_insensitive=True,
+    key_kind="init",
+)
+
+#: FuXi 集合（xu ``ensemble_fuxi.sh`` 口径）
+FUXI_ENS_PHYS_LAYOUT = GriddedLayout(
+    name="fuxi_ens_phys",
+    patterns=FUXI_ENS_LAYOUT.patterns,
+    variables=dict(FUXI_PHYS_VARIABLES),
     kind=DataKind.GRIDDED_FORECAST,
     lead_from="index",
     step_hours=6.0,
@@ -180,6 +232,62 @@ FENGQING_LAYOUT = GriddedLayout(
         "msl": "SURFACE",
         "u10": "SURFACE",
         "v10": "SURFACE",
+    },
+    squeeze_dims=("level", "time", "dtime"),
+    transpose_dims=("member", "lat", "lon"),
+    key_kind="init_lead_group",
+)
+
+#: 风清单卡（xu ``single_fengqing.sh`` 口径）。
+#:
+#: 与 ``FENGQING_LAYOUT`` 的差别有两点：z500 不除 g（m²/s²）；地面风的标准名改成
+#: ``u10m``/``v10m``（xu 与 ERA5 zarr 都用这个名，两边才配得上对）。
+#: 文件里的拼写是 ``U10``/``V10``，由 ``source`` 负责翻译。
+#: 注意不能同时留 ``u10`` 与 ``u10m``——同一个 ``source`` 只认 ``variables`` 里
+#: 字典序靠前的那一个，两个并存会让 ``u10m`` 永远解析不到。
+FENGQING_PHYS_LAYOUT = GriddedLayout(
+    name="fengqing_phys",
+    patterns=FENGQING_LAYOUT.patterns,
+    variables={
+        "z500": VarSpec(source="Z500", unit="m^2/s^2", source_unit="m^2/s^2"),
+        "t700": VarSpec(source="T700", unit="K"),
+        "t850": VarSpec(source="T850", unit="K"),
+        "q700": VarSpec(source="Q700", unit="g/kg", source_unit="g/kg"),
+        "q2m": VarSpec(source="Q2M", unit="g/kg", source_unit="g/kg"),
+        "u200": VarSpec(source="U200", unit="m/s"),
+        "v200": VarSpec(source="V200", unit="m/s"),
+        "u850": VarSpec(source="U850", unit="m/s"),
+        "v850": VarSpec(source="V850", unit="m/s"),
+        "u10m": VarSpec(source="U10", unit="m/s"),
+        "v10m": VarSpec(source="V10", unit="m/s"),
+        "t2m": VarSpec(source="T2M", unit="K"),
+        "msl": VarSpec(source="MSL", unit="Pa"),
+        "tp": VarSpec(source="TP", unit="mm", temporal_kind=TemporalKind.INTERVAL_ACCUMULATION),
+    },
+    kind=DataKind.GRIDDED_FORECAST,
+    member_dim="member",
+    ensure_member_dim=True,
+    groups={
+        "z500": "PLEVELS",
+        "z": "PLEVELS",
+        "gh": "PLEVELS",
+        "t": "PLEVELS",
+        "u": "PLEVELS",
+        "v": "PLEVELS",
+        "q": "PLEVELS",
+        "t700": "PLEVELS",
+        "t850": "PLEVELS",
+        "q700": "PLEVELS",
+        "u200": "PLEVELS",
+        "v200": "PLEVELS",
+        "u850": "PLEVELS",
+        "v850": "PLEVELS",
+        "tp": "SURFACE",
+        "t2m": "SURFACE",
+        "msl": "SURFACE",
+        "q2m": "SURFACE",
+        "u10m": "SURFACE",
+        "v10m": "SURFACE",
     },
     squeeze_dims=("level", "time", "dtime"),
     transpose_dims=("member", "lat", "lon"),
@@ -233,8 +341,70 @@ CRA_LAYOUT = GriddedLayout(
     key_kind="time_group",
 )
 
+#: ERA5 再分析实况（zarr store，见 ``io/era5_zarr_reader.py``）。
+#:
+#: 两个 store 分工由 ``groups`` 声明：气压层用 ``pl``、地面用 ``sfc``。
+#: store 里**没有层次轴**，层次编码在通道名里（``z_500`` / ``u_200``），
+#: 所以 ``source`` 写通道名，配置侧仍用标准名 ``z500``。
+#:
+#: 单位口径对齐参考实现：q 报 g/kg（源是 kg/kg，×1000）、z500 报 m²/s²（不除 g）、
+#: tp 源是 m，×1000 换成 mm。换算烘焙在这里，下游全程是报告单位。
+ERA5_ZARR_LAYOUT = GriddedLayout(
+    name="era5_zarr",
+    patterns=(),
+    variables={
+        "z500": VarSpec(source="z_500", unit="m^2/s^2"),
+        "t700": VarSpec(source="t_700", unit="K"),
+        "t850": VarSpec(source="t_850", unit="K"),
+        "q700": VarSpec(source="q_700", unit="g/kg", scale=1000.0, source_unit="kg/kg"),
+        "u200": VarSpec(source="u_200", unit="m/s"),
+        "v200": VarSpec(source="v_200", unit="m/s"),
+        "u850": VarSpec(source="u_850", unit="m/s"),
+        "v850": VarSpec(source="v_850", unit="m/s"),
+        "msl": VarSpec(source="msl", unit="Pa"),
+        "t2m": VarSpec(source="t2m", unit="K"),
+        "d2m": VarSpec(source="d2m", unit="K"),
+        "q2m": VarSpec(source="q2m", unit="g/kg", scale=1000.0, source_unit="kg/kg"),
+        "u10m": VarSpec(source="u10m", unit="m/s"),
+        "v10m": VarSpec(source="v10m", unit="m/s"),
+        "tp": VarSpec(
+            source="tp",
+            unit="mm",
+            scale=1000.0,
+            source_unit="m",
+            temporal_kind=TemporalKind.INTERVAL_ACCUMULATION,
+        ),
+    },
+    kind=DataKind.GRIDDED_OBSERVATION,
+    engine="zarr",
+    time_kind="observation",
+    groups={
+        "z500": "pl",
+        "t700": "pl",
+        "t850": "pl",
+        "q700": "pl",
+        "u200": "pl",
+        "v200": "pl",
+        "u850": "pl",
+        "v850": "pl",
+        "msl": "sfc",
+        "t2m": "sfc",
+        "d2m": "sfc",
+        "q2m": "sfc",
+        "u10m": "sfc",
+        "v10m": "sfc",
+        "tp": "sfc",
+    },
+    key_kind="time_group",
+)
+
 LAYOUTS: Dict[str, GriddedLayout] = {
     FUXI_LAYOUT.name: FUXI_LAYOUT,
+    FUXI_PHYS_LAYOUT.name: FUXI_PHYS_LAYOUT,
+    FUXI_ENS_LAYOUT.name: FUXI_ENS_LAYOUT,
+    FUXI_ENS_PHYS_LAYOUT.name: FUXI_ENS_PHYS_LAYOUT,
     FENGQING_LAYOUT.name: FENGQING_LAYOUT,
+    FENGQING_PHYS_LAYOUT.name: FENGQING_PHYS_LAYOUT,
     CRA_LAYOUT.name: CRA_LAYOUT,
+    ERA5_ZARR_LAYOUT.name: ERA5_ZARR_LAYOUT,
 }

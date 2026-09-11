@@ -36,6 +36,7 @@ from xmetai_evaluation.metrics.base import (
     MetricRequirements,
     MetricState,
     ProductType,
+    single_variable,
 )
 
 _TRAPZ = getattr(np, "trapezoid", getattr(np, "trapz", None))
@@ -46,11 +47,11 @@ def _values(data: Any) -> np.ndarray:
     if isinstance(data, xr.DataArray):
         return np.asarray(data.values, dtype="f8")
     if isinstance(data, xr.Dataset):
-        return np.asarray(data[list(data.data_vars)[0]].values, dtype="f8")
+        return np.asarray(single_variable(data, "输入").values, dtype="f8")
     if hasattr(data, "payload"):
         payload = data.payload
         if isinstance(payload, xr.Dataset):
-            payload = payload[list(payload.data_vars)[0]]
+            payload = single_variable(payload, "输入")
         return np.asarray(payload.values, dtype="f8")
     return np.asarray(data, dtype="f8")
 
@@ -87,6 +88,14 @@ class EnsembleProbabilityScore(Metric):
             variables=["*"],
             thresholds=[value for _, value in self.thresholds],
         )
+
+    def needs_reference(self) -> bool:
+        """要外部气候概率参考（决定 Runner 要不要构建参考源）。
+
+        没有参考时 BSS 回退样本气候频率 r(1-r) 也能出数，但那是降级口径；
+        配置里给了参考就该用上，所以这里报 True。
+        """
+        return True
 
     def accumulate(self, batch: EvaluationBatch) -> MetricState:
         members = _values(batch.members)

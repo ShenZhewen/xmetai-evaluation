@@ -15,6 +15,7 @@ from xmetai_evaluation.metrics.base import (
     MetricRequirements,
     MetricState,
     ProductType,
+    single_variable,
 )
 from xmetai_evaluation.core.contracts import (
     EvaluationBatch,
@@ -64,9 +65,9 @@ class Bias(Metric):
             observation = batch.observation.payload if hasattr(batch.observation, "payload") else batch.observation
 
         if isinstance(forecast, xr.Dataset):
-            forecast = forecast[list(forecast.data_vars)[0]]
+            forecast = single_variable(forecast, "预报")
         if isinstance(observation, xr.Dataset):
-            observation = observation[list(observation.data_vars)[0]]
+            observation = single_variable(observation, "观测")
 
         # 计算误差
         error = forecast - observation
@@ -74,11 +75,6 @@ class Bias(Metric):
         # 应用掩码
         valid_mask = batch.valid_mask
         error_masked = error.where(valid_mask)
-
-        if isinstance(forecast, xr.Dataset):
-            forecast = forecast[list(forecast.data_vars)[0]]
-        if isinstance(observation, xr.Dataset):
-            observation = observation[list(observation.data_vars)[0]]
 
         # 计算误差和
         sum_error = float(error_masked.sum(skipna=True).values)

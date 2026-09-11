@@ -29,6 +29,7 @@ from xmetai_evaluation.metrics.base import (
     MetricRequirements,
     MetricState,
     ProductType,
+    single_variable,
 )
 
 DEFAULT_MAX_WAVENUMBER = 30
@@ -38,11 +39,11 @@ def _values(data: Any) -> np.ndarray:
     if isinstance(data, xr.DataArray):
         return np.asarray(data.values, dtype="f8")
     if isinstance(data, xr.Dataset):
-        return np.asarray(data[list(data.data_vars)[0]].values, dtype="f8")
+        return np.asarray(single_variable(data, "输入").values, dtype="f8")
     if hasattr(data, "payload"):
         payload = data.payload
         if isinstance(payload, xr.Dataset):
-            payload = payload[list(payload.data_vars)[0]]
+            payload = single_variable(payload, "输入")
         return np.asarray(payload.values, dtype="f8")
     return np.asarray(data, dtype="f8")
 
@@ -105,6 +106,10 @@ class ActivityRatio(Metric):
             product_type=ProductType.DETERMINISTIC_FIELD,
             variables=["*"],
         )
+
+    def needs_reference(self) -> bool:
+        """距平统计，没有气候态直接算不了（_anomalies 会报错）。"""
+        return True
 
     def _anomalies(self, batch: EvaluationBatch):
         if batch.reference is None:

@@ -116,10 +116,51 @@ def _fengqing_source(**params) -> SourceHandle:
     return _gridded_source(FENGQING_LAYOUT, params, "fengqing")
 
 
+def _phys_source(layout_name: str, default_source_id: str):
+    """按 xu 报告口径（z500 = m²/s²、q = g/kg）读预报的通用工厂。
+
+    与 ``_fuxi_source`` 等的差别只在那份布局声明，所以共用 ``_gridded_source``；
+    ``step_hours`` 缺省时用布局自己声明的值。
+    """
+
+    def factory(**params) -> SourceHandle:
+        from xmetai_evaluation.io.layouts import LAYOUTS
+
+        override = params.get("step_hours")
+        return _gridded_source(
+            LAYOUTS[layout_name],
+            params,
+            default_source_id,
+            float(override) if override is not None else None,
+        )
+
+    return factory
+
+
 def _cra_source(**params) -> SourceHandle:
     from xmetai_evaluation.io.layouts import CRA_LAYOUT
 
     return _gridded_source(CRA_LAYOUT, params, "cra")
+
+
+def _era5_zarr_source(**params) -> SourceHandle:
+    """ERA5 再分析实况（zarr）。
+
+    与通用格点源的区别是数据形态：一个 store 装全部时次，不靠文件名发现，
+    所以有自己的 Catalog；变量/单位/分组仍走 ``ERA5_ZARR_LAYOUT`` 声明。
+    一个 run 可以给两个 store（``{"pl": ..., "sfc": ...}``）。
+    """
+    from xmetai_evaluation.io.era5_zarr_reader import Era5ZarrCatalog, Era5ZarrReader
+
+    source_id = params.get("source_id", "era5_zarr")
+    stores = params.get("stores") or {}
+    if not stores:
+        raise ConfigError("reader 'era5_zarr' 需要 stores（如 {'pl': ..., 'sfc': ...}）")
+    return SourceHandle(
+        reader=Era5ZarrReader(source_id=source_id, stores=stores),
+        catalog=Era5ZarrCatalog(stores),
+        config=params,
+    )
 
 
 def _climatology_source(**params) -> SourceHandle:
@@ -134,6 +175,28 @@ def _climatology_source(**params) -> SourceHandle:
     return SourceHandle(
         reader=ClimatologyReader(source_id=source_id, engine=engine),
         catalog=ClimatologyCatalog(root),
+        config=params,
+    )
+
+
+def _daily_climatology_source(**params) -> SourceHandle:
+    """单文件日序气候态（与按 MMDDHH 找文件的 climatology 是两种索引方式）。"""
+    from xmetai_evaluation.io.daily_climatology_reader import (
+        DEFAULT_WINDOW,
+        DailyClimatologyCatalog,
+        DailyClimatologyReader,
+    )
+
+    source_id = params.get("source_id", "daily_climatology")
+    root = _require_root(params, "daily_climatology")
+    return SourceHandle(
+        reader=DailyClimatologyReader(
+            source_id=source_id,
+            window=int(params.get("window", DEFAULT_WINDOW)),
+            scales=params.get("scales"),
+            units=params.get("units"),
+        ),
+        catalog=DailyClimatologyCatalog(root),
         config=params,
     )
 
@@ -368,12 +431,42 @@ def register_builtin_components() -> None:
         "diamond_station", "1.0.0", _station_source, "Diamond 格式站点观测（别名）"
     )
     register_reader("fengqing", "1.0.0", _fengqing_source, "Fengqing 集合预报")
+    register_reader(
+        "fuxi_phys",
+        "1.0.0",
+        _phys_source("fuxi_phys", "fuxi"),
+        "FuXi 网格预报（xu 报告口径：z500 = m²/s²、q = g/kg）",
+    )
+    register_reader(
+        "fuxi_ens_phys",
+        "1.0.0",
+        _phys_source("fuxi_ens_phys", "fuxi_ens"),
+        "FuXi 集合预报（xu 报告口径：z500 = m²/s²、q = g/kg）",
+    )
+    register_reader(
+        "fengqing_phys",
+        "1.0.0",
+        _phys_source("fengqing_phys", "fengqing"),
+        "风清单卡预报（xu 报告口径：z500 = m²/s²、q = g/kg）",
+    )
     register_reader("cra", "1.0.0", _cra_source, "CRA40 再分析实况")
+    register_reader(
+        "era5_zarr",
+        "1.0.0",
+        _era5_zarr_source,
+        "ERA5 再分析实况（zarr store，气压层/地面分 store）",
+    )
     register_reader(
         "climatology",
         "1.0.0",
         _climatology_source,
         "CRA CLI_6HOUR 气候态参考场（按 月日+时次 索引）",
+    )
+    register_reader(
+        "daily_climatology",
+        "1.0.0",
+        _daily_climatology_source,
+        "日序气候态参考场（单文件，按年内日序索引，含环形平滑）",
     )
     register_reader(
         "ref_probability",

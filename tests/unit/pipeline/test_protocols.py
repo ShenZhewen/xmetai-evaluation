@@ -99,6 +99,38 @@ def test_unknown_valid_time_degrades_to_no_reference():
     assert protocol._reference_for(batch) is None
 
 
+def test_reference_synthesizes_wind_speed_from_components():
+    """气候态里只有 u/v 分量时，ws850 要现合成——xu 也是这么兜底的。"""
+    protocol = GridValidTimeProtocol(_spec())
+    protocol.observation_vars = ["u850", "v850", "ws850"]
+    climatology = xr.Dataset(
+        {
+            "u850": (["valid_time", "lat", "lon"], np.full((1, 2, 3), 3.0)),
+            "v850": (["valid_time", "lat", "lon"], np.full((1, 2, 3), 4.0)),
+        },
+        coords={
+            "valid_time": [np.datetime64("2026-08-20T06:00:00")],
+            "lat": LATS,
+            "lon": LONS,
+        },
+    )
+    protocol.reference_bundle = _bundle(climatology, "daily_climatology", DataKind.REFERENCE)
+    protocol.observation_bundle = _bundle(
+        xr.Dataset(
+            {"u850": (["lat", "lon"], np.zeros((2, 3)))},
+            coords={"lat": LATS, "lon": LONS},
+        ),
+        "era5_zarr",
+        DataKind.GRIDDED_OBSERVATION,
+    )
+
+    field = protocol._reference_for(_batch())
+
+    assert field is not None
+    assert "ws850" in field
+    np.testing.assert_allclose(field["ws850"].values, 5.0)
+
+
 def _batch(valid_time="2026-08-20T06:00:00.000000000"):
     forecast = xr.DataArray(np.zeros((2, 3)), dims=["lat", "lon"], coords={"lat": LATS, "lon": LONS})
     return EvaluationBatch(

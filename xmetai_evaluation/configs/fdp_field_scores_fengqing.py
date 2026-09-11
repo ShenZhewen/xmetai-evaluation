@@ -39,7 +39,8 @@ cfg = EvalConfig(
     start_date="20260819",
     end_date="20260819",
     output_dir=os.environ.get(
-        "EVAL_OUTPUT", "evaluation_results/fdp_field_scores_fengqing"
+        "EVAL_OUTPUT",
+        "/workspace/szwCode/xmetai-evaluate/evaluation_results/fdp_field_scores_fengqing",
     ),
     writers=["csv_long", "json"],
     log_level="INFO",

@@ -24,7 +24,12 @@ import xarray as xr
 
 from xmetai_evaluation.core.contracts import DataIndex, DataRequest, EvaluationBatch
 from xmetai_evaluation.core.errors import ConfigError
-from xmetai_evaluation.pipeline.matcher import Matcher
+from xmetai_evaluation.pipeline.matcher import (
+    Matcher,
+    add_derived_variables,
+    align_lon_to,
+    align_to_grid,
+)
 from xmetai_evaluation.pipeline.spec import PipelineSpec, daily_times
 from xmetai_evaluation.transforms.temporal import window_sum_at
 
@@ -436,6 +441,8 @@ class GridValidTimeProtocol(Protocol):
 
     - 样本空间：预报 (init_time, lead_time) 展平出的有效时刻；
     - 结果键：``("valid_time", 有效时刻)``；
+    - 起报：配置显式声明 ``init_times`` 时用它，否则按 ``start_date``/``end_date``
+      探测预报源里实际可用的起报（与 ``station_valid_time`` 同一口径）；
     - 集合降维：由声明的 ``ensemble_mean`` 变换完成；
     - 空间：Matcher 把预报插值到实况网格。
     """
@@ -450,17 +457,36 @@ class GridValidTimeProtocol(Protocol):
         self.member_bundle = None
         self.observation_bundle = None
         self.reference_bundle = None
+        #: 需要成员场的指标所路由到的变量；空表示这次评测不取成员
+        self.member_vars: List[str] = []
         self.batches: Dict[Any, EvaluationBatch] = {}
 
     def prepare(self, context: PipelineContext) -> None:
         forecast = context.forecast
         observation = context.observation
+        # 起报：配置显式声明优先；没声明就按评测时段探测可用起报
+        # （与 station_valid_time 同一口径，配置只需给 start_date/end_date）
         init_times = [
             datetime.fromisoformat(str(value))
             for value in self.spec.forecast.params.get("init_times", [])
         ]
         if not init_times:
-            raise ValueError("grid_valid_time 协议需要 forecast.init_times")
+            start, end = self.spec.period()
+            discovered = forecast.catalog.discover(
+                DataRequest(
+                    source_id=forecast.source_id,
+                    variables=self.forecast_vars,
+                    init_times=daily_times(start, end),
+                )
+            )
+            init_times = forecast.reader.available_init_times(discovered)
+            if not init_times:
+                raise ValueError(f"时间范围 {start} 到 {end} 内没有可用预报起报时间")
+        if self.spec.limit:
+            init_times = init_times[: self.spec.limit]
+        log.info(
+            "起报时间: %s 到 %s，共 %d 个", init_times[0], init_times[-1], len(init_times)
+        )
         lead_times = [float(value) for value in self.spec.forecast.params.get("lead_times", [])]
 
         forecast_request = DataRequest(
@@ -485,14 +511,15 @@ class GridValidTimeProtocol(Protocol):
             getattr(metric, "needs_members", _never_requires_members)()
             for metric in (context.metrics or [])
         )
-        if keep_members and "member" in raw_bundle.payload.dims:
+        self.member_vars = self._member_variables(context) if keep_members else []
+        if self.member_vars and "member" in raw_bundle.payload.dims:
             self.member_bundle = raw_bundle
 
         valid_times = sorted(
             {
                 init_time + timedelta(hours=float(lead))
                 for init_time in init_times
-                for lead in (lead_times or [0.0])
+                for lead in (lead_times or self._available_leads(bundle.payload))
             }
         )
         observation_request = DataRequest(
@@ -529,16 +556,53 @@ class GridValidTimeProtocol(Protocol):
             batch.members = self._members_for(batch)
             batch.reference = self._reference_for(batch)
             self.batches[key] = batch
+            if len(self.batches) % 20 == 0:
+                log.info("参考场装配进度 %d", len(self.batches))
         log.info("配对完成：%d 个批次", len(self.batches))
 
-    def _members_for(self, batch: EvaluationBatch) -> Optional[xr.DataArray]:
-        """把成员场按样本的 init/lead 取出来，插值到实况网格。"""
+    @staticmethod
+    def _available_leads(payload: xr.Dataset) -> List[float]:
+        """没声明 ``lead_times`` 时，按预报文件自带的时效展开（单位：小时）。
+
+        与 ``station_valid_time`` 同一口径（那边也是读 ``windows.lead_time.values``）。
+        这里不能退化成 ``[0.0]``：那样实况和气候态只会被请求一个有效时刻，
+        Matcher 随之只配出一个批次，评测静默缩水成 1/N 且不报错。
+        """
+        if "lead_time" not in payload.coords:
+            return [0.0]
+        return [float(value) for value in payload["lead_time"].values]
+
+    def _member_variables(self, context: PipelineContext) -> List[str]:
+        """需要成员场的指标路由到了哪些变量。
+
+        只给这些变量取成员，而不是全部预报变量：成员场按 (init, lead) 展开后
+        很大，且会一直留在 ``self.batches`` 里。
+        """
+        routed: List[str] = []
+        for item, metric in zip(self.spec.metrics, context.metrics or []):
+            if not getattr(metric, "needs_members", _never_requires_members)():
+                continue
+            for name in item.params.get("variables") or self.forecast_vars:
+                if name not in routed:
+                    routed.append(name)
+        return routed
+
+    def _members_for(self, batch: EvaluationBatch) -> Optional[xr.Dataset]:
+        """把成员场按样本的 init/lead 取出来，插值到实况网格。
+
+        始终返回 Dataset（哪怕只有一个变量），好让 ``narrow_batch`` 能按变量取用——
+        返回裸 DataArray 会在路由到别的变量时被误用。
+        """
         if self.member_bundle is None or not batch.sample_keys:
             return None
-        variable = self.forecast_vars[0]
+        available = [
+            name for name in self.member_vars if name in self.member_bundle.payload.data_vars
+        ]
+        if not available:
+            return None
         record = batch.sample_keys[0]
         try:
-            field = self.member_bundle.payload[variable].sel(
+            field = self.member_bundle.payload[available].sel(
                 init_time=np.datetime64(record["init_time"]),
                 lead_time=float(record["lead_h"]),
             )
@@ -547,23 +611,46 @@ class GridValidTimeProtocol(Protocol):
             return None
         if "member" not in field.dims:
             return None
-        target = self.observation_bundle.payload
+        # 对齐目标取**批次里的实况**，不是原始 bundle（理由同 ``_reference_for``）
+        target = batch.observation
+        aligned = align_to_grid(field, target["lat"].values, target["lon"].values)
+        if aligned is not None:
+            return aligned
         return field.interp(lat=target["lat"], lon=target["lon"])
 
-    def _reference_for(self, batch: EvaluationBatch) -> Optional[xr.DataArray]:
-        """取该有效时刻的气候态参考场，插值到实况网格。"""
+    def _reference_for(self, batch: EvaluationBatch) -> Optional[xr.Dataset]:
+        """取该有效时刻的气候态参考场，插值到实况网格。
+
+        同样返回 Dataset（全部观测变量），由 ``narrow_batch`` 按变量取用。
+        """
         if self.reference_bundle is None or not batch.sample_keys:
             return None
-        variable = self.observation_vars[0]
+        available = [
+            name
+            for name in self.observation_vars
+            if name in self.reference_bundle.payload.data_vars
+        ]
+        if not available:
+            return None
         record = batch.sample_keys[0]
         try:
-            field = self.reference_bundle.payload[variable].sel(
+            field = self.reference_bundle.payload[available].sel(
                 valid_time=np.datetime64(record["valid_time"])
             )
         except Exception as exc:
             log.debug("气候态取用失败（%s）：%s", record, exc)
             return None
-        target = self.observation_bundle.payload
+        # 对齐目标取**批次里的实况**，不是原始 bundle：Matcher 会把实况经度折算到
+        # 预报那一圈（ERA5 的 -180..180 -> 0..360），原始 bundle 仍是折算前的。
+        # 拿原始 bundle 当目标，参考场和实况就会落在两套经度上，ACC/活跃度
+        # 按标签对齐后全是 NaN。
+        target = batch.observation
+        # 气候态可能和预报不在同一圈经度上；缺 wsX 时用分量现合成（参考实现如此兜底）
+        field = align_lon_to(field, target["lon"].values)
+        field = add_derived_variables(field, self.observation_vars)
+        aligned = align_to_grid(field, target["lat"].values, target["lon"].values)
+        if aligned is not None:
+            return aligned
         return field.interp(lat=target["lat"], lon=target["lon"])
 
     def samples(self, context: PipelineContext) -> Iterator[Sample]:

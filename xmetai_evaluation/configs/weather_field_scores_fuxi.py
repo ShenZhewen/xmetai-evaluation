@@ -23,7 +23,7 @@ cfg = EvalConfig(
     forecast_reader={
         "type": "fuxi",
         "root_dir": os.environ.get(
-            "FUXI_OUTPUT", "/workspace/data/shenzw/fuxi_output"
+            "FUXI_OUTPUT", "/workspace/data/shenzw/fuxi_single_output"
         ),
         "variable": "z500",
     },
@@ -42,7 +42,8 @@ cfg = EvalConfig(
     end_date=os.environ.get("END_DATE", "20251231"),
 
     output_dir=os.environ.get(
-        "EVAL_OUTPUT", "evaluation_results/weather_field_scores_fuxi"
+        "EVAL_OUTPUT",
+        "/workspace/szwCode/xmetai-evaluate/evaluation_results/weather_field_scores_fuxi",
     ),
     writers=["csv_long", "json"],
     log_level="INFO",

@@ -6,7 +6,7 @@ import sys
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Union
 
 
 # 项目根目录
@@ -38,8 +38,9 @@ class EvalConfig:
     # None = 用流程模板的视图，显式给列表则覆盖模板
     writers: Optional[List[str]] = None
 
-    # 流程名（pipeline/pipelines.py 里的模板）；给了就用它的协议/变换/指标
-    pipeline: str = ""
+    # 流程名（pipeline/pipelines.py 里的模板）；给了就用它的协议/变换/指标。
+    # 写成列表就是按顺序跑多段（如集合降水检验两次窗口），结果合并落同一个 output_dir
+    pipeline: Union[str, List[str]] = ""
 
     # 协议口径覆盖（如观测为北京时：local_utc_offset_hours=8）
     options: Dict[str, Any] = field(default_factory=dict)
@@ -85,6 +86,45 @@ class EvalConfig:
                 raise ValueError(f"无效的结束日期格式: {self.end_date}")
 
         return start, end
+
+
+def metric_options_from_var_metrics(
+    var_metrics: Dict[str, List[str]],
+    metrics: Optional[List[str]] = None,
+) -> Dict[str, Dict[str, Any]]:
+    """把「变量 -> 指标」翻译成 ``EvalConfig.metric_options``。
+
+    参考实现用 ``--var-metrics z500:rmse,acc`` 声明"哪个变量算哪些指标"；
+    框架里的对应声明是 ``metric_options[指标名]["variables"] = [变量...]``。
+    这里做一次反转，配置就能直接照抄参考实现的形状：
+
+        VAR_METRICS = {"z500": ["rmse", "acc"], "t2m": ["rmse"]}
+        metric_options = metric_options_from_var_metrics(VAR_METRICS)
+
+    没被任何变量点名的指标不会出现在结果里；想要某个指标评全部变量，
+    就在 ``var_metrics`` 里给每个变量都写上它。
+
+    Args:
+        var_metrics: 变量 -> 指标名列表（顺序即结果里的变量顺序）。
+        metrics: 要输出哪些指标；默认取 ``var_metrics`` 里出现过的全部。
+    """
+    names = (
+        list(metrics)
+        if metrics
+        else [name for items in var_metrics.values() for name in items]
+    )
+    ordered: List[str] = []
+    for name in names:
+        if name not in ordered:
+            ordered.append(name)
+    return {
+        name: {
+            "variables": [
+                variable for variable, items in var_metrics.items() if name in items
+            ]
+        }
+        for name in ordered
+    }
 
 
 def _resolve_config_path(value: str) -> Path:

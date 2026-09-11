@@ -95,6 +95,15 @@ class Metric(ABC):
         """该指标是否必须拿到原始集合成员（概率/集合类指标为 True）。"""
         return self.requirements().product_type is ProductType.ENSEMBLE_SAMPLES
 
+    def needs_reference(self) -> bool:
+        """该指标是否要用参考源（气候态、气候概率等）。
+
+        Runner 据此决定要不要构建参考源：配置里配了参考、但这一段没指标用它，
+        就不该去建、更不该在每个样本上白查一次。默认 False——不需要参考的指标
+        占多数，跟 ``needs_members`` 一样由用到参考的子类覆写成 True。
+        """
+        return False
+
     def validate(self, batch: EvaluationBatch) -> None:
         """
         检查单位、维度、成员、坐标、时间语义和阈值
@@ -210,3 +219,22 @@ class Metric(ABC):
         self.validate(batch)
         state = self.accumulate(batch)
         return self.finalize(state)
+
+
+def single_variable(data: Any, side: str) -> xr.DataArray:
+    """从 Dataset 里取出唯一的变量场。
+
+    指标一次只评一个变量。多变量批次必须由 ``metric_options`` 的 ``variables``
+    路由到具体变量后再交给指标（Runner 会调 ``matcher.narrow_batch``）。
+
+    这里拿到多变量的 Dataset 说明配置漏了路由：静默取第一个变量会得出一个
+    看起来正常、实际只代表某一个变量的分数，所以直接报错。
+    """
+    names = list(data.data_vars)
+    if len(names) != 1:
+        raise MetricError(
+            f"{side} 传入了 {len(names)} 个变量 {names}，但该指标一次只评一个变量；"
+            "请在配置的 metric_options 里声明变量路由，例如 "
+            '{"rmse": {"variables": ["z500", "t2m"]}}'
+        )
+    return data[names[0]]

@@ -16,6 +16,7 @@ from xmetai_evaluation.metrics.base import (
     MetricRequirements,
     MetricState,
     ProductType,
+    single_variable,
 )
 from xmetai_evaluation.core.contracts import (
     EvaluationBatch,
@@ -48,6 +49,10 @@ class ACC(Metric):
             variables=["*"],
         )
 
+    def needs_reference(self) -> bool:
+        """距平相关系数要气候态才算得出距平（缺参考时零场兜底、结果无意义）。"""
+        return True
+
     def accumulate(self, batch: EvaluationBatch) -> MetricState:
         """
         累积相关统计量
@@ -70,9 +75,9 @@ class ACC(Metric):
             observation = batch.observation.payload if hasattr(batch.observation, "payload") else batch.observation
 
         if isinstance(forecast, xr.Dataset):
-            forecast = forecast[list(forecast.data_vars)[0]]
+            forecast = single_variable(forecast, "预报")
         if isinstance(observation, xr.Dataset):
-            observation = observation[list(observation.data_vars)[0]]
+            observation = single_variable(observation, "观测")
         # 获取气候态
         if batch.reference is None:
             # 如果没有气候态，使用零场（临时方案）

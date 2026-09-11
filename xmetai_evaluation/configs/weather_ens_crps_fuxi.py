@@ -35,7 +35,8 @@ cfg = EvalConfig(
     end_date=os.environ.get("END_DATE", "20251231"),
 
     output_dir=os.environ.get(
-        "EVAL_OUTPUT", "evaluation_results/weather_ens_crps_fuxi"
+        "EVAL_OUTPUT",
+        "/workspace/szwCode/xmetai-evaluate/evaluation_results/weather_ens_crps_fuxi",
     ),
     writers=["csv_long"],
     log_level="INFO",

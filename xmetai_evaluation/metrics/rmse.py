@@ -13,6 +13,7 @@ from xmetai_evaluation.metrics.base import (
     MetricRequirements,
     MetricState,
     ProductType,
+    single_variable,
 )
 from xmetai_evaluation.core.contracts import (
     EvaluationBatch,
@@ -62,9 +63,9 @@ class RMSE(Metric):
             observation = batch.observation.payload if hasattr(batch.observation, "payload") else batch.observation
 
         if isinstance(forecast, xr.Dataset):
-            forecast = forecast[list(forecast.data_vars)[0]]
+            forecast = single_variable(forecast, "预报")
         if isinstance(observation, xr.Dataset):
-            observation = observation[list(observation.data_vars)[0]]
+            observation = single_variable(observation, "观测")
 
         # 计算误差
         error = forecast - observation
