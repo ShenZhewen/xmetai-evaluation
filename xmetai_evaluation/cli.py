@@ -16,15 +16,18 @@ from xmetai_evaluation.configs.base import load_config
 from xmetai_evaluation.logging_util import configure_logging
 from xmetai_evaluation.pipeline.pipelines import list_pipelines
 from xmetai_evaluation.pipeline.runner import Runner
-from xmetai_evaluation.pipeline.spec import PipelineSpec
+from xmetai_evaluation.pipeline.spec import specs_from_config
 
 
 def run_evaluation(cfg) -> int:
     """执行一次评测（EvalConfig -> PipelineSpec -> Runner）。
 
+    配置里的 ``pipeline`` 可以是一串流程模板，那样就是一条命令跑多段、
+    结果合并落同一个 ``output_dir``。
+
     程序化入口：集成测试直接构造 EvalConfig 调用这里，绕过 argparse。
     """
-    Runner(PipelineSpec.from_config(cfg)).run()
+    Runner(specs_from_config(cfg)).run()
     return 0
 
 

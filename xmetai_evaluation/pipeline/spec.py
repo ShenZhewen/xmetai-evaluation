@@ -190,11 +190,17 @@ class PipelineSpec:
         return start, end
 
     @classmethod
-    def from_config(cls, cfg: Any) -> "PipelineSpec":
+    def from_config(cls, cfg: Any, pipeline: Optional[str] = None) -> "PipelineSpec":
         """从 ``configs/*.py`` 的 ``EvalConfig`` 构造声明。
 
-        - 配置声明了 ``pipeline``：用该流程模板（推荐）；
-        - 否则：把配置里的 protocol/transforms/metrics 内联成一份临时模板（兼容旧配置）。
+        Args:
+            cfg: 配置对象。
+            pipeline: 指定流程模板名；不给就用配置里声明的那个。配置里的
+                ``pipeline`` 可以是列表（多段），那时由 ``specs_from_config``
+                逐段调用本方法并把名字传进来。
+
+        Raises:
+            ConfigError: 配置没有声明任何流程模板。
         """
         forecast_config = dict(cfg.forecast_reader)
         observation_config = dict(cfg.observation_reader)
@@ -208,14 +214,7 @@ class PipelineSpec:
 
         from xmetai_evaluation.pipeline.pipelines import get_template
 
-        pipeline_name = str(getattr(cfg, "pipeline", "") or "")
-        if not pipeline_name:
-            from xmetai_evaluation.pipeline.pipelines import list_pipelines
-
-            raise ConfigError(
-                f"配置 {cfg.name} 没有声明 pipeline（要走哪套流程）。"
-                f"可用流程: {', '.join(sorted(list_pipelines()))}"
-            )
+        pipeline_name = str(pipeline or "").strip() or pipeline_names(cfg)[0]
         template = get_template(pipeline_name)
 
         return cls(
@@ -239,10 +238,43 @@ class PipelineSpec:
             ),
             log_level=getattr(cfg, "log_level", "INFO"),
             variables=variables,
-            config_options={},
+            config_options=dict(getattr(cfg, "options", None) or {}),
             transform_options=dict(getattr(cfg, "transform_options", None) or {}),
             metric_options=dict(getattr(cfg, "metric_options", None) or {}),
         )
+
+
+def pipeline_names(cfg: Any) -> List[str]:
+    """配置声明的流程模板名列表。
+
+    ``pipeline`` 写一个名字就是一段；写一串就是按顺序跑多段（比如集合降水
+    检验要 24h 的 TS 和 6h 的概率评分两套窗口，见 ``pipelines.py``）。
+
+    Raises:
+        ConfigError: 一个流程名都没声明。
+    """
+    raw = getattr(cfg, "pipeline", "") or ""
+    if isinstance(raw, str):
+        names = [raw.strip()] if raw.strip() else []
+    else:
+        names = [str(name).strip() for name in raw if str(name).strip()]
+    if not names:
+        from xmetai_evaluation.pipeline.pipelines import list_pipelines
+
+        raise ConfigError(
+            f"配置 {cfg.name} 没有声明 pipeline（要走哪套流程）。"
+            f"可用流程: {', '.join(sorted(list_pipelines()))}"
+        )
+    return names
+
+
+def specs_from_config(cfg: Any) -> List[PipelineSpec]:
+    """把一份配置展开成要跑的若干段（每段一个流程模板）。
+
+    多段共用一个 ``output_dir``：结果合并后由 Runner 落盘一次，长表里靠
+    ``window_h`` 之类的列区分是哪一段算的。
+    """
+    return [PipelineSpec.from_config(cfg, name) for name in pipeline_names(cfg)]
 
 
 def _parse_date(value: str, field_name: str) -> datetime:

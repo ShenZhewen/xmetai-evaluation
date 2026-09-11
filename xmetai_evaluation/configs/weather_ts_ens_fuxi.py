@@ -1,95 +1,64 @@
 # -*- coding: utf-8 -*-
-"""集合降水分类检验（FuXi 集合 × Diamond 站点）。
+"""集合降水分类检验（FuXi 集合 × Diamond 站点）：一条命令跑两段。
 
-流程：``weather_ts_ens``（集合平均 → 窗口累积 → 插值到站点；TS 系列 + 概率评分 AROC/BS/BSS）。
-数据：``{FUXI_ENS_OUTPUT}/YYYYMMDD/member_*/001.nc…``（TP，逐 6h）。
-BSS 参考：设 ``BSS_REF``（ref/MMDDHH.000 目录）且 ``WINDOW_HOURS=6`` 时用外部气候概率，
-否则回退样本气候频率 r(1-r)。
+口径由负责人给定，对标原版 ``run_categorical.py``（``--window-ts 24 --window-aroc 6``）：
+
+    窗口 24  集合平均场   TS / POD / FAR / 频率偏差        -> weather_ts_ens
+    窗口 6   逐成员        AROC / BS / BSS（要气候概率）    -> weather_ts_ens_prob
+
+两段的窗口不同，而一条模板只有一个 ``window_hours``（它同时决定观测累积长度和
+有效时效的筛选），所以配置里用列表声明两条模板，框架按顺序各跑一段、结果合并后
+落盘一次：
+
+    scores.csv                        两段的统一长表，靠 window_h 列区分（24 / 6）
+    diagnostics/categorical_wide.csv  仅 24h 的 TS 宽表
+    diagnostics/probability_wide.csv  仅 6h 的 AROC/BS/BSS 宽表
+    manifest.json                     运行记录（segments 里有每段的窗口）
+
+阈值不在这里配：两条模板自带的阈值常量（24h 的 [0.1,10,25,50,100]、
+6h 的 [0.1,4,13,25]）已与原版输出逐格一致，且 6h 那组必须与参考文件的 4 列同集合。
+
+数据：
+    预报  {fuxi_ens_output}/YYYYMMDD/member_*/001.nc…（TP，逐 6h）
+    观测  Diamond 站点降水（北京时，协议默认 +8 对齐）
+    参考  气候概率目录 ref/MMDDHH.000（**必填**，见 BSS_REF_DEFAULT）
 """
-import os
 
 from xmetai_evaluation.configs.base import EvalConfig
 
-
-def _window_hours() -> float:
-    """累积窗口：``WINDOW_HOURS=6`` 切到 6h 口径（参考实现的 AROC/BSS 用 6h）。"""
-    return float(os.environ.get("WINDOW_HOURS", "24"))
-
-
-def _lead_times():
-    """``LEAD_TIMES=6,12,18,24`` 只读部分时效，显著降低内存与耗时。"""
-    raw = os.environ.get("LEAD_TIMES", "").strip()
-    if not raw:
-        return None
-    return [float(item) for item in raw.split(",") if item.strip()]
-
-
-def _writers():
-    """输出视图：默认最小集；``WRITERS=csv_long,categorical_wide,probability_wide`` 打开宽表。"""
-    raw = os.environ.get("WRITERS", "csv_long")
-    return [name.strip() for name in raw.split(",") if name.strip()]
-
-
-WINDOW = _window_hours()
-
-#: TS 阈值（对齐参考实现 DEFAULT_THRESHOLDS）
-TS_THRESHOLDS = {
-    6.0: [0.1, 13.0, 25.0],
-    24.0: [0.1, 10.0, 25.0, 50.0, 100.0],
-}.get(WINDOW, [0.1, 10.0, 25.0, 50.0, 100.0])
-
-#: 概率评分阈值（对齐参考实现 DEFAULT_AROC_THRESHOLDS）
-PROB_THRESHOLDS = {
-    6.0: [0.1, 4.0, 13.0, 25.0],
-    24.0: [0.1, 4.0, 13.0, 25.0],
-}.get(WINDOW, [0.1, 4.0, 13.0, 25.0])
-
-
-def _reference_reader():
-    """BSS 外部气候概率参考（可选，仅 6h 窗口径，对标原版 ``--ref``）。
-
-    设 ``BSS_REF`` 指向 ref/MMDDHH.000 目录、且 ``WINDOW_HOURS=6`` 时才启用；
-    否则 BSS 回退样本气候频率 r(1-r)。
-    """
-    if WINDOW == 6.0 and os.environ.get("BSS_REF"):
-        return {"type": "ref_probability", "root_dir": os.environ["BSS_REF"]}
-    return None
-
+#: BSS 的外部气候概率目录（``ref/MMDDHH.000``：站号 + 4 个超越式概率）。
+#: 负责人给定的固定输入，对应原版的 ``--ref``；换目录直接改这一行。
+BSS_REF_DEFAULT = "/workspace/data/worm/r0/ref"
 
 cfg = EvalConfig(
     name="weather_ts_ens_fuxi",
-    description="FuXi 集合降水评估：集合平均 TS + 概率评分 AROC/BS/BSS",
-    pipeline="weather_ts_ens",
+    description="FuXi 集合降水评估：24h 集合平均 TS + 6h 逐成员概率 AROC/BS/BSS",
+    # 两段：先 24h 的 TS，再 6h 的概率评分（顺序即执行顺序，结果合并落盘）
+    pipeline=["weather_ts_ens", "weather_ts_ens_prob"],
 
     forecast_reader={
         "type": "fuxi_ens",
-        "root_dir": os.environ.get(
-            "FUXI_ENS_OUTPUT", "/workspace/data/shenzw/fuxi_ens_output"
-        ),
+        "root_dir": "/workspace/data/shenzw/fuxi_ens_output",
         "variable": "tp",
         "step_hours": 6.0,
-        "lead_times": _lead_times(),
+        # 只读部分时效可显著降内存（如 [6, 12, 18, 24]）；
+        # 注意 24h 段要求时效里有 24 的倍数，裁太短会让那一段一个样本都跑不出来
+        "lead_times": None,
     },
     observation_reader={
         "type": "station",
-        "root_dir": os.environ.get("STATION_OBS", "/workspace/data/worm/r0/2025"),
+        "root_dir": "/workspace/data/worm/r0/2025",
         "variable": "precipitation",
-        "station_list": os.environ.get(
-            "STATION_LIST", "/workspace/data/worm/r0/zd_sta_10285.dat"
-        ) or None,
+        "station_list": "/workspace/data/worm/r0/zd_sta_10285.dat",
     },
-    reference_reader=_reference_reader(),
+    # BSS 的气候概率参考。必须给：缺了会降级成样本气候频率 r(1-r)，
+    # 那算出来的 BSS 与原版不可比。
+    reference_reader={"type": "ref_probability", "root_dir": BSS_REF_DEFAULT},
 
-    transform_options={"time_window_accumulator": {"window_hours": WINDOW}},
-    metric_options={
-        "ts_score": {"thresholds": TS_THRESHOLDS},
-        "ensemble_probability": {"thresholds": PROB_THRESHOLDS},
-    },
+    start_date="20250101",
+    end_date="20251231",
+    limit=None,  # 限起报数，直接改这里；None = 不限
 
-    start_date=os.environ.get("START_DATE", "20250101"),
-    end_date=os.environ.get("END_DATE", "20251231"),
-
-    output_dir=os.environ.get("EVAL_OUTPUT", "evaluation_results/weather_ts_ens_fuxi"),
-    writers=_writers(),
+    output_dir="/workspace/szwCode/xmetai-evaluate/evaluation_results/ts_multi_fuxi_ens",
     log_level="INFO",
 )

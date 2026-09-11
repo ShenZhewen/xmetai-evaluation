@@ -9,10 +9,16 @@
     python -m xmetai_evaluation --list-pipelines            # 看能力清单
     python -m xmetai_evaluation --config my_config.py       # 配置自己声明 pipeline
 
-9 条流程按三大业务块统一前缀：``fdp_``（业务天气评测）、``weather_``（天气模型
+11 条流程按三大业务块统一前缀：``fdp_``（业务天气评测）、``weather_``（天气模型
 验证）、``clim_``（气候，待落地）。每条模板的 ``description`` 就是
 ``--list-pipelines`` 打印的内容（含用途、输入数据、计算口径、指标阈值与产出文件），
 所以这里不再另抄一份流程清单。阈值之类的数字直接引用本文件的常量，改常量即生效。
+
+一条模板只有**一个时间窗口**（``station_valid_time`` 的 ``window_hours`` 同时决定
+观测累积长度和有效时效的筛选）。需要两套窗口的能力就写成两条模板，由配置的
+``pipeline`` 列表按顺序一起跑（见 ``weather_ts_ens`` / ``weather_ts_ens_prob``）。
+窗口写死在模板里是有意的：``transform_options`` 和 ``options`` 是各段共用的，
+从配置里给窗口会同时改掉每一段。
 """
 
 from __future__ import annotations
@@ -53,32 +59,54 @@ PIPELINE_TEMPLATES: Dict[str, PipelineTemplate] = {
         metrics=[MetricSpec("ts_score", {"thresholds": TS_THRESHOLDS})],
         writers=["csv_long", "categorical_wide"],
     ),
+    # 集合降水检验拆成两条：窗口 24 的 TS 与窗口 6 的概率评分口径不同，
+    # 一条模板只能有一个窗口（station_valid_time 的 window_hours 同时决定观测
+    # 累积长度和有效时效的筛选），所以只能在配置里把两条一起列出来跑。
     "weather_ts_ens": PipelineTemplate(
         name="weather_ts_ens",
         protocol="station_valid_time",
         description=(
-            "集合降水分类检验（站点）：集合平均 TS/POD/FAR + 逐成员概率 AROC/BS/BSS\n"
-            "  用途  两路检验：集合平均场算 TS 系列；逐成员算概率评分\n"
-            "  数据  预报 fuxi_ens（tp，逐 6h，member_* 子目录）/ 观测 station\n"
-            "        参考 可选 ref_probability（ref/MMDDHH.000 目录，BSS 用）\n"
+            "集合降水分类检验（站点，24h）：集合平均 TS/POD/FAR/频率偏差\n"
+            "  用途  集合平均场当确定性预报用，看 24h 累积降水的落区与量级\n"
+            "  数据  预报 fuxi_ens（tp，逐 6h，member_* 子目录）/ 观测 station / 参考 无\n"
             "  计算  station_valid_time：集合平均 → 24h 累积 → 双线性插值到站\n"
             f"  指标  ts_score  thresholds={TS_THRESHOLDS}\n"
-            f"        ensemble_probability  thresholds={PROB_THRESHOLDS}\n"
-            "        概率按超越式口径（x ≥ 阈值）；BS_ref 默认样本气候频率 r(1-r)，\n"
-            "        有外部气候概率时改为 mean((p_clim-o)^2)（仅 6h 窗口生效）\n"
-            "        产出 scores.csv、diagnostics/categorical_wide.csv、\n"
-            "        diagnostics/probability_wide.csv"
+            "        逐阈值逐时效给 TS / POD / FAR / 漏报率 / 频率偏差 BIAS\n"
+            "        产出 scores.csv、diagnostics/categorical_wide.csv\n"
+            "  配套  概率评分 AROC/BS/BSS 走另一条 weather_ts_ens_prob（6h 口径，\n"
+            "        需要外部气候概率参考）；配置里写\n"
+            "        pipeline=[\"weather_ts_ens\", \"weather_ts_ens_prob\"] 一次跑完两条"
         ),
         transforms=[
             TransformSpec("ensemble_mean"),
             TransformSpec("time_window_accumulator", {"window_hours": 24}),
             TransformSpec("grid_to_station", {"method": "bilinear"}),
         ],
-        metrics=[
-            MetricSpec("ts_score", {"thresholds": TS_THRESHOLDS}),
-            MetricSpec("ensemble_probability", {"thresholds": PROB_THRESHOLDS}),
+        metrics=[MetricSpec("ts_score", {"thresholds": TS_THRESHOLDS})],
+        writers=["csv_long", "categorical_wide"],
+    ),
+    "weather_ts_ens_prob": PipelineTemplate(
+        name="weather_ts_ens_prob",
+        protocol="station_valid_time",
+        description=(
+            "集合降水概率评分（站点，6h）：逐成员 AROC/BS/BSS\n"
+            "  用途  集合本身的可靠性：排序能力（AROC）、概率误差（BS）、\n"
+            "        相对气候基准的技巧（BSS）\n"
+            "  数据  预报 fuxi_ens（tp，逐 6h，member_* 子目录）/ 观测 station\n"
+            "        参考 ref_probability（ref/MMDDHH.000 目录）——BSS 的\n"
+            "        BS_ref = mean((p_clim-o)²)，必填；缺参考会降级成样本气候频率 r(1-r)\n"
+            f"  指标  ensemble_probability  thresholds={PROB_THRESHOLDS}\n"
+            "        超越式口径（x ≥ 阈值）；阈值集合必须与参考文件列一致\n"
+            "        产出 scores.csv、diagnostics/probability_wide.csv\n"
+            "  配套  集合平均的 TS 系列走 weather_ts_ens（24h 口径）\n"
+            "  注意  这里**不做集合平均**：概率要逐成员算，均值会把成员信息抹掉"
+        ),
+        transforms=[
+            TransformSpec("time_window_accumulator", {"window_hours": 6}),
+            TransformSpec("grid_to_station", {"method": "bilinear"}),
         ],
-        writers=["csv_long", "categorical_wide", "probability_wide"],
+        metrics=[MetricSpec("ensemble_probability", {"thresholds": PROB_THRESHOLDS})],
+        writers=["csv_long", "probability_wide"],
     ),
     "weather_field_scores": PipelineTemplate(
         name="weather_field_scores",
@@ -120,6 +148,31 @@ PIPELINE_TEMPLATES: Dict[str, PipelineTemplate] = {
         ),
         transforms=[TransformSpec("ensemble_mean")],
         metrics=[MetricSpec("crps"), MetricSpec("spread_error")],
+        writers=["csv_long"],
+        options={"ensemble_reduction": "mean"},
+    ),
+    "weather_ens_field_scores": PipelineTemplate(
+        name="weather_ens_field_scores",
+        protocol="grid_valid_time",
+        description=(
+            "集合场检验：RMSE / CRPS / ACC / 预报活跃度 / 纬向谱\n"
+            "  用途  同一批集合样本上既看确定性误差（集合均值 vs 实况），\n"
+            "        也看集合分布本身的质量（CRPS）\n"
+            "  数据  预报 fuxi_ens（集合）/ 观测 era5_zarr\n"
+            "        参考 daily_climatology —— ACC / 活跃度必需，纬向谱不需要\n"
+            "  计算  grid_valid_time：格点有效时刻配对；集合均值另算\n"
+            "        CRPS 直接吃原始成员，不走均值\n"
+            "  指标  rmse、crps、acc、activity、zonal_spectrum\n"
+            "        产出 scores.csv"
+        ),
+        transforms=[TransformSpec("ensemble_mean")],
+        metrics=[
+            MetricSpec("rmse"),
+            MetricSpec("crps"),
+            MetricSpec("acc"),
+            MetricSpec("activity"),
+            MetricSpec("zonal_spectrum"),
+        ],
         writers=["csv_long"],
         options={"ensemble_reduction": "mean"},
     ),

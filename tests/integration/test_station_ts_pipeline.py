@@ -4,6 +4,7 @@
 配置 -> 注册表 -> Reader -> Transform -> Metric -> 统一长表 的整条链路。
 """
 
+import json
 from datetime import datetime, timedelta
 
 import numpy as np
@@ -305,7 +306,10 @@ def _write_split_observations(root):
 
 
 def test_ensemble_probability_scores_are_written(tmp_path):
-    """同一批成员：TS 走集合平均场，AROC/BS/BSS 走原始成员。"""
+    """一条命令跑两段：24h 集合平均出 TS，6h 逐成员出 AROC/BS/BSS。
+
+    两段窗口不同 → 两条模板；框架按顺序各跑一段，结果合并落盘一次。
+    """
     forecast_root = tmp_path / "forecast_ens"
     station_root = tmp_path / "stations"
     station_root.mkdir()
@@ -315,8 +319,8 @@ def test_ensemble_probability_scores_are_written(tmp_path):
 
     config = EvalConfig(
         name="synthetic_ensemble_prob",
-        description="集合概率评分端到端",
-        pipeline="weather_ts_ens",
+        description="集合概率评分端到端（两段）",
+        pipeline=["weather_ts_ens", "weather_ts_ens_prob"],
         forecast_reader={
             "type": "fuxi_ens",
             "root_dir": str(forecast_root),
@@ -328,37 +332,58 @@ def test_ensemble_probability_scores_are_written(tmp_path):
             "root_dir": str(station_root),
             "variable": "precipitation",
         },
-        transform_options={"time_window_accumulator": {"window_hours": WINDOW_HOURS}},
-        metric_options={
-            "ts_score": {"thresholds": [0.1]},
-            "ensemble_probability": {"thresholds": [0.1]},
-        },
         start_date=INIT_TIME.strftime("%Y%m%d"),
         end_date=INIT_TIME.strftime("%Y%m%d"),
         output_dir=str(output_dir),
-        writers=["csv_long", "categorical_wide", "probability_wide"],
+        # writers 留 None：各段用自己的模板视图，Runner 取并集后合并写一次
     )
 
     assert run_evaluation(config) == 0
 
     scores = pd.read_csv(output_dir / "scores.csv")
+    # 两段的行在同一张长表里共存，靠 window_h 区分
+    assert set(scores["window_h"]) == {24, 6}
+
     ts_row = scores[scores["metric"] == "ts"].iloc[0]
     assert ts_row["value"] == pytest.approx(1.0)  # 集合平均场：A 正确否定，B 命中
     assert ts_row["n_valid"] == len(STATIONS)
+    assert ts_row["window_h"] == 24
 
-    prob = scores[scores["product_kind"] == "probabilistic"].set_index("metric")
+    # 概率评分走 6h 窗口，每个时效各一条；本用例里成员雨量逐时效相同，
+    # 所以只看 lead=6、阈值 0.1 那一档就够（6h 累积下 A/B 两站仍是"无事件/有事件"）
+    probabilistic = scores[scores["product_kind"] == "probabilistic"]
+    assert set(probabilistic["lead_h"]) == {6.0, 12.0, 18.0, 24.0}
+    assert (probabilistic["window_h"] == 6).all()
+    prob = probabilistic[
+        (probabilistic["lead_h"] == 6.0) & (probabilistic["threshold"] == 0.1)
+    ].set_index("metric")
     assert {"aroc", "bs", "bss"}.issubset(set(prob.index))
     assert prob.loc["aroc", "value"] == pytest.approx(1.0)
     assert prob.loc["bs", "value"] == pytest.approx(0.125)
     assert prob.loc["bss", "value"] == pytest.approx(0.5)
     assert prob.loc["aroc", "n_valid"] == len(STATIONS)
 
+    categorical = pd.read_csv(output_dir / "diagnostics" / "categorical_wide.csv")
+    assert (categorical["window_h"] == 24).all()
+    assert set(categorical["threshold_mm"]) == {0.1, 10.0, 25.0, 50.0, 100.0}
+    assert categorical[categorical["threshold_mm"] == 0.1].iloc[0]["TS"] == pytest.approx(1.0)
+
     wide = pd.read_csv(output_dir / "diagnostics" / "probability_wide.csv")
     assert {"grade", "threshold_mm", "AROC", "BS", "BS_ref", "BSS", "base_rate", "n_points"}.issubset(
         set(wide.columns)
     )
-    first = wide.iloc[0]
+    assert (wide["window_h"] == 6).all()
+    # 模板默认的 4 档阈值都要出数（不再是配置里只给 0.1 的那一档）
+    assert set(wide["threshold_mm"]) == {0.1, 4.0, 13.0, 25.0}
+    first = wide[wide["threshold_mm"] == 0.1].iloc[0]
     assert first["AROC"] == pytest.approx(1.0)
     assert first["BSS"] == pytest.approx(0.5)
     assert first["base_rate"] == pytest.approx(0.5)
     assert first["n_points"] == len(STATIONS)
+
+    manifest = json.loads((output_dir / "manifest.json").read_text(encoding="utf-8"))
+    assert [segment["pipeline"] for segment in manifest["segments"]] == [
+        "weather_ts_ens",
+        "weather_ts_ens_prob",
+    ]
+    assert [segment["window_h"] for segment in manifest["segments"]] == [24, 6]
