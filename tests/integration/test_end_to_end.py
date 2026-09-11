@@ -1,28 +1,46 @@
 """
 端到端集成测试：确定性降水 RMSE 评测
 
-验证 README Change 6 要求：
-- Reader 读取合成数据
-- Metric 计算 RMSE
-- Pipeline 编排整个流程
-- 不依赖真实气象数据
+验证链路：合成数据 → DataBundle → RMSE（整批/分块一致）→ ResultStore 长表产物。
+不依赖真实气象数据，也不依赖任何具体 Reader 实现（本地 helper 直接包装 DataBundle）。
 """
 
 import pytest
-from pathlib import Path
 import pandas as pd
 import xarray as xr
 import numpy as np
-from datetime import datetime
 
-from xmetai_evaluation.io.netcdf_reader import SimpleNetCDFReader
 from xmetai_evaluation.metrics.rmse import RMSE
 from xmetai_evaluation.core.contracts import (
-    DataRequest,
     EvaluationBatch,
+    DataBundle,
     DataKind,
+    SemanticMetadata,
+    Provenance,
 )
+from xmetai_evaluation.core.variables import TemporalKind
 from xmetai_evaluation.results import SCORE_COLUMNS, ResultStore, RunContext
+
+
+def _load_bundle(path, source_id):
+    """把合成 NetCDF 文件直接包装成 DataBundle（替代已删除的 SimpleNetCDFReader）。"""
+    ds = xr.open_dataset(path)
+    return DataBundle(
+        payload=ds,
+        kind=DataKind.GRIDDED_FORECAST,
+        source_id=source_id,
+        standard_vars={var: var for var in ds.data_vars},
+        semantic=SemanticMetadata(
+            units={var: str(ds[var].attrs.get("units", "unknown")) for var in ds.data_vars},
+            temporal_kind=TemporalKind.INSTANTANEOUS,
+            grid_type="regular_latlon",
+        ),
+        provenance=Provenance(
+            input_files=[str(path)],
+            reader_id=source_id,
+            reader_version="1.0.0",
+        ),
+    )
 
 
 @pytest.fixture
@@ -82,8 +100,6 @@ def synthetic_forecast_obs_pair(tmp_path):
     return {
         "forecast_path": fcst_path,
         "observation_path": obs_path,
-        "forecast_dir": fcst_dir,
-        "observation_dir": obs_dir,
         "true_bias": bias,
         "noise_std": noise_std,
         "n_samples": n_samples,
@@ -100,26 +116,18 @@ class TestEndToEndDeterministicRMSE:
         测试手动组装的工作流
 
         步骤：
-        1. 用 Reader 读取预报和观测
+        1. 读取预报和观测为 DataBundle
         2. 构建 EvaluationBatch
         3. 用 RMSE 计算指标
         4. 验证结果合理
         """
         # Step 1: 读取数据
-        fcst_reader = SimpleNetCDFReader.with_root_dir(
-            root_dir=synthetic_forecast_obs_pair["forecast_dir"],
-            source_id="synthetic_forecast",
+        fcst_bundle = _load_bundle(
+            synthetic_forecast_obs_pair["forecast_path"], "synthetic_forecast"
         )
-        obs_reader = SimpleNetCDFReader.with_root_dir(
-            root_dir=synthetic_forecast_obs_pair["observation_dir"],
-            source_id="synthetic_obs",
+        obs_bundle = _load_bundle(
+            synthetic_forecast_obs_pair["observation_path"], "synthetic_obs"
         )
-
-        fcst_request = DataRequest(source_id="synthetic_forecast", variables=["t2m"])
-        obs_request = DataRequest(source_id="synthetic_obs", variables=["t2m"])
-
-        fcst_bundle = fcst_reader.load(fcst_request)
-        obs_bundle = obs_reader.load(obs_request)
 
         # 验证读取成功
         assert fcst_bundle.source_id == "synthetic_forecast"
@@ -175,20 +183,12 @@ class TestEndToEndDeterministicRMSE:
     def test_with_partial_masking(self, synthetic_forecast_obs_pair):
         """测试部分掩码场景"""
         # 读取数据
-        fcst_reader = SimpleNetCDFReader.with_root_dir(
-            root_dir=synthetic_forecast_obs_pair["forecast_dir"],
-            source_id="synthetic_forecast",
+        fcst_bundle = _load_bundle(
+            synthetic_forecast_obs_pair["forecast_path"], "synthetic_forecast"
         )
-        obs_reader = SimpleNetCDFReader.with_root_dir(
-            root_dir=synthetic_forecast_obs_pair["observation_dir"],
-            source_id="synthetic_obs",
+        obs_bundle = _load_bundle(
+            synthetic_forecast_obs_pair["observation_path"], "synthetic_obs"
         )
-
-        fcst_request = DataRequest(source_id="synthetic_forecast", variables=["t2m"])
-        obs_request = DataRequest(source_id="synthetic_obs", variables=["t2m"])
-
-        fcst_bundle = fcst_reader.load(fcst_request)
-        obs_bundle = obs_reader.load(obs_request)
 
         fcst_array = fcst_bundle.payload["t2m"]
         obs_array = obs_bundle.payload["t2m"]
@@ -236,20 +236,12 @@ class TestEndToEndDeterministicRMSE:
         模拟大数据场景：数据太大无法一次加载，需要分块处理。
         """
         # 读取数据
-        fcst_reader = SimpleNetCDFReader.with_root_dir(
-            root_dir=synthetic_forecast_obs_pair["forecast_dir"],
-            source_id="synthetic_forecast",
+        fcst_bundle = _load_bundle(
+            synthetic_forecast_obs_pair["forecast_path"], "synthetic_forecast"
         )
-        obs_reader = SimpleNetCDFReader.with_root_dir(
-            root_dir=synthetic_forecast_obs_pair["observation_dir"],
-            source_id="synthetic_obs",
+        obs_bundle = _load_bundle(
+            synthetic_forecast_obs_pair["observation_path"], "synthetic_obs"
         )
-
-        fcst_request = DataRequest(source_id="synthetic_forecast", variables=["t2m"])
-        obs_request = DataRequest(source_id="synthetic_obs", variables=["t2m"])
-
-        fcst_bundle = fcst_reader.load(fcst_request)
-        obs_bundle = obs_reader.load(obs_request)
 
         fcst_array = fcst_bundle.payload["t2m"]
         obs_array = obs_bundle.payload["t2m"]
@@ -310,19 +302,12 @@ class TestEndToEndResultsTable:
 
     def test_results_are_written_as_canonical_long_table(self, tmp_path, synthetic_forecast_obs_pair):
         """任意评测的结果都应落成同一种长表"""
-        fcst_reader = SimpleNetCDFReader.with_root_dir(
-            root_dir=synthetic_forecast_obs_pair["forecast_dir"],
-            source_id="synthetic_forecast",
+        fcst_bundle = _load_bundle(
+            synthetic_forecast_obs_pair["forecast_path"], "synthetic_forecast"
         )
-        obs_reader = SimpleNetCDFReader.with_root_dir(
-            root_dir=synthetic_forecast_obs_pair["observation_dir"],
-            source_id="synthetic_obs",
+        obs_bundle = _load_bundle(
+            synthetic_forecast_obs_pair["observation_path"], "synthetic_obs"
         )
-
-        fcst_request = DataRequest(source_id="synthetic_forecast", variables=["t2m"])
-        obs_request = DataRequest(source_id="synthetic_obs", variables=["t2m"])
-        fcst_bundle = fcst_reader.load(fcst_request)
-        obs_bundle = obs_reader.load(obs_request)
 
         fcst_array = fcst_bundle.payload["t2m"]
         obs_array = obs_bundle.payload["t2m"]
