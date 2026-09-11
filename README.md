@@ -20,15 +20,11 @@ xmetai-inference → 预报产品文件 → xmetai-evaluation → 评测结果�
 ```bash
 pip install -e .
 
-# 列出内置流程
+# 看有哪些评测功能
 xmetai-eval --list-pipelines
 
-# 跑内置任务（数据路径由环境变量提供，见 configs/*.py）
+# 开始评测（配置可以是内置名，也可以是 .py 路径；数据路径由环境变量提供）
 xmetai-eval --config weather_ts_ens_fuxi
-
-# 或指向自定义配置
-xmetai-eval --config /path/to/my_eval.py
-# 等价写法：python -m xmetai_evaluation --config weather_ts_ens_fuxi
 ```
 
 ## 目录结构
@@ -89,17 +85,17 @@ cli → load_config(EvalConfig) → PipelineSpec(流程模板+数据)
 
 流程与配置按三大业务块统一前缀命名：`fdp_`（业务天气评测，参考 `ref/fdp`）、`weather_`（天气模型验证，参考 `ref/tiqnqi` 两个库）、`clim_`（气候，参考 `ref/qihou`，待落地）。fdp 与 weather 的连续量/集合指标有重叠，属正常——两者是不同业务线，共用同一套 metric 实现。
 
-| 评测能力 | 流程名 | 输入数据 | 输出 CSV | 评估指标 |
-|---|---|---|---|---|
-| 确定性降水分类检验 | `weather_ts_det` | 确定性格点降水预报（`fuxi`，tp）+ Diamond 站点降水观测 | `scores.csv`、`diagnostics/categorical_wide.csv` | TS / POD / FAR / 漏报率 / 频率偏差（BIAS） |
-| 集合降水分类 + 概率检验 | `weather_ts_ens` | 集合格点降水预报（`fuxi_ens`，tp）+ Diamond 站点降水观测（可选 BSS 外部气候概率 `ref_probability`） | `scores.csv`、`diagnostics/categorical_wide.csv`、`diagnostics/probability_wide.csv` | 集合平均 TS / POD / FAR + 逐成员概率 AROC / BS / BSS |
-| 确定性连续量检验 | `weather_field_scores` | 格点场预报（`fuxi`，z500 等）+ 格点实况 + 气候态（ACC/活跃度必需） | `scores.csv` | RMSE / ACC / 预报活跃度（FA）+ 纬向功率谱 |
-| 集合连续评分 | `weather_ens_crps` | 集合格点场预报（`fuxi_ens`）+ 格点实况 | `scores.csv` | CRPS / Spread / 集合平均 RMSE / Spread-Error 比 |
-| 集合连续评分 | `fdp_ens_crps` | 集合格点场预报（`fengqing`）+ CRA40 再分析实况 | `scores.csv` | CRPS / Spread / 集合平均 RMSE / Spread-Error 比 |
-| 要素场检验 | `fdp_field_scores` | 格点场预报（`fengqing`，z500 等）+ CRA40 实况 + 气候态（可选，ACC 必需） | `scores.csv`、`scores.json` | RMSE / Bias / ACC |
-| 中国区站点降水检验 | `fdp_precip_ts` | 格点降水预报 + Diamond 站点降水观测（中国区，cos 纬度加权） | `scores.csv`、`diagnostics/categorical_wide.csv` | TS / 频率偏差（BIAS） |
-| 降水空间检验 | `fdp_precip_fss` | 格点降水预报 + 格点降水实况（CRA / CMPAS） | `scores.csv` | FSS（多邻域窗口） |
-| 活跃度比 / 功率谱 | `fdp_activity_spectrum` | 格点场预报（z500）+ 格点实况 + 气候态 | `scores.csv` | 活跃度比（AR / FC / OBS / BIAS）+ 功率谱（谱曲线 + 功率比） |
+| 评测能力 | 输入数据 | 输出 CSV | 评估指标 |
+|---|---|---|---|
+| **确定性降水分类检验**<br>`weather_ts_det` | 确定性格点降水预报（`fuxi`，tp）+ Diamond 站点降水观测 | `scores.csv`、`diagnostics/categorical_wide.csv` | TS / POD / FAR / 漏报率 / 频率偏差（BIAS） |
+| **集合降水分类 + 概率检验**<br>`weather_ts_ens` | 集合格点降水预报（`fuxi_ens`，tp）+ Diamond 站点降水观测（可选 BSS 外部气候概率 `ref_probability`） | `scores.csv`、`diagnostics/categorical_wide.csv`、`diagnostics/probability_wide.csv` | 集合平均 TS / POD / FAR + 逐成员概率 AROC / BS / BSS |
+| **确定性连续量检验**<br>`weather_field_scores` | 格点场预报（`fuxi`，z500 等）+ 格点实况 + 气候态（ACC/活跃度必需） | `scores.csv` | RMSE / ACC / 预报活跃度（FA）+ 纬向功率谱 |
+| **集合连续评分**<br>`weather_ens_crps` | 集合格点场预报（`fuxi_ens`）+ 格点实况 | `scores.csv` | CRPS / Spread / 集合平均 RMSE / Spread-Error 比 |
+| **集合连续评分**<br>`fdp_ens_crps` | 集合格点场预报（`fengqing`）+ CRA40 再分析实况 | `scores.csv` | CRPS / Spread / 集合平均 RMSE / Spread-Error 比 |
+| **要素场检验**<br>`fdp_field_scores` | 格点场预报（`fengqing`，z500 等）+ CRA40 实况 + 气候态（可选，ACC 必需） | `scores.csv`、`scores.json` | RMSE / Bias / ACC |
+| **中国区站点降水检验**<br>`fdp_precip_ts` | 格点降水预报 + Diamond 站点降水观测（中国区，cos 纬度加权） | `scores.csv`、`diagnostics/categorical_wide.csv` | TS / 频率偏差（BIAS） |
+| **降水空间检验**<br>`fdp_precip_fss` | 格点降水预报 + 格点降水实况（CRA / CMPAS） | `scores.csv` | FSS（多邻域窗口） |
+| **活跃度比 / 功率谱**<br>`fdp_activity_spectrum` | 格点场预报（z500）+ 格点实况 + 气候态 | `scores.csv` | 活跃度比（AR / FC / OBS / BIAS）+ 功率谱（谱曲线 + 功率比） |
 
 > 台风路径/强度检验（`ref/tiqnqi/xmetai_model_verification_xu/run_tc.py`：台风中心诊断 + babj 实况配对 + 路径/强度误差）尚未吸收进框架，属待办 gap。
 
