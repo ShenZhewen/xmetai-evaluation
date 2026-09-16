@@ -1392,7 +1392,12 @@ def _conclusion_summary(bundle: Bundle, change: Optional[str]) -> List[str]:
     if significant:
         items.append(
             "综合相对 RMSE 上通过 Holm 校正的显著差异："
-            + "；".join(f"{t.a} 优于 {t.b}（p={_fmt(t.p_holm, 4)}）" for t in significant)
+            # 方向只能来自检验结论（t.better），不能拿参数顺序 t.a/t.b 当优劣——
+            # 否则 B 更优时会写成「A 优于 B」，和第三节的表直接打架。
+            + "；".join(
+                f"{t.better} 优于 {t.b if t.better == t.a else t.a}（p={_fmt(t.p_holm, 4)}）"
+                for t in significant
+            )
             + "。"
         )
     else:

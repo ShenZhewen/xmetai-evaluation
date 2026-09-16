@@ -153,6 +153,7 @@ class FieldFile(object):
             h = _h5.File(self.path, "r")
             self._close = h.close
             self._read_h5py(h)
+        self._check_lat()
         if fix_lon:
             lon, fixed = fix_lon_if_buggy(self.lon)
             if fixed:
@@ -167,6 +168,26 @@ class FieldFile(object):
             self.lon_fixed = False
         self._init_date = None
         self._check_time_step()
+
+    def _check_lat(self):
+        """纬度坐标体检：单位必须是度、且步长为常规网格间隔。
+
+        传弧度时 |lat| <= pi 不会越界，但步长会比度制小 ~57 倍，
+        这里用步长兜底拒绝，避免 cos(lat) 权重静默算错。
+        """
+        lat = np.asarray(self.lat, dtype="f8")
+        if lat.size == 0:
+            return
+        vmax = float(np.nanmax(np.abs(lat)))
+        if vmax > 90.0 + 1e-6:
+            raise DataFileError(
+                "lat 超出 [-90, 90]：max|lat|=%.4f（%s）" % (vmax, self.path))
+        if lat.size > 1:
+            dlat = float(np.nanmean(np.abs(np.diff(lat))))
+            if dlat < 0.005:
+                raise DataFileError(
+                    "lat 步长均值 %.5f 过小，疑似单位为弧度（本库要求「度」）：%s"
+                    % (dlat, self.path))
 
     def _check_time_step(self):
         """时效步长为非常规值（非 1/3/6/12/24h 的均匀步长）时告警。

@@ -246,7 +246,9 @@ def summarize_det(root, out=None, plot=True, verbose=True):
 
     root 为 outdir_root（含 YYYYMMDD 子目录），每日期目录内有
     rmse_<date>_det.csv / acc_<date>_det.csv / fa_<date>_det.csv /
-    spectrum_<date>_<var>.csv（也支持 run_rmse 单对的 rmse_<date>.csv 无 _det 命名）。
+    spectrum_<date>_<var>.csv（也支持 run_rmse 单对的 rmse_<date>.csv 无 _det 命名），
+    以及带功率 zonal_bands_<date>_<var>.csv / spherical_bands_<date>_<var>.csv
+    （老归档没有这两类文件，照旧可用）。
     """
     root = str(root)
     out = out or root
@@ -262,6 +264,7 @@ def summarize_det(root, out=None, plot=True, verbose=True):
     rmse_f, acc_f = [], []
     fa_kind = {"pred": [], "obs": [], "bias": [], "ratio": []}
     spec = {}
+    bands = {}                       # var -> {"zonal"|"spherical": [逐日表, ...]}
     used = []
 
     for d in dates:
@@ -316,10 +319,21 @@ def summarize_det(root, out=None, plot=True, verbose=True):
             spec.setdefault(v, []).append(
                 (sp.index.to_numpy(), sp[predc], sp[obsc]))
             hit = True
+        for kind in ("zonal", "spherical"):
+            pre = "%s_bands_%s_" % (kind, d)
+            for bp in sorted(glob.glob(os.path.join(dd, pre + "*.csv"))):
+                v = os.path.basename(bp)[len(pre):-4]
+                try:
+                    bd = _read_one(bp)
+                except Exception:
+                    continue
+                if bd.size:
+                    bands.setdefault(v, {}).setdefault(kind, []).append(bd)
+                    hit = True
         if hit:
             used.append(d)
 
-    if not (rmse_f or acc_f or any(fa_kind.values()) or spec):
+    if not (rmse_f or acc_f or any(fa_kind.values()) or spec or bands):
         raise ValueError("%s 下没有任何确定性结果文件" % root)
 
     def _w(df, fn):
@@ -345,6 +359,15 @@ def summarize_det(root, out=None, plot=True, verbose=True):
         m = pd.DataFrame({"pred_mean": pr, "obs_mean": ob},
                          index=pd.Index(idx, name="wavenumber"))
         _w(m, "det_summary_spectrum_%s.csv" % v)
+
+    # 带功率：列名原样保留（zonal/spherical × pred/obs/ratio × 频带），
+    # 名称契约见 vfc.metrics.spectrum.band_power_frame
+    for v in sorted(bands):
+        for kind, frames in bands[v].items():
+            m = _mean_of_frames(frames)
+            if m.size:
+                m.index.name = "lead_h"
+                _w(m, "det_summary_%s_bands_%s.csv" % (kind, v))
 
     def _mean_of_var(frames, v):
         vals = []

@@ -25,8 +25,10 @@ from .io_nc import FieldFile, check_pair
 from .metrics import RMSEAccumulator, AnomalyCorrelationAccumulator, \
     ActivityAccumulator
 from .specs import get_spec, apply_transform, VAR_SPECS
-from .metrics.spectrum import zonal_spectrum, wavenumber_axis,\
-    wavelength_km
+from .metrics.spectrum import (
+    DEFAULT_BANDS, band_power_frame, wavelength_km, wavenumber_axis,
+    zonal_spectrum,
+)
 
 _METRICS = ("rmse", "acc", "fa", "spectrum")
 
@@ -35,6 +37,26 @@ def _default_name(obs_path) -> str:
     """obs_20220830.nc → 20220830。"""
     m = re.search(r"(\d{8})", os.path.basename(str(obs_path)))
     return m.group(1) if m else os.path.splitext(os.path.basename(str(obs_path)))[0]
+
+
+def _sph_block():
+    try:
+        return max(1, int(os.environ.get("VFC_SPH_BLOCK", "16") or "16"))
+    except Exception:
+        return 16
+
+
+def _spectrum_bands_enabled() -> bool:
+    return os.environ.get("VFC_SPECTRUM_BANDS", "1").strip().lower() not in (
+        "0", "false", "no", "off")
+
+
+def _band_power_frame(pred, obs, lat, leads, bands=DEFAULT_BANDS):
+    """本模块的带功率表：列名契约与球谐降级逻辑都在 vfc.metrics.spectrum，
+    这里只补上本入口自己的分块旋钮。球谐带功率只对「全球含极」网格有定义
+    （见 spectrum.validate_global_lat），bbox 区域裁剪会自动降级成只出 zonal。"""
+    return band_power_frame(pred, obs, lat, leads, bands=bands,
+                            block=_sph_block())
 
 
 def _bbox_indices(lat, lon, bbox):
@@ -243,6 +265,7 @@ def verify_pair(obs_path, pred_path, variables=None, metrics=("rmse",),
             return acc.finalize()
 
         rmse_s, acc_s, fa_cols, spectra = {}, {}, {}, {}
+        spectra_bands = {}
         for v in variables:
             spec = get_spec(v)
             comps = spec.derived
@@ -322,6 +345,9 @@ def verify_pair(obs_path, pred_path, variables=None, metrics=("rmse",),
                     with np.errstate(divide="ignore", invalid="ignore"):
                         d["pred/obs"] = d["pred"] / d["obs"]
                     spectra[v] = d.iloc[1:]            # k=0 已置零，不输出
+                    if _spectrum_bands_enabled():
+                        spectra_bands[v] = _band_power_frame(
+                            p_al[m], o_al[m], lat_sub, leads_real[m])
 
         # q700/q2m 统一按 g/kg 报告（内部 kg/kg；rmse/fa/谱 ×1000/×1e6）
         _Q_VARS = tuple(v for v, s in VAR_SPECS.items()
@@ -336,6 +362,13 @@ def verify_pair(obs_path, pred_path, variables=None, metrics=("rmse",),
             if _v in spectra:
                 spectra[_v]["pred"] = spectra[_v]["pred"] * 1e6
                 spectra[_v]["obs"] = spectra[_v]["obs"] * 1e6
+            # 带功率同样按 g/kg 口径缩放（ratio 列无量纲，不动）
+            if _v in spectra_bands:
+                for _c in ("zonal_pred_", "zonal_obs_",
+                           "spherical_pred_", "spherical_obs_"):
+                    for _col in spectra_bands[_v].columns:
+                        if _col.startswith(_c):
+                            spectra_bands[_v][_col] *= 1e6
 
         # -- 落盘 ---------------------------------------------------------------
         files = []
@@ -374,6 +407,23 @@ def verify_pair(obs_path, pred_path, variables=None, metrics=("rmse",),
                 if _plot_spectrum(spectra, png,
                                   "power spectrum  (%s)" % name):
                     files.append(png)
+        if spectra_bands:
+            # 带功率表：zonal 必出，spherical 只在全球含极网格上有（见
+            # _band_power_frame 的降级逻辑）。文件名与报告模板约定一致：
+            # 纬向谱是 spectrum_*（逐波数）/ zonal_bands_*（分带），
+            # 球谐是 spherical_bands_*。
+            for v, d in spectra_bands.items():
+                zcols = [c for c in d.columns if c.startswith("zonal_")]
+                scols = [c for c in d.columns if c.startswith("spherical_")]
+                zcsv = os.path.join(outdir, "zonal_bands_%s_%s.csv" % (name, v))
+                d[zcols].to_csv(zcsv, float_format="%.6g")
+                files.append(zcsv)
+                if scols:
+                    scsv = os.path.join(outdir,
+                                        "spherical_bands_%s_%s.csv" % (name, v))
+                    d[scols].to_csv(scsv, float_format="%.6g")
+                    files.append(scsv)
+            results["spectrum_bands"] = spectra_bands
 
         meta = {
             "name": name, "obs": str(obs_path), "pred": str(pred_path),

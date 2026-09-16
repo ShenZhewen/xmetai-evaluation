@@ -25,12 +25,19 @@ from vfc.zarr_target import ZarrTarget
 from vfc.io_nc import DataFileError
 from vfc.metrics import lat_weights, rmse_by_lead, crps_by_lead, \
     brier_by_lead, AnomalyCorrelationAccumulator, ActivityAccumulator
-from vfc.metrics.spectrum import zonal_spectrum, wavenumber_axis,\
-    wavelength_km
+from vfc.metrics.spectrum import band_power_arrays, DEFAULT_BANDS, \
+    zonal_spectrum, wavenumber_axis, wavelength_km
 from vfc.specs import get_spec, VAR_SPECS
 
 _METRICS = ("rmse", "crps", "brier", "acc", "fa", "spectrum")
 _EPOCH = _dt.datetime(1970, 1, 1)
+
+# 带功率（zonal / spherical band power）随 spectrum 一起出，落成
+# zonal_bands_<date>_<var>.csv 与 spherical_bands_<date>_<var>.csv。
+# 球谐基与纬度权重只在首次调用时构建并按 (nlat, nlon, bands) 缓存
+# （spectrum._SPH_CACHE），所以这里关掉只能省掉逐场的展开开销，省不掉建基。
+SPECTRUM_BANDS = True      # 直接改这里：False = 不产出带功率文件
+SPH_BLOCK = 16             # 球谐一次展开多少个场；只影响内存，不影响结果
 
 # 比湿类要素（vfc/specs 中目标单位为 kg kg-1）。部分模式输出按 g/kg 存储
 # （如盘古/FuXi/AIFS 的 q700/q2m），而 ERA5 zarr 真值为 kg/kg → 用
@@ -141,6 +148,60 @@ def _spread_by_lead(p, lat, weighted):
     ok = np.isfinite(s)
     sw = (ok.astype("f8") * w).sum(axis=(1, 2))
     return np.sqrt(np.where(ok, s * s, 0.0).sum(axis=(1, 2)) / np.maximum(sw, 1e-12))
+
+
+_BAND_TAGS = tuple("%d_%d" % (lo, hi) for lo, hi in DEFAULT_BANDS)
+
+
+def _band_power_table(zonal, sph, leads, member_names, ensemble, ensonly):
+    """逐 lead 的带功率字典 → 归档表（行 = lead_h，列 = 各频带）。
+
+    列名契约见 ``vfc.metrics.spectrum.band_power_frame``——批量路径与
+    ``regr_pair`` 的产物共用同一套名字，报告端只按这一套取数。
+
+    **单成员不写前缀**（``zonal_pred_1_4``），与 ``regr_pair`` 的
+    ``zonal_bands_*`` / ``spherical_bands_*`` 逐列一致；集合按 ``<member>_``
+    前缀另出 ``ensmean_``。obs 各成员相同，照 ``spectrum_<date>_<var>.csv``
+    的老规矩逐成员复制一份。``sph`` 为空 = 球谐不可用（区域网格），只出 zonal。
+    """
+    data = {}
+
+    def _put(prefix, kind, arr):
+        for i, tag in enumerate(_BAND_TAGS):
+            data[prefix + kind + "_" + tag] = arr[:, i]
+
+    def _pairs(frame):
+        """{键: 数组} → [(前缀, pred 数组, obs 数组)]。"""
+        if not ensemble:
+            return [("", frame[member_names[0] + "_pred"], frame["obs"])]
+        out = []
+        if not ensonly:
+            for m in member_names:
+                out.append((m + "_", frame[m + "_pred"], frame["obs"]))
+        out.append(("ensmean_", frame["ensmean_pred"], frame["obs"]))
+        return out
+
+    for prefix, pred, obs in _pairs(zonal):
+        _put(prefix, "zonal_pred", pred)
+        _put(prefix, "zonal_obs", obs)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            _put(prefix, "zonal_ratio", pred / obs)
+    if sph:
+        for prefix, pred, obs in _pairs(sph):
+            _put(prefix, "spherical_pred", pred)
+            _put(prefix, "spherical_obs", obs)
+            with np.errstate(divide="ignore", invalid="ignore"):
+                _put(prefix, "spherical_ratio", pred / obs)
+    return pd.DataFrame(data, index=pd.Index(leads, name="lead_h"))
+
+
+def _new_spectrum_agg():
+    """谱聚合器：``{"spectrum": {变量: [表]}, "bands": {变量: [表]}}``。
+
+    做成子字典而不是多传一个形参，是为了让 ``_collect_agg`` / ``_write_means``
+    的十个调用点（五个批量入口各两处）保持原样。
+    """
+    return {"spectrum": {}, "bands": {}}
 
 
 class CompositeTarget(object):
@@ -373,6 +434,8 @@ def run_ensemble(pred_dir, target_zarr, init=None, members=None,
     fa_tables = {m: {} for m in member_names}
     fa_tables["ensmean"] = {}
     spectra = {}
+    spectra_bands = {}      # 带功率表：变量 -> DataFrame（行=lead，列=各频带）
+    band_notes = {}         # 变量 -> 球谐可用性说明（区域网格时记原因）
     align_meta = {}
 
     _use_block = (len(member_names) > 1 and getattr(pred, "read_block", None)
@@ -594,6 +657,8 @@ def run_ensemble(pred_dir, target_zarr, init=None, members=None,
                 _fa["ensmean"] = ActivityAccumulator(n_lead, lat_sub,
                                                      weighted=lat_weighted)
             _winsum = {}
+            _winband = {}       # 纬向带功率：键同 _winsum，另加 "obs"
+            _winsph = {}        # 球谐带功率；区域网格时清空 = 不出球谐列
             _wincnt = 0
             if "spectrum" in _vmet(v) and v != "tp":
                 _mwin = np.ones(n_lead, dtype=bool)
@@ -609,6 +674,18 @@ def run_ensemble(pred_dir, target_zarr, init=None, members=None,
                         _winsum[_m + "_pred"] = np.zeros(_kax.size)
                 _winsum["ensmean_pred"] = np.zeros(_kax.size)
                 _winsum["obs"] = np.zeros(_kax.size)
+                if SPECTRUM_BANDS:
+                    # 带功率**按 lead 逐条留档**，不做 _wincnt 平均：功率不是
+                    # 求和，留下逐 lead 才能算「日期 × 变量 × lead」的总均方根。
+                    _bpk = ([] if _ensonly
+                            else [_m + "_pred" for _m in member_names])
+                    if _is_ensemble or not _bpk:
+                        _bpk.append("ensmean_pred")
+                    _nb = len(_BAND_TAGS)
+                    for _d in (_winband, _winsph):
+                        for _k in _bpk:
+                            _d[_k] = np.zeros((n_lead, _nb))
+                        _d["obs"] = np.zeros((n_lead, _nb))
             for i0 in range(0, n_lead, blk):
                 j1 = min(i0 + blk, n_lead)
                 _idx = list(range(i0, j1))
@@ -741,6 +818,36 @@ def run_ensemble(pred_dir, target_zarr, init=None, members=None,
                             oc[_seg], lat_sub,
                             weighted=lat_weighted).sum(axis=0)
                         _wincnt += int(_seg.sum())
+                        if _winband:
+                            # 逐 lead 写回**绝对**位置：_seg 是本块内的窗口掩码，
+                            # 直接 _winband[k][i0:j1][_seg] = … 写不进去（布尔
+                            # 索引出来的是副本）。obs 各成员相同只算一次，单成员
+                            # 时 member pred 就是 ensmean，也不重复展开——球谐
+                            # 展开是这里最贵的一步。
+                            # 名字统一带 _bp 前缀：本函数里 _sp/_so 等已被占用
+                            # （_sp 是集合离散度累加器，见函数开头）。
+                            _abs = np.flatnonzero(_seg) + i0
+                            _bp_pf = {}
+                            if not _ensonly:
+                                for _i, _m in enumerate(member_names):
+                                    _bp_pf[_m + "_pred"] = pcw[_i]
+                            if _is_ensemble or not _bp_pf:
+                                _bp_pf["ensmean_pred"] = pcw.mean(axis=0)
+                            _bp_z, _bp_o, _bp_s, _bp_so, _bp_note = \
+                                band_power_arrays(
+                                    np.stack(list(_bp_pf.values())), oc[_seg],
+                                    lat_sub, block=SPH_BLOCK,
+                                    weighted=lat_weighted)
+                            for _j, _k in enumerate(_bp_pf):
+                                _winband[_k][_abs] = _bp_z[_j]
+                            _winband["obs"][_abs] = _bp_o
+                            if _bp_s is None:
+                                band_notes.setdefault(v, _bp_note)
+                                _winsph = {}     # 区域网格：本变量不再出球谐列
+                            else:
+                                for _j, _k in enumerate(_bp_pf):
+                                    _winsph[_k][_abs] = _bp_s[_j]
+                                _winsph["obs"][_abs] = _bp_so
             if _merge_uv:
                 _an, _bn = _wind_uv[1], _wind_uv[2]
                 if "rmse" in _vmet(_an):
@@ -814,6 +921,14 @@ def run_ensemble(pred_dir, target_zarr, init=None, members=None,
                                                         name="wavenumber"))
                 _d.insert(0, "wavelength_km", wavelength_km(_kax))
                 spectra[v] = _d.iloc[1:]           # k=0 already zeroed
+            if _winband:
+                # 只出**窗口内**的 lead：窗口外的位置还停在 0，写进归档会被读成
+                # 「那里功率为 0」，而事实是「那里没算」。
+                spectra_bands[v] = _band_power_table(
+                    {_k: _a[_mwin] for _k, _a in _winband.items()},
+                    {_k: _a[_mwin] for _k, _a in _winsph.items()},
+                    np.asarray(leads)[_mwin], member_names,
+                    _is_ensemble, _ensonly)
         else:
             if comps:
                 a, b = comps
@@ -983,6 +1098,30 @@ def run_ensemble(pred_dir, target_zarr, init=None, members=None,
                 d = pd.DataFrame(cols, index=pd.Index(k, name="wavenumber"))
                 d.insert(0, "wavelength_km", wavelength_km(k))
                 spectra[v] = d.iloc[1:]            # k=0 已置零，不输出
+                if SPECTRUM_BANDS:
+                    # 与流式分支同口径（逐 lead、只出窗口内时效），只是这里
+                    # 本来就整读，直接切片即可。
+                    # 名字带 _bp 前缀：本函数里 _sp 是集合离散度累加器。
+                    _bp_pf = {}
+                    if not _ensonly:
+                        for _i, _mn in enumerate(member_names):
+                            _bp_pf[_mn + "_pred"] = p[_i][m]
+                    if _is_ensemble or not _bp_pf:
+                        _bp_pf["ensmean_pred"] = p.mean(axis=0)[m]
+                    _bp_z, _bp_o, _bp_s, _bp_so, _bp_note = band_power_arrays(
+                        np.stack(list(_bp_pf.values())), o[m], lat_sub,
+                        block=SPH_BLOCK, weighted=lat_weighted)
+                    _bp_zonal = {_k: _v for _k, _v in zip(_bp_pf, _bp_z)}
+                    _bp_zonal["obs"] = _bp_o
+                    _bp_sph = {}
+                    if _bp_s is None:
+                        band_notes.setdefault(v, _bp_note)
+                    else:
+                        _bp_sph = {_k: _v for _k, _v in zip(_bp_pf, _bp_s)}
+                        _bp_sph["obs"] = _bp_so
+                    spectra_bands[v] = _band_power_table(
+                        _bp_zonal, _bp_sph, np.asarray(leads)[m],
+                        member_names, _is_ensemble, _ensonly)
 
     if _use_block:
         variables = _vars
@@ -1011,6 +1150,12 @@ def run_ensemble(pred_dir, target_zarr, init=None, members=None,
             for _col in list(spectra[_v].columns):
                 if _col != "wavelength_km":
                     spectra[_v][_col] = spectra[_v][_col] * 1e6
+    for _v in list(spectra_bands):
+        if _v in _HUMIDITY_VARS:
+            for _col in list(spectra_bands[_v].columns):
+                # ratio 列无量纲，与 spectra 一样不缩放。
+                if "_pred_" in _col or "_obs_" in _col:
+                    spectra_bands[_v][_col] = spectra_bands[_v][_col] * 1e6
 
     if not _is_ensemble:
         spread_tables.clear()                  # 单确定性：无“集合离散度”
@@ -1060,6 +1205,16 @@ def run_ensemble(pred_dir, target_zarr, init=None, members=None,
     if spectra:
         for v, d in spectra.items():
             _write(d, "spectrum", "_" + v)
+    if spectra_bands:
+        # 列名契约见 _band_power_table：单成员与 regr_pair 的 zonal_bands_* /
+        # spherical_bands_* 逐列一致。球谐列只在全球含极网格上存在，区域网格
+        # 只有 zonal（原因记在 meta["spectrum_bands_note"]）。
+        for v, d in spectra_bands.items():
+            _scols = [c for c in d.columns if "spherical_" in c]
+            _write(d[[c for c in d.columns if c not in _scols]],
+                   "zonal_bands", "_" + v)
+            if _scols:
+                _write(d[_scols], "spherical_bands", "_" + v)
     results["rmse"] = {k: pd.DataFrame(v) for k, v in rmse_tables.items() if v}
     results["acc"] = {k: pd.DataFrame(v) for k, v in acc_tables.items() if v}
     results["fa"] = {k: pd.DataFrame(v) for k, v in fa_tables.items() if v}
@@ -1067,6 +1222,7 @@ def run_ensemble(pred_dir, target_zarr, init=None, members=None,
     results["crps"] = pd.DataFrame(crps_tables) if crps_tables else None
     results["brier"] = pd.DataFrame(brier_tables) if brier_tables else None
     results["spectrum"] = spectra
+    results["spectrum_bands"] = spectra_bands
 
     if plot:
         _plot_rmse(results.get("rmse"), outdir, name, files)
@@ -1098,6 +1254,12 @@ def run_ensemble(pred_dir, target_zarr, init=None, members=None,
         "q": {"unit": "kg kg-1", "vars": list(_HUMIDITY_VARS),
               "target_scale_to_kgkg": float(target_q_scale),
               "pred_scale_to_kgkg": float(pred_q_scale)},
+        # 带功率是否含球谐列、以及不含时的原因（区域 bbox 网格上球谐无定义，
+        # 见 spectrum.validate_global_lat）。"disabled" = 本次没开带功率。
+        "spectrum_bands": {
+            "bands": list(_BAND_TAGS),
+            "note": (band_notes or ("global: spherical band power computed"
+                                    if spectra_bands else "disabled"))},
         "options": {"lat_weighted": bool(lat_weighted),
                     "bbox": list(bbox) if bbox else None,
                     "block": int(block),
@@ -1315,6 +1477,19 @@ def _resume_load(outdir_date, date, metrics):
                 os.path.join(outdir_date, fn), index_col=0)
     if spec:
         res["spectrum"] = spec
+    # 带功率分两个文件落盘（zonal_bands_* / spherical_bands_*），读回来按列
+    # 合并成一张表，形状与 run_ensemble 返回的 results["spectrum_bands"] 一致。
+    band = {}
+    for _tag in ("zonal_bands", "spherical_bands"):
+        pre = _tag + "_" + date + "_"
+        for fn in sorted(os.listdir(outdir_date)):
+            if fn.startswith(pre) and fn.endswith(".csv"):
+                v = fn[len(pre):-4]
+                df = pd.read_csv(os.path.join(outdir_date, fn), index_col=0)
+                band[v] = df if v not in band else pd.concat(
+                    [band[v], df], axis=1)
+    if band:
+        res["spectrum_bands"] = band
     meta.setdefault("n_members",
                     len(meta.get("members")
                         or meta.get("member_names") or ["det"]))
@@ -1362,7 +1537,11 @@ def _collect_agg(res, agg, sp):
     s = res.get("spectrum")
     if s:
         for v, df in s.items():
-            sp.setdefault(v, []).append(df)
+            sp["spectrum"].setdefault(v, []).append(df)
+    b = res.get("spectrum_bands")
+    if b:
+        for v, df in b.items():
+            sp["bands"].setdefault(v, []).append(df)
 
 
 def _agg_mean(items):
@@ -1399,11 +1578,26 @@ def _write_means(outdir_root, agg, sp):
                                   "mean_spread_rmse_ratio.csv")
                 ratio.to_csv(fp, float_format="%.6g")
                 written.append(fp)
-    for v, items in sp.items():
+    for v, items in sp["spectrum"].items():
         m = _agg_mean(items)
         if m is not None:
             fp = os.path.join(outdir_root, "mean_spectrum_%s.csv" % v)
             m.to_csv(fp, float_format="%.6g")
+            written.append(fp)
+    for v, items in sp["bands"].items():
+        # 文件名与逐日的 zonal_bands_<date>_<var>.csv / spherical_bands_<date>_<var>.csv
+        # 对应；区域网格上球谐列不存在，此时只写 zonal 那一份。
+        m = _agg_mean(items)
+        if m is None:
+            continue
+        scols = [c for c in m.columns if "spherical_" in c]
+        for tag, cols in (("zonal_bands",
+                           [c for c in m.columns if c not in scols]),
+                          ("spherical_bands", scols)):
+            if not cols:
+                continue
+            fp = os.path.join(outdir_root, "mean_%s_%s.csv" % (tag, v))
+            m[cols].to_csv(fp, float_format="%.6g")
             written.append(fp)
     return written
 
@@ -1468,7 +1662,7 @@ def run_batch(pred_root, target_zarr, outdir_root, dates=None, verbose=True,
             source=kw.get("climo_source", "未标注"))
     rows, metas, failures = [], [], []
     agg = {t: [] for t in _LEAD_METRICS}
-    sp = {}
+    sp = _new_spectrum_agg()
     for date in candidates:
         out = os.path.join(outdir_root, date)
         if resume and _resume_ok(out, date, kw.get("metrics")):
@@ -1671,7 +1865,7 @@ def run_batch_parallel(pred_root, target_zarr, outdir_root, dates=None,
     rows, metas, agg = [], [], {}
     for tag in _LEAD_METRICS:
         agg[tag] = []
-    sp = {}
+    sp = _new_spectrum_agg()
     done_dates = [d for d in _all_candidates
                   if os.path.exists(os.path.join(outdir_root, d,
                                                  d + "_meta.json"))]
@@ -1756,7 +1950,7 @@ def run_pangu_batch(pangu_root, target_zarr, outdir_root, dates=None,
             source=kw.get("climo_source", "未标注"))
     rows, metas, failures = [], [], []
     agg = {t: [] for t in _LEAD_METRICS}
-    sp = {}
+    sp = _new_spectrum_agg()
     engine = kw.get("engine", "auto")
     for date in candidates:
         out = os.path.join(outdir_root, date)
@@ -1853,7 +2047,7 @@ def run_aifs_batch(pred_root, target_root, outdir_root, dates=None,
             source=kw.get("climo_source", "未标注"))
     rows, failures = [], []
     agg = {t: [] for t in _LEAD_METRICS}
-    sp = {}
+    sp = _new_spectrum_agg()
     engine = kw.get("engine", "auto")
     for date in candidates:
         out = os.path.join(outdir_root, date)
@@ -2005,7 +2199,7 @@ def run_aifs_batch_parallel(pred_root, target_root, outdir_root, dates=None,
     rows, _metas, agg = [], [], {}
     for tag in _LEAD_METRICS:
         agg[tag] = []
-    sp = {}
+    sp = _new_spectrum_agg()
     done_dates = [d for d in _all_candidates
                   if os.path.exists(os.path.join(outdir_root, d,
                                                  d + "_meta.json"))]
@@ -2213,6 +2407,14 @@ def _self_test() -> int:
         check("谱 z500 列齐全",
               set(res["spectrum"]["z500"].columns)
               >= {"ensmean_pred", "ensmean_obs", "wavelength_km"})
+        # 带功率：逐 lead 一行，列名契约与 regr_pair 共用（见 band_power_frame）。
+        # 自检网格不是全球含极网格，球谐会自动降级，所以这里只断言纬向列。
+        _bp = res["spectrum_bands"]["z500"]
+        check("带功率 z500 列齐全（逐 lead + obs 列）",
+              _bp.shape[0] == len(leads)
+              and any(c.endswith("zonal_pred_1_4") for c in _bp.columns)
+              and any(c.endswith("zonal_obs_1_4") for c in _bp.columns)
+              and any(c.endswith("zonal_ratio_65_128") for c in _bp.columns))
         # ws200 流式（默认 VFC_ENS_STREAM_DERIVED=1）与全量读取（=0）结果一致
         _old_sd = os.environ.get("VFC_ENS_STREAM_DERIVED")
         os.environ["VFC_ENS_STREAM_DERIVED"] = "0"
@@ -2614,8 +2816,10 @@ def _self_test() -> int:
                 _write_step_nc(os.path.join(md, "%03d.nc" % (k + 1)),
                                {"Z500": wave_p + off}, lat, lon)
         nef = _EF(os.path.join(tmp, "nested"))
+        # members 是 os.path.relpath 的结果，Windows 下用 "\\" 分隔，断言前统一成 "/"
+        nrm = [m.replace(os.sep, "/") for m in nef.members]
         check("嵌套布局自动识别（member 相对路径 + 读取形状）",
-              nef.members == ["20250106/member_000", "20250106/member_001"]
+              nrm == ["20250106/member_000", "20250106/member_001"]
               and nef.read("z500").shape == (2, 3, nlat, nlon))
         nres, nmeta = run_ensemble(
             os.path.join(tmp, "nested"), [sfc_b, pl_b], init="2025-01-01T00:00",
