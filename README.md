@@ -49,7 +49,7 @@ python runner.py --config configs/weather_rmse_single_fengqing.py
 | **确定性降水分类检验** `weather_ts_det` | capability | 格点降水预报 + Diamond 站点观测 | `ts_<name>.csv`：TS/POD/FAR/漏报率/BIAS × 阈值(0.1/10/25/50/100/250mm) × 24h 时效 | `weather_ts_single_fgvp` |
 | **集合降水分类检验** `weather_ts_ens` | capability | 集合平均降水场 + 站点观测 | 同上（集合平均场口径） | `weather_ts_ens_fuxi` |
 | **集合降水概率评分** `weather_ts_ens_prob` | capability | 集合降水 + 站点观测 + 气候概率 | AROC/BS/BSS × 6h | **[BLOCKED]**（缺 `vfc.reader_categorical` 等模块，`weather_ts_prob_ens_fuxi` 仅供参考） |
-| **确定性连续量检验**（batch） | batch | 预报根目录 + era5 zarr + 气候态 | RMSE/ACC/活跃度/谱长表 | `weather_rmse_single_{fuxi,fgvp,fengqing}` |
+| **确定性连续量检验**（batch） | batch | 预报根目录 + era5 zarr + 气候态 | RMSE/ACC/活跃度/谱长表 | `weather_rmse_single_{fuxi,fgvp,fengqing,pangu}` |
 | **集合连续量检验**（batch） | batch | 同上（集合） | 同上 + CRPS/离散度 | `weather_rmse_ens_fuxi` |
 | **台风路径/强度检验** `typhoon` | capability | 预报场 + babj 实况 | `tc<编号>_<起报>.csv`：路径/强度误差 | `weather_typhoon_single_fuxi` |
 | **fdp 确定性场检验** `fdp_field_det` | capability | FCSTDATA DF 预报 nc + CRA 实况 + CLI 气候态 | 长表：z500/t2m/msl/u10/v10 的 RMSE/Bias，z500 另有 ACC | `fdp_rmse_single_multi` |
