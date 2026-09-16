@@ -15,8 +15,8 @@ eval_pro/
 ├── runner.py            # 唯一入口：加载 config → capability 或 batch
 ├── core/                # 核心实现，runner 之外的所有 py 都在这里
 │   ├── api.py               # capability 注册与参数适配
-│   ├── batch_adapter.py     # batch config → 参考实现 CLI 参数
-│   ├── run_batch_rmse.py     # 参考实现入口，RMSE/ACC/FA/谱 批量评测
+│   ├── batch_adapter.py     # batch config → 批量评测 CLI 参数
+│   ├── run_batch_rmse.py    # batch 类评测的 CLI 入口，转发到 vfc/regr_ens、vfc/regr_summary
 │   ├── runlog.py             # fd 级运行日志，控制台 + logs/ 双写
 │   ├── categorical_ref.py    # 降水分类检验参考实现
 │   └── tc_ref.py             # 台风路径/强度检验参考实现
@@ -202,7 +202,7 @@ python runner.py --config configs/s2s_tcc_single_multi.py
 ## 如何扩展
 
 - **新增模型评一批 RMSE/TS**：抄最接近的 config 改 `pred_root` 和单位（注意 q 换算表），代码不动。
-- **新增指标**：在 `vfc/metrics/` 实现，参考实现在 `core/run_batch_rmse.py` / `vfc/regr_ens.py` 的指标分发处接入。
+- **新增指标**：在 `vfc/metrics/` 实现（已有 rmse / acc_fa / spectrum / crps / brier），再到 `vfc/regr_ens.py` 的指标分发处（`if "<metric>" in metrics:`）接入；汇总口径改 `vfc/regr_summary.py`。`core/run_batch_rmse.py` 只转发 argv，加指标不用动它。
 - **新增评测能力**：`core/api.py` 加适配函数，`runner.py` 的 `CAPABILITIES` 注册。
 
 ## 已知限制
