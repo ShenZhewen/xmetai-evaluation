@@ -23,6 +23,8 @@ CAPABILITIES = {
     "fdp_ens": ("core.fdp_adapter", "run_ens"),
     "fdp_activity_spectrum": ("core.fdp_adapter", "run_activity_spectrum"),
     "fdp_tp_det": ("core.fdp_adapter", "run_tp_det"),
+    # s2s 确定性预测（core/s2s_adapter.py → runpy 启动 s2s/ 原脚本）
+    "s2s_det": ("core.s2s_adapter", "run_det"),
 }
 
 

@@ -22,6 +22,7 @@ eval_pro/
 │   └── tc_ref.py             # 台风路径/强度检验参考实现
 ├── vfc/                 # 验证核心模块（拷自 xmetai_model_verification_xu）
 ├── fdp/                 # 示范计划检验包（4 个 verifier 原样拷入，runpy 启动）
+├── s2s/                 # 确定性预测检验包（5 个 step 脚本原样拷入，runpy 启动）
 ├── configs/            # 评测配置（Python dict，字面量默认值）
 ├── outputs/results/    # 评测产物
 ├── outputs/.temp/      # 断点续跑缓存（按 config 指纹分目录）
@@ -56,6 +57,7 @@ python runner.py --config configs/weather_rmse_single_fengqing.py
 | **fdp 集合检验** `fdp_ens` | capability | ENS 预报 nc + CRA + 站点降水实况 | 长表：CRPS/离散度-误差比/集合平均 RMSE + BSS/AROC（0.1/4/13/25mm） | `fdp_crps_ens_multi` |
 | **fdp 活跃度+功率谱** `fdp_activity_spectrum` | capability | DF z500 + CRA + CLI 气候态 | 长表：activity_ratio；`_power_spectrum.csv`：逐波数功率预报 vs 实况 | `fdp_activity_single_multi` |
 | **fdp 确定性降水检验** `fdp_tp_det` | capability | DF tp + 站点实况(diamond 3) + CMPAS/CRA 网格 | 长表：6h(TS/Bias三档+FSS+综合)/24h(TS/Bias五档+综合)，`accum_hours` 列区分 | `fdp_ts_single_multi` |
+| **s2s 确定性预测检验** `s2s_det` | capability | CRA 观测 + 模式 60 天预报（member 平均）+ 周平均距平 | 长表：TCC/RMSE 区域加权平均（step4 柱状图口径 + step5 空间图口径，`table` 列区分） | `s2s_tcc_single_multi` |
 
 ## 评估指标说明
 
@@ -177,6 +179,19 @@ python runner.py --config configs/fdp_rmse_single_multi.py
 - 单个起报失败只记日志、不中断区间；`resume: True` 时靠 `outputs/.temp/<output_name>/<date>.done` 标记跳过已完成起报。
 - fdp 原始逐日起报 CSV + 图留在 staging（`outputs/.temp/<output_name>/`）；跑完由 adapter 合并成带 `init_date` 列的长表，runner 落盘 `outputs/results/<output_name>/<capability>.csv`（活跃度能力另出 `_power_spectrum.csv`）。
 - 模型清单、路径根（FCSTDATA / CRA / CLI / RDATA）都是 config 字面量，按环境改。
+
+## s2s 评测（确定性预测检验包）
+
+`s2s/` 下是"确定性预测"（延伸期/次季节检验）的 5 个 step 脚本：step1 CRA 观测距平（气候态→距平→1.5°→60 天 lead_time 合并）、step2 模式距平（member 平均→模式气候态→距平）、step3 周平均（week1-9 + week34/56）、step4 TCC/RMSE 区域柱状图、step5 TCC/p-value/RMSE 空间图。`core/s2s_adapter.py` 按 `config["steps"]` 选步、拼 argv 后用 runpy 逐个跑——指标计算零改动，仅两处外围微调（step4 起报日期区间、step5 cartopy 离线数据目录改 CLI 参数）。
+
+```bash
+python runner.py --config configs/s2s_tcc_single_multi.py
+```
+
+- **气候态是一次性投资**：step1 的 CRA 气候态（2004-2023）和 step2 的模式气候态只依赖变量+基准年+数据源，算完落盘永久复用，脚本自带"输出已存在即跳过"；日常重跑把 `steps` 配成 `["step4", "step5"]` 即可，换变量/换基准年才需要重算。
+- 前置步骤的中间产物（clim/diff/anom/combine/week）落在 config 指定的各数据目录；step4/5 的 metrics/figures 落 `outputs/.temp/<output_name>/`，区域加权平均 CSV 由 adapter 合并成带 `table` 列的长表（`step4_bar` / `step5_regional`）发布到 `outputs/results/<output_name>/`。
+- step5 空间图依赖 cartopy 离线 Natural Earth shapefile（`cartopy_dir`，含 `shapefiles/` 子目录），缺库/缺数据会自动跳过绘图，统计量照常输出。
+- MJO 评测（qihou 项目另一半）暂未集成：原 README 标注 ttr→olr 符号两套不一致、u200/u850 按位置索引选层等未确认问题。
 
 ## 运行日志
 
