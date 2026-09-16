@@ -167,7 +167,8 @@ def _collect_tables(cfg, steps, staging):
     if "step4" in steps:
         step4_out = Path(cfg.get("step4_output", staging / "step4_output"))
         for metric in ("tcc", "rmse"):
-            fp = step4_out / "tables" / "%s_%s_regional_weighted_mean_%s.csv" % (var, metric, year)
+            # 格式串必须带括号：/ 与 % 同级左结合，不括会先拼路径再对 Path 取模
+            fp = step4_out / "tables" / ("%s_%s_regional_weighted_mean_%s.csv" % (var, metric, year))
             if fp.exists():
                 df = pd.read_csv(fp)
                 df.insert(0, "table", "step4_bar")
@@ -176,7 +177,7 @@ def _collect_tables(cfg, steps, staging):
 
     if "step5" in steps:
         step5_out = Path(cfg.get("step5_output", staging / "step5_output"))
-        fp = step5_out / "regional" / var / "%s_regional_weighted_mean.csv" % var
+        fp = step5_out / "regional" / var / ("%s_regional_weighted_mean.csv" % var)
         if fp.exists():
             df = pd.read_csv(fp)
             df.insert(0, "table", "step5_regional")
