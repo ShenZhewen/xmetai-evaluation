@@ -1,12 +1,35 @@
 # eval_pro: 气象模型离线评测框架
 
-气象模型**离线评测**：输入已经推理完成的预报产品 + 观测/再分析/气候态，输出结构化指标 CSV。
+## 摘要
 
-**只做评测，不做推理**：不加载模型权重、不训练、不调度推理。
+气象模型的迭代速度已经快过评测体系的建设速度。AI 大模型与传统数值模式各自输出预报产品，
+变量命名、单位、网格与落盘布局互不相同；而评测口径长期分散在一次性脚本里——同一份指标换一组数据
+就要重写流程，同一次对比换一个模型就要重新对齐变量，指标实现各写一份，结论既不可比、
+也难以复现和追溯。**快速迭代的模型与缓慢沉淀的评测能力之间，缺口越拉越大。**
+
+为解决这一问题，我们提出了 **eval_pro：一个配置驱动的气象模型自动评估一体化框架**。
+核心思路是把「评测」从一次性脚本抽象为**可注册、可配置、可续跑**的能力单元：用同一套配置语言
+描述「评什么、用什么数据、出什么指标」，由框架统一负责数据加载、并行调度、指标计算、
+结果归档与报告生成。评测方因此不必关心各家的数据布局差异，只需声明一次口径，
+就能在任意模型、任意时段上重复执行，并让所有结论落在同一套可追溯的产物上。
+
+框架**只做评测，不做推理**——不加载模型权重、不训练、不调度推理；输入是已经推理完成的预报产品
+与观测/再分析/气候态，输出是结构化指标 CSV 与可直接交付的分析报告。
 
 ```
 xmetai-inference（推理框架）→ 预报产品目录 → eval_pro → outputs/results/ 下的长表 CSV
 ```
+
+设计要点：
+
+- **唯一入口**：`runner.py` 加载 config 后按类型分派到 capability / batch 两条路径；
+  `core/`、`vfc/`、`fdp/`、`s2s/` 只提供能力实现，各有自己的入口会立刻让「配置驱动」失效。
+- **配置即实验**：配置是 Python dict、字面量默认值，可 diff、可留痕；改日期/指标/变量会得到新的
+  指纹目录，旧结果原地保留，实验之间互不污染。
+- **一套口径覆盖多类检验**：确定性/集合、分类/连续量、站点/格点，以及台风、fdp 示范计划、
+  s2s 次季节等能力，共用同一套配置语义与产物规范。
+- **可续跑、可交付**：归档目录即工作目录，断点续跑按日期粒度跳过已完成的结果；
+  报告由 `skills/` 下的技能从归档直接生成，评测与出报告解耦。
 
 ## 目录结构
 
@@ -137,7 +160,6 @@ CONFIG = {
     "n_workers": 48,
     "worker_fallback": [48, 4, 2],
     "resume": True,
-    "resume_cache": True,
     "summarize_mode": "--summarize-det",
     "env_overrides": {"VFC_DATES_PER_CHILD": "1", "OMP_NUM_THREADS": "1", ...},
 }
@@ -157,10 +179,26 @@ batch 配置语义：
 
 ## 批处理输出与断点续跑
 
-- 逐日期结果写到 `outputs/.temp/<output_name>/<fingerprint>/<YYYYMMDD>/`（rmse/acc 等逐日 CSV + `<date>_meta.json`），**持续保留**，`resume: True` 断点续跑就靠它。
-- 改配置（日期/指标/变量）会产生新 fingerprint 目录，旧缓存不自动清理。想让新 periods 复用旧缓存：跑一次拿到新 fingerprint 路径（日志 `Using persistent cache:` 行），把旧缓存目录改名成新路径即可——但**必须删掉不再评测的日期目录**（如 20251217-20251228），因为 `--summarize-det` 扫的是缓存根下所有 YYYYMMDD 目录、不看 periods，留着会把坏数据混进 mean 文件。
-- 汇总文件在缓存根：`summary.csv`、`mean_*.csv`、`det_summary_overall.csv`（或 ens）。
-- 最终长表发布到 `outputs/results/<output_name>/<output_name>.csv`。
+**没有中间临时目录**：工作目录就是最终归档目录 `outputs/results/<output_name>/<fingerprint>/`，逐日结果直接落在那里，跑完不需要再搬。
+
+```
+outputs/results/<output_name>/
+├── <output_name>.csv          ← 汇总长表（所有 det_summary 熔成一张）
+└── <fingerprint>/             ← 归档：报告脚本直接吃这个目录
+    ├── summary.csv            逐日起报点一行（横向）
+    ├── mean_rmse.csv / mean_acc.csv / mean_fa.csv / mean_spectrum_*.csv
+    ├── batch_meta.json        本次跑的配置快照
+    ├── cache_meta.json        {fingerprint, output_name}
+    ├── .summary/              det_summary_*.csv（跨日期汇总表）
+    └── <YYYYMMDD>/            逐日 CSV + <date>_meta.json
+```
+
+- `resume: True` 断点续跑就靠归档里的 `<date>_meta.json`：完整日期直接读回，不重算。
+  `resume: False`（默认）则重算全部日期、就地覆盖——**同一 fingerprint 下配置完全相同，
+  重算等价于全新跑**，所以不需要「先清空再跑」。
+- 改配置（日期/指标/变量/worker 数）会产生新 fingerprint 目录，旧目录不自动清理。
+- 想让新 periods 复用旧结果：把旧归档目录改名成新 fingerprint（日志 `Work directory (also the archive):` 那行给出路径）——但**必须删掉不再评测的日期目录**（如 20251217-20251228），因为 `--summarize-det` 扫的是归档根下所有 YYYYMMDD 目录、不看 periods，留着会把坏数据混进 mean 文件。
+- 汇总表全在 `.summary/` 子目录、**不带图**（摘要步骤固定传 `--no-plot`）；逐日 `rmse_<date>.png` / `spectrum_<date>.png` 则按 regr_ens 默认照常生成。
 
 并行策略：起报日期按 `VFC_DATES_PER_CHILD`（=1）切块，短命 worker 每进程只跑一块，内存不跨日期累积。首次启动有 20 分钟左右的冷启动静默（48 个 worker 同时加载库/气候态），期间日志无输出是**正常现象**，等第一波 chunk 完成后进度会突然密集出现。
 
