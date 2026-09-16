@@ -13,21 +13,21 @@ xmetai-inference（推理框架）→ 预报产品目录 → eval_pro → output
 ```text
 eval_pro/
 ├── runner.py            # 唯一入口：加载 config → capability 或 batch
-├── core/                # 核心实现（runner 之外的所有 py 都在这里）
+├── core/                # 核心实现，runner 之外的所有 py 都在这里
 │   ├── api.py               # capability 注册与参数适配
 │   ├── batch_adapter.py     # batch config → 参考实现 CLI 参数
-│   ├── run_batch_rmse.py     # 参考实现入口（RMSE/ACC/FA/谱 批量评测）
-│   ├── runlog.py             # fd 级运行日志（控制台 + logs/ 双写）
+│   ├── run_batch_rmse.py     # 参考实现入口，RMSE/ACC/FA/谱 批量评测
+│   ├── runlog.py             # fd 级运行日志，控制台 + logs/ 双写
 │   ├── categorical_ref.py    # 降水分类检验参考实现
 │   └── tc_ref.py             # 台风路径/强度检验参考实现
-├── vfc/                 # 验证核心模块（拷自 xmetai_model_verification_xu）
-├── fdp/                 # 示范计划检验包（4 个 verifier 原样拷入，runpy 启动）
-├── s2s/                 # 确定性预测检验包（5 个 step 脚本原样拷入，runpy 启动）
-├── configs/            # 评测配置（Python dict，字面量默认值）
+├── vfc/                 # RMSE/ACC/谱 等验证核心能力代码
+├── fdp/                 # 示范计划检验核心能力代码
+├── s2s/                 # 确定性预测检验核心能力代码
+├── configs/            # 评测配置，Python dict、字面量默认值
 ├── outputs/results/    # 评测产物
-├── outputs/.temp/      # 断点续跑缓存（按 config 指纹分目录）
-├── ref_result/         # 参考结果（只读对照，不参与运行）
-├── skills/             # 报告生成技能（见 skills/xmetai-evaluation/）
+├── outputs/.temp/      # 断点续跑缓存，按 config 指纹分目录
+├── ref_result/         # 参考结果，只读对照，不参与运行
+├── skills/             # 报告生成技能，见 skills/xmetai-evaluation/
 └── visualization/      # 报告图件
 ```
 
