@@ -16,9 +16,13 @@ CONFIG = {
     ],
     "outdir_root": "/workspace/_XMETAI_test_results/single_pangu",
     "periods": [
-        ("20250101", "20250630"),
-        # 20251217 起预报数据缺失/无效，不参与评测。
-        ("20250701", "20251216"),
+        # 20251217 起预报数据缺失/无效，止于 20251216，单段跑满 349 天。
+        # **不要**再拆回 (0101-0630)+(0701-1216) 两段：regr_ens 的收尾步骤只按
+        # **当次 CLI 的 --dates** 重写 summary.csv / batch_meta.json（见 vfc/regr_ens.py
+        # 的 done_dates 取 _all_candidates，不是扫描 outdir_root），后一段会把前一段
+        # 整个盖掉——归档里躺着 349 个日期目录，summary 只剩 169 行。
+        # 合并不改任何逐日结果，只改这份日期清单。
+        ("20250101", "20251216"),
     ],
     "metrics": ["rmse", "spectrum", "acc", "fa"],
     "variables": [
@@ -44,15 +48,17 @@ CONFIG = {
         "ws200": ["rmse", "spectrum"],
     },
     "climo": "/workspace/data/worm/era5_clim_phys_14.nc",
-    # Pangu ONNX 官方输出 q 是 g/kg（推理框架若按原样落盘则为 g/kg → 0.001）。
-    # ⚠ 单位待实锤：若 q700 RMSE 大到离谱且只有 q 异常，先查这里——
-    # 预报 q 值域 ~1-10 = g/kg（本配置正确），~0.001-0.01 = kg/kg（删掉这行）。
-    "pred_q_scale": 0.001,
+    # pred_q_scale 故意不写：默认 1.0，Pangu 落盘 q 已是 kg/kg。
+    # 2026-09-16 实锤：pangu_output/20250102/001.nc 的 Q700 mean=0.00230、
+    # max=0.0118（同期 Z500 mean=54089、MSL mean=100997，均为标准气象单位）。
+    # 曾经抄 fgvp 的 0.001 是错的：会把 q 再缩 1000 倍压成 ~0，q700 RMSE 退化成
+    # 「观测自身的 RMS」≈4.4 g/kg 且**不随时效增长**（其余变量全正常）。这个特征
+    # 和 FengQing 那次一模一样，见 weather_rmse_single_fengqing.py 的注释。
+    # 判据：raw q 值域 ~1-10 = g/kg（要写 0.001）；~0.001-0.01 = kg/kg（不写）。
     # 普通日期单 worker <10G，48 并发吞吐最高；fallback 留 4 作纯保底。
     "n_workers": 48,
     "worker_fallback": [48, 4, 2],
     "resume": True,
-    "resume_cache": True,
     "summarize_mode": "--summarize-det",
     "env_overrides": {
         "VFC_DATES_PER_CHILD": "1",

@@ -15,9 +15,13 @@ CONFIG = {
     ],
     "outdir_root": "/workspace/_XMETAI_test_results/single_fgvp",
     "periods": [
-        ("20250101", "20250630"),
-        # 20251217 起预报数据缺失/无效，不参与评测。
-        ("20250701", "20251216"),
+        # 20251217 起预报数据缺失/无效，止于 20251216，单段跑满 349 天。
+        # **不要**再拆回 (0101-0630)+(0701-1216) 两段：regr_ens 的收尾步骤只按
+        # **当次 CLI 的 --dates** 重写 summary.csv / batch_meta.json（见 vfc/regr_ens.py
+        # 的 done_dates 取 _all_candidates，不是扫描 outdir_root），后一段会把前一段
+        # 整个盖掉——归档里躺着 349 个日期目录，summary 只剩 169 行。
+        # 合并不改任何逐日结果，只改这份日期清单。
+        ("20250101", "20251216"),
     ],
     "metrics": ["rmse", "spectrum", "acc", "fa"],
     "variables": [
@@ -48,7 +52,6 @@ CONFIG = {
     "n_workers": 48,
     "worker_fallback": [48, 36, 24, 12, 4, 2],
     "resume": True,
-    "resume_cache": True,
     "summarize_mode": "--summarize-det",
     "env_overrides": {
         "VFC_DATES_PER_CHILD": "1",

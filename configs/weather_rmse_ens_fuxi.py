@@ -32,7 +32,6 @@ CONFIG = {
     "n_workers": 48,
     "worker_fallback": [48, 36, 24, 12, 4, 2],
     "resume": True,
-    "resume_cache": True,
     "summarize_mode": "--summarize-ens",
     "env_overrides": {
         "VFC_ENS_ENSMEAN_ONLY": "1",
