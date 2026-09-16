@@ -13,7 +13,8 @@ CONFIG = {
         "/workspace/data/liujunjie/era5_foundation_store2/era5_sfc_2025.01-2026.07.c15.p25.h6.zarr",
         "/workspace/data/liujunjie/era5_foundation_store2/era5_pl_2025.01-2026.07.c84.p25.h6.zarr",
     ],
-    "outdir_root": "/workspace/_XMETAI_test_results/ens_fuxi",
+    # 只被打印，不决定落盘位置（真实归档见 outputs/results/<output_name>/<指纹>/）。
+    "outdir_root": "/workspace/szwCode/xmetai-eval_pro/outputs",
     "periods": [
         ("20250101", "20250630"),
         # 20251217 起预报数据缺失/无效，不参与评测。
