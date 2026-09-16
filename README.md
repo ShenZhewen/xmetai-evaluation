@@ -1,230 +1,180 @@
-# xmetai-evaluation
+# eval_pro: 气象模型离线评测框架
 
-气象模型**离线评测**框架：输入已经推理完成的预报产品 + 观测/再分析/气候态，输出统一的结构化指标与报告。
+气象模型**离线评测**：输入已经推理完成的预报产品 + 观测/再分析/气候态，输出结构化指标 CSV。
 
 **只做评测，不做推理**：不加载模型权重、不训练、不调度推理。
 
 ```
-xmetai-inference → 预报产品文件 → xmetai-evaluation → 评测结果与报告
-```
-
-## 能力边界
-
-- 输入预报：NetCDF 格点场（FuXi 确定性 / FuXi 集合 / Fengqing）。
-- 输入观测/参考：Diamond 站点观测、CRA40 再分析、CRA 气候态。
-- 产品类型：确定性场、集合成员场、概率产品。
-- 输出：`scores.csv` 长表、分类/概率宽表、JSON 快照、覆盖率；可选图件。
-
-## 快速开始
-
-```bash
-pip install -e .
-
-# 看有哪些评测功能
-xmetai-eval --list-pipelines
-
-# 开始评测（配置可以是内置名，也可以是 .py 路径；数据路径由环境变量提供）
-xmetai-eval --config weather_ts_ens_fuxi
+xmetai-inference（推理框架）→ 预报产品目录 → eval_pro → outputs/results/ 下的长表 CSV
 ```
 
 ## 目录结构
 
 ```text
-xmetai-evaluation/
-├── pyproject.toml                  # 打包 + CLI 入口 xmetai-eval
-├── xmetai_evaluation/
-│   ├── cli.py                      # 统一入口：加载配置 → 交给 Runner
-│   ├── components.py               # 内置组件注册（按名字查表，不分类型分支）
-│   ├── logging_util.py
-│   ├── configs/                    # EvalConfig + 任务配置（部分用环境变量覆盖路径）
-│   │   ├── base.py                 # EvalConfig 定义 + load_config()
-│   │   ├── weather_ts_det_fgvp.py       # FuXi 确定性降水分类检验
-│   │   ├── weather_ts_ens_fuxi.py       # FuXi 集合降水：24h TS + 6h 概率两段一趟跑完
-│   │   ├── weather_field_scores_fuxi.py # FuXi 确定性连续量检验（RMSE/ACC/FA/谱）
-│   │   ├── weather_ens_crps_fuxi.py     # FuXi 集合连续评分（CRPS/Spread-Error）
-│   │   └── fdp_field_scores_fengqing.py # 要素场检验（RMSE/Bias/ACC）
-│   ├── core/                       # contracts / errors / registry / variables
-│   ├── io/                         # gridded / layouts / station_reader / climatology_reader / netcdf_reader / base
-│   ├── transforms/                 # interpolation / temporal / regrid
-│   ├── metrics/                    # rmse / bias / acc / categorical / probabilistic / ensemble / spatial / specialized
-│   ├── pipeline/                   # runner(唯一执行内核) / spec / pipelines / protocols / matcher
-│   ├── results/                    # store / table
-│   └── visualization/              # precipitation_plots / ts_report
-├── tests/                          # unit + integration
-├── ref/                            # 参考实现（只读档案，不入库、不参与运行）
-├── evaluation_results/             # 评测产物（不入库）
-└── reports/                        # 报告图件（不入库）
+eval_pro/
+├── runner.py            # 唯一入口：加载 config → capability 或 batch
+├── core/                # 核心实现（runner 之外的所有 py 都在这里）
+│   ├── api.py               # capability 注册与参数适配
+│   ├── batch_adapter.py     # batch config → 参考实现 CLI 参数
+│   ├── run_batch_rmse.py     # 参考实现入口（RMSE/ACC/FA/谱 批量评测）
+│   ├── runlog.py             # fd 级运行日志（控制台 + logs/ 双写）
+│   ├── categorical_ref.py    # 降水分类检验参考实现
+│   └── tc_ref.py             # 台风路径/强度检验参考实现
+├── vfc/                 # 验证核心模块（拷自 xmetai_model_verification_xu）
+├── configs/            # 评测配置（Python dict，字面量默认值）
+├── outputs/results/    # 评测产物
+├── outputs/.temp/      # 断点续跑缓存（按 config 指纹分目录）
+├── ref_result/         # 参考结果（只读对照，不参与运行）
+├── skills/             # 报告生成技能（见 skills/xmetai-evaluation/）
+└── visualization/      # 报告图件
 ```
 
-## 执行流程
+配置文件按 `weather_<流程>_<single/ens>_<模型>` 命名，输出目录与 config 名一致。
 
-一条链路，无第二套循环：
+## 快速开始
 
+```bash
+# capability 类配置（降水 TS / 台风）
+python runner.py -config configs/weather_ts_single_fgvp.py
+
+# batch 类配置（RMSE/ACC/FA/谱，自 scripts/*.sh 迁移）
+python runner.py --config configs/weather_rmse_single_fengqing.py
 ```
-cli → load_config(EvalConfig) → PipelineSpec(流程模板+数据)
-    → Runner(唯一样本循环) → ResultStore 落盘
-```
-
-- **流程模板**（`pipeline/pipelines.py`）只声明「怎么算」：协议 + 变换链 + 指标 + 输出视图。
-- **配置**（`configs/*.py`）只声明「算什么」：数据在哪、评哪段时间。
-- **组件注册**（`components.py`）：新增数据源/指标只加注册项，不动 Runner。
-
-## 已注册组件
-
-| 类型 | 注册名 |
-|---|---|
-| Reader | `fuxi`、`fuxi_ens`、`fengqing`、`cra`、`station`（`diamond_station` 别名）、`climatology`、`ref_probability` |
-| Transform | `grid_to_station`、`time_window_accumulator`、`ensemble_mean` |
-| Metric | `rmse`、`bias`、`acc`、`acc_uncentered`、`ts_score`、`ensemble_probability`、`crps`、`spread_error`、`fss`、`activity`、`spectrum`、`zonal_spectrum` |
-| Protocol | `station_valid_time`（插值到站点，按有效时刻配对）、`grid_valid_time`（插值到实况网格） |
-| Writer | `csv_long`（始终写出）、`coverage`、`details`、`json`、`categorical_wide`、`probability_wide` |
 
 ## 评测能力清单
 
-每行是一个可直接跑的评测能力（流程名 `pipeline`），输入/输出文件相对 `output_dir`。
+| 能力 | 类型 | 输入 | 输出 | 对应 config |
+|---|---|---|---|---|
+| **确定性降水分类检验** `weather_ts_det` | capability | 格点降水预报 + Diamond 站点观测 | `ts_<name>.csv`：TS/POD/FAR/漏报率/BIAS × 阈值(0.1/10/25/50/100/250mm) × 24h 时效 | `weather_ts_single_fgvp` |
+| **集合降水分类检验** `weather_ts_ens` | capability | 集合平均降水场 + 站点观测 | 同上（集合平均场口径） | `weather_ts_ens_fuxi` |
+| **集合降水概率评分** `weather_ts_ens_prob` | capability | 集合降水 + 站点观测 + 气候概率 | AROC/BS/BSS × 6h | **[BLOCKED]**（缺 `vfc.reader_categorical` 等模块，`weather_ts_prob_ens_fuxi` 仅供参考） |
+| **确定性连续量检验**（batch） | batch | 预报根目录 + era5 zarr + 气候态 | RMSE/ACC/活跃度/谱长表 | `weather_rmse_single_{fuxi,fgvp,fengqing}` |
+| **集合连续量检验**（batch） | batch | 同上（集合） | 同上 + CRPS/离散度 | `weather_rmse_ens_fuxi` |
+| **台风路径/强度检验** `typhoon` | capability | 预报场 + babj 实况 | `tc<编号>_<起报>.csv`：路径/强度误差 | `weather_typhoon_single_fuxi` |
 
-流程与配置按三大业务块统一前缀命名：`fdp_`（业务天气评测，参考 `ref/fdp`）、`weather_`（天气模型验证，参考 `ref/tiqnqi` 两个库）、`clim_`（气候，参考 `ref/qihou`，待落地）。fdp 与 weather 的连续量/集合指标有重叠，属正常——两者是不同业务线，共用同一套 metric 实现。
+## 评估指标说明
 
-「评估指标」一列给的是 **`scores.csv` 的 `metric` 列取值**（即过滤长表用的那个字符串），
-括号里是该指标在表里变化的坐标轴（阈值 / 时效 / 窗口 / 邻域窗口）。
-标注「明细」的是**不进 `scores.csv`** 的诊断量，含义见下面「评估指标说明」。
-
-| 评测能力 | 输入数据 | 输出 CSV | 评估指标（`metric` 列取值） |
-|---|---|---|---|
-| **确定性降水分类检验**<br>`weather_ts_det` | 确定性格点降水预报（`fuxi`，tp）+ Diamond 站点降水观测 | `scores.csv`、`diagnostics/categorical_wide.csv` | `ts`、`pod`、`far`、`miss_rate`、`frequency_bias`<br>逐 阈值（0.1/10/25/50/100 mm）× 24h 时效 |
-| **集合降水分类检验（24h）**<br>`weather_ts_ens` | 集合格点降水预报（`fuxi_ens`，tp）+ Diamond 站点降水观测 | `scores.csv`、`diagnostics/categorical_wide.csv` | `ts`、`pod`、`far`、`miss_rate`、`frequency_bias`（集合平均场）<br>逐 阈值（0.1/10/25/50/100 mm）× 24h 时效；明细 `hits`/`misses`/`false_alarms`/`correct_negatives`/`n_pairs` |
-| **集合降水概率评分（6h）**<br>`weather_ts_ens_prob` | 集合格点降水预报（`fuxi_ens`，tp）+ Diamond 站点降水观测 + 气候概率参考 `ref_probability` | `scores.csv`、`diagnostics/probability_wide.csv` | `aroc`、`bs`、`bss`（逐成员概率，不做集合平均）<br>逐 阈值（0.1/4/13/25 mm）× 6h 时效；明细 `BS_ref`/`base_rate`/`n_points` |
-| **确定性连续量检验**<br>`weather_field_scores` | 格点场预报（`fuxi`，z500 等）+ 格点实况 + 气候态（ACC/活跃度必需） | `scores.csv`、`diagnostics/scores_detail.csv` | `rmse`、`acc`、`activity_ratio`、`activity_forecast`、`activity_observation`、`activity_bias`、`spectrum_power_ratio`（纬向谱）<br>明细 逐波数谱曲线 |
-| **集合连续评分**<br>`weather_ens_crps` | 集合格点场预报（`fuxi_ens`）+ 格点实况 | `scores.csv` | `crps`、`spread`、`rmse`（集合平均场）、`spread_error_ratio` |
-| **集合场检验**<br>`weather_ens_field_scores` | 集合格点场预报（`fuxi_ens`）+ 格点实况（ERA5）+ 气候态（ACC/活跃度必需） | `scores.csv`、`diagnostics/scores_detail.csv` | `rmse`、`crps`、`acc`、`activity_ratio`、`activity_forecast`、`activity_observation`、`activity_bias`、`spectrum_power_ratio`<br>明细同 `weather_field_scores` |
-| **集合连续评分**<br>`fdp_ens_crps` | 集合格点场预报（`fengqing`）+ CRA40 再分析实况 | `scores.csv` | `crps`、`spread`、`rmse`（集合平均场）、`spread_error_ratio` |
-| **要素场检验**<br>`fdp_field_scores` | 格点场预报（`fengqing`，z500 等）+ CRA40 实况 + 气候态（可选，ACC 必需） | `scores.csv` | `rmse`、`bias`、`acc` |
-| **中国区站点降水检验**<br>`fdp_precip_ts` | 格点降水预报 + Diamond 站点降水观测（中国区，cos 纬度加权） | `scores.csv`、`diagnostics/categorical_wide.csv` | `ts`、`pod`、`far`、`miss_rate`、`frequency_bias`<br>逐 阈值（0.1/13/25 mm）× 6h 时效（UTC 对齐，窗口不要求观测完整） |
-| **降水空间检验**<br>`fdp_precip_fss` | 格点降水预报 + 格点降水实况（CRA / CMPAS） | `scores.csv` | `fss`（阈值 13 mm × 邻域窗口 1/3/5/15/31/63，每个组合一行）<br>明细 `window`/`n_points` |
-| **活跃度比 / 功率谱**<br>`fdp_activity_spectrum` | 格点场预报（z500）+ 格点实况 + 气候态（活跃度比必需） | `scores.csv` | `activity_ratio`、`activity_forecast`、`activity_observation`、`activity_bias`、`spectrum_power_ratio`（二维谱，不减纬向均值）<br>明细 逐波数谱曲线 |
-
-内置配置里 `weather_field_scores_fuxi` 与 `fdp_field_scores_fengqing` 另外声明了 `json` writer，
-会多写一份 `scores.json`；那是配置的选择，不属于流程模板的产出。
-注意配置里的 `writers` 是**替换**模板自带的那一份、不是追加，所以
-`weather_field_scores_fuxi` 要把模板的 `details` 一并写上，谱曲线才有落盘的地方。
-
-### 评估指标说明
-
-分类检验（降水阈值）：
+分类检验（降水阈值，超越式口径 `x ≥ 阈值`）：
 
 | 指标 | 含义 | 口径 | 方向 |
 |---|---|---|---|
 | `ts` | TS（Threat Score，即 CSI）：命中占「命中+漏报+空报」的比例 | `hits / (hits + misses + false_alarms)` | 0~1，越大越好 |
-| `pod` | 命中率：实况发生的事件里被预报到的比例 | `hits / (hits + misses)` | 0~1，越大越好；空报多也能拿高分，需与 `far` 同看 |
-| `far` | 空报率：预报的事件里实况没发生的比例 | `false_alarms / (hits + false_alarms)` | 0~1，越小越好 |
-| `miss_rate` | 漏报率 | `1 − POD` | 0~1，越小越好 |
+| `pod` | 命中率：实况发生的事件里被预报到的比例 | `hits / (hits + misses)` | 越大越好；空报多也能拿高分，需与 `far` 同看 |
+| `far` | 空报率：预报的事件里实况没发生的比例 | `false_alarms / (hits + false_alarms)` | 越小越好 |
+| `miss_rate` | 漏报率 | `1 − POD` | 越小越好 |
 | `frequency_bias` | 频率偏差：预报事件数 / 实况事件数 | `(hits + false_alarms) / (hits + misses)` | 1 为无偏，>1 空报偏多、<1 漏报偏多 |
 
-概率评分（集合成员，超越式口径 `x ≥ 阈值`）：
+连续量 / 集合评分（batch 类）：
 
 | 指标 | 含义 | 口径 | 方向 |
 |---|---|---|---|
-| `aroc` | 概率排序能力（ROC 曲线下面积） | 以「成员中超过阈值的比例」为预报概率画 ROC，再积分；由概率直方图直接算，不落 ROC 点列 | 0.5 = 无技巧，1 = 完美排序 |
-| `bs` | Brier 评分：概率预报的均方误差 | `mean((p − o)²)`，`p` = 成员超越频率，`o ∈ {0,1}` | 0 最好，单位同概率² |
-| `bss` | Brier 技巧评分：相对气候基准的技巧 | `1 − BS / BS_ref` | >0 好于气候基准，1 = 完美，<0 不如气候 |
-| `bs_ref`（明细） | 参考 BS | 有 `ref_probability` 参考时 `mean((p_clim − o)²)`；缺参考时降级为样本气候频率 `r(1−r)`——**降级后 BSS 与原版不可比** | 同上 |
-| `base_rate`（明细） | 事件样本频率 | 该档样本里实况达到阈值的比例 | 用于判断样本是否失衡 |
-| `n_points`（明细） | 参与该档评分的配对数 | — | — |
+| `rmse` | 均方根误差 | 逐起报算 RMSE，再跨起报平均（**不是**把 MSE 平均后开根） | 越小越好 |
+| `acc` | 距平相关系数 | 距平 = 场 − 气候态，域加权 | −1~1，越大越好；**缺气候态则无意义** |
+| `fa` | 活跃度比：预报距平变化幅度相对实况 | `std(预报距平) / std(实况距平)`，面积加权 | <1 偏平滑（系统性偏弱），>1 偏噪 |
+| `spectrum` | 功率谱 / 纬向谱 | 预报与实况逐波数功率对比；总功率比 = 能量是否偏 | 1 表示总能量不偏；单看总量会掩盖分布失真，需与谱曲线同看 |
+| `crps` | 连续排序概率评分（集合） | 闭式解，逐点只用有限成员 | 越小越好 |
+| `spread` | 集合离散度（集合） | 成员标准差 | 与 `rmse` 同量级才有意义 |
+| `spread_error_ratio` | 离散度-误差比（集合） | `SPREAD / RMSE(集合平均场)` | ≈1 标定良好，<1 过度自信，>1 欠自信 |
 
-连续量 / 集合评分：
+读表要点：
 
-| 指标 | 含义 | 口径 | 方向 |
-|---|---|---|---|
-| `rmse` | 均方根误差 | `sqrt(Σw(f − o)² / Σw)`，`w` 为区域权重 | 越小越好，单位同变量 |
-| `bias` | 平均误差（系统性偏差） | `Σw(f − o) / Σw` | 0 为无偏，>0 预报偏大 |
-| `acc` | 距平相关系数：预报距平场与实况距平场的（加权）相关 | 距平 = 场 − 气候态；默认 `centered`（距今平再减域加权均值，经典皮尔逊），FDP/WeatherBench2 的 uncentered 口径用 `acc_uncentered` | −1~1，越大越好；**缺气候态会用零场兜底、结果无意义**（行状态标 `partial`） |
-| `crps` | 连续排序概率评分：集合分布与实况的整体差异 | 闭式解，逐点只用有限成员，缺测成员不参与；不做非负截断 | 越小越好 |
-| `spread` | 集合离散度 | `sqrt(Σᵢ(mᵢ − m̄)² / (M − 1))` | 与 `rmse` 同量级才有意义 |
-| `spread_error_ratio` | 离散度-误差比 | `SPREAD / RMSE(集合平均场)` | ≈1 标定良好，<1 过度自信，>1 欠自信 |
-| `activity_ratio` | 活跃度比：预报的距平变化幅度相对实况 | `std(预报距平) / std(实况距平)`，面积加权 | <1 偏平滑（系统性偏弱），>1 偏噪；**缺气候态时无意义** |
-| `activity_forecast` | 预报距平标准差 | 同 `activity_ratio` 的分子 | 诊断用，与实况侧同看 |
-| `activity_observation` | 实况距平标准差 | 同 `activity_ratio` 的分母 | 诊断用 |
-| `activity_bias` | 活跃度偏差：预报距平标准差 − 实况距平标准差 | `std(预报距平) − std(实况距平)` | 0 为无偏，<0 预报偏平滑；单位同 `activity_forecast` |
-| `fss` | 邻域分数技巧评分：邻域平滑后再比「有/无」 | `1 − Σ(p_f − p_o)² / Σ(p_f² + p_o²)`，`p` 为邻域内超过阈值的格点占比 | 越大越好；窗口越大越接近随机基准，看技巧随尺度衰减 |
-| `spectrum_power_ratio` | 总功率比：预报能量相对实况 | 预报功率谱总量 / 实况功率谱总量；逐波数曲线在明细表 | 1 表示总能量不偏；单看总量会掩盖分布失真，需与谱曲线同看 |
+- **跨起报平均在输出层做，不在指标层**：对逐起报 RMSE 再平均 ≠ 把 MSE 平均后开根，参考实现也是前者。
+- **ts CSV 里的 `grade` 列写 `≥0.1`/`≥250`**（超越式），阈值档位 0.1/10/25/50/100/250mm 对齐参考结果 `ts_fgvp_2025.csv`。
+- **列联表计数（hits/misses/false_alarms/n_pairs）直接在 ts CSV 里**，不单独透视。
 
-几个读表要点：
+### 单位换算要点（踩过的坑）
 
-- **长表只放标量。** 列联表计数（`hits`/`misses`/`false_alarms`/`correct_negatives`/`n_pairs`）、
-  `BS_ref`/`base_rate`/`n_points`、逐波数谱曲线都不占 `scores.csv` 的列，
-  只进明细表 `diagnostics/scores_detail.csv`（声明 `details` writer 时写出）；
-  其中前两组会被 `categorical_wide` / `probability_wide` 各自透视成表头列。
-  活跃度的四个量（`activity_ratio`/`activity_forecast`/`activity_observation`/`activity_bias`）
-  都是标量，**都在长表里**。
-- **谱曲线是明细表里的一组长表行**：`group` 列形如 `k=<波数>`，
-  `field` 取 `power_forecast`/`power_observation`，一行一个波数——不是参考实现那种
-  每个变量一份宽 CSV。
-- **同名不同口径靠 `aggregation` 区分。** 例如集合场检验里 `spread_error` 顺带输出的 `rmse`
-  是**集合平均场的域加权**口径（`area_weighted`），`rmse` 指标是逐样本平均口径（`mean_over_samples`）。
-- **空 `value` 不是 0。** NaN/Inf 一律写空字符串，该档有没有数看 `status` 列
-  （`success` / `partial` / `no_valid_data` / `undefined`）。
-
-一条流程模板只有**一个时间窗口**（`station_valid_time` 的 `window_hours` 同时决定观测累积长度和有效时效的筛选），所以集合降水检验按口径拆成了两条：24h 的 `weather_ts_ens` 出 TS 系列，6h 的 `weather_ts_ens_prob` 出概率评分。`weather_ts_ens_fuxi` 配置用 `pipeline=["weather_ts_ens", "weather_ts_ens_prob"]` 一条命令跑完两段，结果合并落同一个 `output_dir`（`scores.csv` 里靠 `window_h` 列区分，两个宽表各取自己那一段）。
-
-> 台风路径/强度检验（`ref/tiqnqi/xmetai_model_verification_xu/run_tc.py`：台风中心诊断 + babj 实况配对 + 路径/强度误差）尚未吸收进框架，属待办 gap。
-
-输出文件口径：
-
-| 文件 | 说明 |
-|---|---|
-| `scores.csv` | 统一评分长表（始终写出），每行 = 一个 变量×指标×阈值×时效×样本 的评分 |
-| `coverage.csv` | 请求/有效样本覆盖率（显式声明 `coverage` writer 时写出） |
-| `diagnostics/scores_detail.csv` | 诊断明细：列联表计数、`BS_ref`/`base_rate`/`n_points`、逐波数谱曲线（`group=k=<波数>`） |
-| `diagnostics/categorical_wide.csv` | 分类检验宽表（阈值 × 时效：TS/POD/FAR/漏报率/BIAS + `hits`/`misses`/`false_alarms`/`n_pairs` 计数） |
-| `diagnostics/probability_wide.csv` | 概率评分宽表（阈值 × 时效：AROC/BS/BSS + `BS_ref`/`base_rate`/`n_points`） |
-| `scores.json` | 评分 JSON 快照 |
-
-当前已接好的内置任务配置（`configs/`）：`weather_ts_det_fgvp`（FGVP 确定性降水）、`weather_ts_ens_fuxi`（FuXi 集合降水，24h TS + 6h 概率两段一趟跑完）、`weather_field_scores_fuxi`（FuXi 确定性连续量）、`weather_ens_crps_fuxi`（FuXi 集合连续评分）、`fdp_field_scores_fengqing`（Fengqing 要素场）。
+| 模型 | 预报 q 单位 | config 写法 |
+|---|---|---|
+| FuXi / FGVP | g/kg | `"pred_q_scale": 0.001`（→ kg/kg 对齐 era5 目标） |
+| **FengQing** | **kg/kg** | **不写 `pred_q_scale`**（默认 1.0；官方 upper_mean.npy q 块 mean≈0.0018 实锤）。抄 fgvp 的 0.001 会把 q 缩小 1000 倍，q 的 RMSE 大到离谱且只有 q 异常 |
 
 ## 配置
 
-配置是一个 `EvalConfig` 实例（`configs/base.py`），核心字段：
+两类配置都是 Python dict、字面量默认值（不用环境变量）。
+
+**capability 类**（降水 TS / 台风）：
+
+```python
+# configs/weather_ts_single_fgvp.py
+CONFIG = {
+    "capability": "weather_ts_det",
+    "pred": "/workspace/data/shenzw/fgvp_output",
+    "station_dir": "/workspace/data/worm/r0/2025",
+    "start_date": "20250101", "end_date": "20251216",  # 20251217 起预报数据缺失，不评
+    "windows": [24.0], "lead_step": 6.0, "tz_shift": 8.0,
+    "interp": "bilinear", "tp_scale": 1.0, "workers": 8,
+    # name 决定落盘文件名：ts_single_fgvp.csv + single_fgvp_meta.json
+    "name": "single_fgvp",
+    "output_dir": ".../outputs/results/weather_ts_single_fgvp",
+}
+```
+
+**batch 类**（RMSE/ACC/FA/谱，自 scripts/*.sh 迁移，语义与原脚本一致）：
+
+```python
+# configs/weather_rmse_single_fengqing.py（节选）
+CONFIG = {
+    "type": "batch",
+    "label": "fengqing",
+    "output_name": "weather_rmse_single_fengqing",
+    "pred_root": "/workspace/data/shenzw/fengqing_output",
+    "target_zarr": ["…sfc….zarr", "…pl….zarr"],
+    "outdir_root": "/workspace/_XMETAI_test_results/single_fengqing",
+    # 20251217 起预报数据缺失/无效（q700 全 NaN、单日内存暴涨），所有 config 统一止于 20251216
+    "periods": [("20250101", "20250630"), ("20250701", "20251216")],
+    "metrics": ["rmse", "spectrum", "acc", "fa"],
+    "variables": ["z500", "q700", ...],
+    "var_metrics": {"z500": ["rmse", "spectrum", "acc", "fa"], ...},  # 逐变量过滤
+    "climo": "/workspace/data/worm/era5_clim_phys_14.nc",
+    "n_workers": 48,
+    "worker_fallback": [48, 4, 2],
+    "resume": True,
+    "resume_cache": True,
+    "summarize_mode": "--summarize-det",
+    "env_overrides": {"VFC_DATES_PER_CHILD": "1", "OMP_NUM_THREADS": "1", ...},
+}
+```
+
+batch 配置语义：
 
 | 字段 | 含义 |
 |---|---|
-| `pipeline` | 走哪套流程模板（必填）；写成列表则按顺序各跑一段，结果合并落同一个 `output_dir` |
-| `forecast_reader` / `observation_reader` | 数据源：`{"type": <reader>, "root_dir": ..., "variable": ...}` |
-| `reference_reader` | 参考场：气候态（ACC/活跃度需要）或气候概率（BSS 需要）。配置里给了、但某段的指标用不上时不会构建 |
-| `start_date` / `end_date` | 评测时段（`YYYYMMDD` 或 `YYYYMMDDHH`） |
-| `output_dir` | 结果输出目录 |
-| `transform_options` / `metric_options` | 覆盖模板里的变换/指标参数 |
-| `writers` | 覆盖模板的输出视图（默认 `csv_long`） |
+| `periods` | 评测时段（过滤到 pred_root 里实际存在的 YYYYMMDD 目录） |
+| `var_metrics` | 逐变量 × 指标过滤（`metrics` 是总集） |
+| `pred_q_scale` | 预报 q 缩放（见上表；FuXi/FGVP=0.001，FengQing 不写） |
+| `n_workers` / `worker_fallback` | 并行进程数 / 失败降档重试序列 |
+| `resume` | 跳过已有完整输出的日期 |
+| `summarize_mode` | 汇总口径：`--summarize-det` / `--summarize-ens` |
+| `env_overrides` | 子进程启动前注入的环境变量（BLAS 线程控制等） |
 
-最小示例：
+## 批处理输出与断点续跑
 
-```python
-from xmetai_evaluation.configs.base import EvalConfig
+- 逐日期结果写到 `outputs/.temp/<output_name>/<fingerprint>/<YYYYMMDD>/`（rmse/acc 等逐日 CSV + `<date>_meta.json`），**持续保留**，`resume: True` 断点续跑就靠它。
+- 改配置（日期/指标/变量）会产生新 fingerprint 目录，旧缓存不自动清理。想让新 periods 复用旧缓存：跑一次拿到新 fingerprint 路径（日志 `Using persistent cache:` 行），把旧缓存目录改名成新路径即可——但**必须删掉不再评测的日期目录**（如 20251217-20251228），因为 `--summarize-det` 扫的是缓存根下所有 YYYYMMDD 目录、不看 periods，留着会把坏数据混进 mean 文件。
+- 汇总文件在缓存根：`summary.csv`、`mean_*.csv`、`det_summary_overall.csv`（或 ens）。
+- 最终长表发布到 `outputs/results/<output_name>/<output_name>.csv`。
 
-cfg = EvalConfig(
-    name="my_eval",
-    description="FuXi 集合降水分类检验",
-    pipeline="weather_ts_ens",
-    forecast_reader={"type": "fuxi_ens", "root_dir": "/data/fuxi_ens", "variable": "tp", "step_hours": 6.0},
-    observation_reader={"type": "station", "root_dir": "/data/station", "variable": "precipitation"},
-    start_date="20250101",
-    end_date="20251231",
-    output_dir="evaluation_results/my_eval",
-)
-```
+并行策略：起报日期按 `VFC_DATES_PER_CHILD`（=1）切块，短命 worker 每进程只跑一块，内存不跨日期累积。首次启动有 20 分钟左右的冷启动静默（48 个 worker 同时加载库/气候态），期间日志无输出是**正常现象**，等第一波 chunk 完成后进度会突然密集出现。
 
-要注意 `transform_options` / `metric_options` / `options` 是**各段共用**的：配置里写 `{"time_window_accumulator": {"window_hours": 6}}` 会把每一段的窗口都改成 6。窗口属于"怎么算"，写在模板里（`pipeline/pipelines.py`）。多段的完整例子见 `configs/weather_ts_ens_fuxi.py`。
+**worker 数怎么定**（2026-09-15 480G/48核 全量日志实锤）：普通日期单 worker 常驻 <10G，48 并发吞吐最高（~4 日期/分钟）；OOM 只发生在坏数据日期上（单日 >40G，12 并发即崩）。所以 `n_workers=48` 起跑、fallback `[48, 4, 2]`——中间档（如 36/24/12）撞上坏日期一样崩，每档白死 ~10 分钟，不值得放阶梯里。换内存规格的机器按 `可用内存 × 0.7 ÷ 单 worker 峰值` 估算并发数。
 
-内置配置用环境变量覆盖数据路径与时段，例如 `weather_field_scores_fuxi` / `weather_ens_crps_fuxi` 支持 `FUXI_OUTPUT` / `FUXI_ENS_OUTPUT`、`CRA_ROOT`、`CRA_CLI_ROOT`（前者 ACC/活跃度需要）、`START_DATE`、`END_DATE`、`EVAL_OUTPUT`。
+## 运行日志
+
+- `runner.py` 把全部输出（含并行 worker 和 `run_batch_rmse.py` 子进程）同时写到控制台和 `logs/runner_<config名>_<北京时间>.log`。
+- 接管的是文件描述符而不是 `sys.stdout`，所以 `logging` / 子进程 / 未捕获的 traceback 都会进日志；每个 chunk 都是不带缓冲的 `os.write`，进程被 `kill -9` 掉日志也是完整的。
+- 同一秒内重跑同一个 config 会写成 `runner_<config名>_<时间>_2.log`，不会混进同一个文件。
 
 ## 如何扩展
 
-- **新增模型 / 数据集**：已支持的文件布局 → 写一份数据源配置即可；全新格式 → 在 `io/` 实现 Reader，再到 `components.py` 注册。
-- **新增指标**：在 `metrics/` 实现 `Metric`（`accumulate` / `merge` / `finalize`），到 `components.py` 注册。
-- **新增流程**：在 `pipeline/pipelines.py` 加一个 `PipelineTemplate`。
-- **新增数据源/算法** = 加注册项；**新增评测** = 加配置，代码不动。
+- **新增模型评一批 RMSE/TS**：抄最接近的 config 改 `pred_root` 和单位（注意 q 换算表），代码不动。
+- **新增指标**：在 `vfc/metrics/` 实现，参考实现在 `core/run_batch_rmse.py` / `vfc/regr_ens.py` 的指标分发处接入。
+- **新增评测能力**：`core/api.py` 加适配函数，`runner.py` 的 `CAPABILITIES` 注册。
 
-## 测试
+## 已知限制
 
-```bash
-pytest
-```
+1. **无本地执行**：数据在远程服务器，本仓库只维护代码与配置。
+2. **概率评分 BLOCKED**：`weather_ts_ens_prob` 依赖的 `vfc.reader_categorical` / `station_categorical` / `metric_categorical` 在参考源里缺失，没有源码不造实现。
+3. **无输出清理**：逐日结果永久保留（resume 需要）。
+4. **batch 迁移不全**：原 run_all.sh 的 6 个模型只迁了 4 个（single_fuxi / ens_fuxi / single_fgvp / single_fengqing；single_aifs、ensemble_aifs 未迁）。
+5. **评测时段止于 20251216**：20251217 起预报数据缺失/无效（q700 全 NaN、评测时单日内存暴涨 10 倍），所有 RMSE/TS config 统一排除该窗口。跨模型对比时 H2 口径为 `20250701-20251216`。

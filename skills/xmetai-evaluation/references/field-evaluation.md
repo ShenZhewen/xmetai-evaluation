@@ -8,6 +8,13 @@
 覆盖流程：`weather_field_scores`。**能力身份认的是产物目录里 `manifest.json` 的
 `resolved_config.pipeline`，不是目录名**（配置名与流程名本来就不绑定）。
 
+> **现状：这一族的格式契约（`assets/templates/field_scores.md`）已删。**
+> 能力本身、渲染器（`visualization/field_report.py`）和本文件都还在，
+> `generate_report.py` 照跑不误；但报告"结构固定"这句话**没有真值来源了**——
+> `tests/unit/visualization/test_field.py` 原先是对着那份骨架逐字比对的，
+> 骨架一删，它再红也说不清是渲染器变了还是骨架没了。
+> 本文件描述的口径与判读规则**不受影响**（它们对的是代码，不是骨架）。
+
 ---
 
 ## 0. 三条原则
