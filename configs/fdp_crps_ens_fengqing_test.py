@@ -1,4 +1,4 @@
-"""fdp 集合检验 — 本地测试数据版（D:/fdp_weather_test_bash）。
+"""fdp 集合检验 — 本地测试数据版（Windows 数据在 D:/fdp_weather_test_bash，WSL 里跑、路径是 /mnt/d 视角）。
 
 数据实况（2026-09-16 盘点）：
 - 预报是 21 成员 ENS_FCST，走 fcstdata_root 的标准路径
@@ -17,11 +17,11 @@ CONFIG = {
     "models": ["Fengqing"],
     "forecast_type": "ens",
     "forecast_hours": list(range(6, 43, 6)),
-    "fcstdata_root": "D:/fdp_weather_test_bash/FCSTDATA",
-    "cra_root": "D:/fdp_weather_test_bash/cra_root",
-    "obs_rain_root": "D:/fdp_weather_test_bash/降水",
+    "fcstdata_root": "/mnt/d/fdp_weather_test_bash/FCSTDATA",
+    "cra_root": "/mnt/d/fdp_weather_test_bash/cra_root",
+    "obs_rain_root": "/mnt/d/fdp_weather_test_bash/降水",
     "accum_hours": 6,
     "forecast_root": "",
     "resume": True,
-    "output_dir": "D:/xmetai-evalation/outputs/results/fdp_crps_ens_fengqing_test",
+    "output_dir": "/mnt/d/xmetai-evalation/outputs/results/fdp_crps_ens_fengqing_test",
 }

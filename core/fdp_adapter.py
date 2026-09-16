@@ -66,7 +66,7 @@ def _run_period(cfg, output_name, script_name, build_argv):
     dates = _expand_dates(cfg["start_date"], cfg["end_date"], cfg.get("init_hour", "00"))
     resume = cfg.get("resume", False)
 
-    n_ok = n_skip = n_fail = 0
+    n_ok = n_empty = n_skip = n_fail = 0
     for i, date in enumerate(dates, 1):
         marker = staging / (date + ".done")
         if resume and marker.exists():
@@ -80,14 +80,22 @@ def _run_period(cfg, output_name, script_name, build_argv):
         print("=" * 60, flush=True)
         try:
             _run_script(script_name, argv)
-            n_ok += 1
-            marker.write_text(date, encoding="utf-8")
+            # 只有真出了逐起报 CSV 才算完成：路径配错/数据缺失时脚本也会
+            # "正常跑完"但 0 结果，这种日期不能写 .done，否则 resume 会把它
+            # 错误跳过，修完路径重跑也不补。
+            if list(staging.glob("*%s.csv" % date)):
+                n_ok += 1
+                marker.write_text(date, encoding="utf-8")
+            else:
+                n_empty += 1
+                print("[fdp] ⚠ %s 跑完但没有任何结果 CSV（路径配错或数据缺失），"
+                      "不写完成标记" % date, file=sys.stderr, flush=True)
         except Exception as exc:
             n_fail += 1
             print("[fdp] ✗ %s 失败: %s" % (date, exc), file=sys.stderr, flush=True)
 
-    print("[fdp] 区间跑完: 成功 %d，跳过 %d，失败 %d（staging: %s）"
-          % (n_ok, n_skip, n_fail, staging), flush=True)
+    print("[fdp] 区间跑完: 成功 %d，无结果 %d，跳过 %d，失败 %d（staging: %s）"
+          % (n_ok, n_empty, n_skip, n_fail, staging), flush=True)
     return staging
 
 
