@@ -107,7 +107,9 @@ def run_batch_config(path: Path, cfg: dict) -> int:
     # Extract batch parameters
     label = cfg.pop("label", "batch")
     pred_root = cfg.pop("pred_root")
-    target_zarr = cfg.pop("target_zarr")
+    # AIFS 没有 target_zarr（观测是目录式的 <target_root>/<日期>/，见
+    # configs/weather_rmse_single_aifs.py），所以这里不再强制要求该键。
+    target_zarr = cfg.pop("target_zarr", None)
     outdir_root = cfg.pop("outdir_root")
     periods = cfg.pop("periods")
     metrics = cfg.pop("metrics")
@@ -122,8 +124,12 @@ def run_batch_config(path: Path, cfg: dict) -> int:
     worker_fallback = cfg.pop("worker_fallback", None)
     summarize_mode = cfg.pop("summarize_mode", None)
     env_overrides = cfg.pop("env_overrides", None)
+    # AIFS 专属：设了就切到 --aifs-pred-root/--aifs-target-root 那条命令行。
+    # 不设（其余五个模型）行为完全不变。它经 **kwargs 一路进指纹，因为观测源
+    # 本身就影响结果——换 target 必须换目录，不能续写。
+    aifs_target_root = cfg.pop("aifs_target_root", None)
     output_name = cfg.pop("output_name", label)
-    resume_cache = cfg.pop("resume_cache", False)
+    cfg.pop("resume_cache", None)  # 已废弃：工作目录固定为 results/<output_name>/<指纹>/
 
     print(f"[runner] Batch label: {label}", flush=True)
     print(f"[runner] Pred root: {pred_root}", flush=True)
@@ -132,6 +138,11 @@ def run_batch_config(path: Path, cfg: dict) -> int:
     print(f"[runner] Metrics: {metrics}", flush=True)
     print(f"[runner] Variables: {len(variables)} vars", flush=True)
     print(f"[runner] Workers: {n_workers} (fallback: {worker_fallback})", flush=True)
+
+    # 只在非空时才塞进调用：run_batch_with_periods 没有这个形参，它会被 **kwargs
+    # 收走并进指纹。无条件传 None 会让其余五个模型的 kwargs 凭空多一个键，
+    # 指纹全变 —— 归档目录名跟着变，等于把已有结果全作废。
+    aifs_kw = {"aifs_target_root": aifs_target_root} if aifs_target_root else {}
 
     return run_batch_with_periods(
         entry_script=entry_script,
@@ -150,7 +161,7 @@ def run_batch_config(path: Path, cfg: dict) -> int:
         summarize_mode=summarize_mode,
         env_overrides=env_overrides,
         output_name=output_name,
-        resume_cache=resume_cache,
+        **aifs_kw,
     )
 
 

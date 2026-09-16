@@ -5,10 +5,8 @@ import hashlib
 import json
 import os
 import re
-import shutil
 import subprocess
 import sys
-import tempfile
 import threading
 import time
 from pathlib import Path
@@ -138,7 +136,7 @@ def _progress_monitor(outdir_root: str, total_dates: int, stop_event: threading.
 def run_batch_job(
     entry_script: Path,
     pred_root: str,
-    target_zarr: list[str],
+    target_zarr: list[str] | None,
     outdir_root: str,
     dates: list[str],
     metrics: list[str],
@@ -150,6 +148,7 @@ def run_batch_job(
     resume: bool = False,
     worker_fallback: list[int] | None = None,
     env_overrides: dict[str, str] | None = None,
+    aifs_target_root: str | None = None,
 ) -> int:
     """Run one date batch using the reference entry point."""
     if not dates:
@@ -169,10 +168,22 @@ def run_batch_job(
     monitor_thread.start()
 
     try:
-        cmd = [sys.executable, str(entry_script), "--pred-root", pred_root,
-               "--dates", *dates, "--target-zarr", *target_zarr,
-               "--metrics", *metrics, "--vars", *variables,
-               "--n-workers", str(n_workers), "--outdir-root", outdir_root]
+        # AIFS 走的不是通用路径：它的观测是目录式的（<target_root>/<日期>/），
+        # 由 vfc/regr_ens.py 的 run_aifs_batch* 读 AifsForecast，只认
+        # --aifs-pred-root / --aifs-target-root 两个专属开关，**没有 target_zarr**。
+        # 其余模型一律走 --pred-root + --target-zarr。
+        if aifs_target_root:
+            cmd = [sys.executable, str(entry_script),
+                   "--aifs-pred-root", pred_root,
+                   "--aifs-target-root", aifs_target_root,
+                   "--dates", *dates,
+                   "--metrics", *metrics, "--vars", *variables,
+                   "--n-workers", str(n_workers), "--outdir-root", outdir_root]
+        else:
+            cmd = [sys.executable, str(entry_script), "--pred-root", pred_root,
+                   "--dates", *dates, "--target-zarr", *target_zarr,
+                   "--metrics", *metrics, "--vars", *variables,
+                   "--n-workers", str(n_workers), "--outdir-root", outdir_root]
         if var_metrics:
             for var, metric_names in var_metrics.items():
                 cmd.extend(["--var-metrics", f"{var}:{','.join(metric_names)}"])
@@ -237,31 +248,22 @@ def run_batch_with_periods(
     periods: list[tuple[str, str]],
     summarize_mode: str | None = None,
     output_name: str = "batch",
-    resume_cache: bool = False,
     **kwargs: Any,
 ) -> int:
-    """Run periods, summarize, and publish one capability-level CSV.
+    """Run periods, summarize, and publish into ``outputs/results/``.
 
-    Reference date directories are temporary by default.  Setting resume_cache=True
-    retains a fingerprinted hidden cache so the reference --resume contract remains
-    available across invocations.
+    工作目录就是最终归档目录：``results/<output_name>/<配置指纹>/``。跑出来的
+    逐日结果直接落在那儿，不再有中间副本——省一份存储，断档重跑就地续上
+    （是否跳过已完成的日期由 ``resume`` 决定，见 :func:`run_batch_job`）。
     """
     print(f"[batch_adapter] Starting batch with periods", flush=True)
     print(f"[batch_adapter]   Output root: {outdir_root}", flush=True)
     print(f"[batch_adapter]   Periods: {len(periods)}", flush=True)
-    print(f"[batch_adapter]   Resume cache: {resume_cache}", flush=True)
 
-    # Use unified outputs directory structure
-    # /workspace/szwCode/xmetai-eval_pro/outputs/
-    #   ├── .temp/          <- Temporary work directories
-    #   └── results/        <- Final CSV results
     # 本文件在 core/ 下，outputs/ 在仓库根（=core 的上一级），不是本文件所在目录。
     eval_pro_root = Path(__file__).resolve().parent.parent
     unified_outputs = eval_pro_root / "outputs"
-    temp_base = unified_outputs / ".temp"
     results_base = unified_outputs / "results"
-
-    temp_base.mkdir(parents=True, exist_ok=True)
     results_base.mkdir(parents=True, exist_ok=True)
 
     config_fingerprint = _fingerprint({
@@ -269,25 +271,11 @@ def run_batch_with_periods(
         "summarize_mode": summarize_mode, "kwargs": kwargs,
     })
 
-    if resume_cache:
-        # Use persistent cache under .temp
-        work_root = temp_base / output_name / config_fingerprint
-        work_root.mkdir(parents=True, exist_ok=True)
-        cleanup = False
-        print(f"[batch_adapter] Using persistent cache: {work_root}", flush=True)
-    else:
-        # Use timestamped temporary directory under .temp
-        import time
-        timestamp = time.strftime("%Y%m%d_%H%M%S")
-        work_root = temp_base / f"{output_name}_{timestamp}_{config_fingerprint[:8]}"
-        work_root.mkdir(parents=True, exist_ok=True)
-        cleanup = True
-        print(f"[batch_adapter] Using temporary work directory: {work_root}", flush=True)
-
-    # Final results go to results/ directory
+    # 配置相同 → 指纹相同 → 同一个目录，重跑就是往里续写/覆盖。
     final_output_dir = results_base / output_name
-    final_output_dir.mkdir(parents=True, exist_ok=True)
-    print(f"[batch_adapter] Final results will be saved to: {final_output_dir}", flush=True)
+    work_root = final_output_dir / config_fingerprint
+    work_root.mkdir(parents=True, exist_ok=True)
+    print(f"[batch_adapter] Work directory (also the archive): {work_root}", flush=True)
 
     failed = 0
     try:
@@ -330,17 +318,12 @@ def run_batch_with_periods(
                 except (OSError, ValueError, pd.errors.ParserError) as exc:
                     print(f"[batch_adapter] Publish failed: {exc}", file=sys.stderr, flush=True)
                     failed = 1
-        if resume_cache and not failed:
-            print(f"[batch_adapter] Writing cache metadata", flush=True)
+        if not failed:
             (work_root / "cache_meta.json").write_text(
                 json.dumps({"fingerprint": config_fingerprint, "output_name": output_name},
                            indent=2), encoding="utf-8")
     finally:
-        if cleanup:
-            print(f"[batch_adapter] Cleaning up temporary directory: {work_root}", flush=True)
-            shutil.rmtree(work_root, ignore_errors=True)
-        else:
-            print(f"[batch_adapter] Preserving cache directory: {work_root}", flush=True)
+        print(f"[batch_adapter] Archive directory: {work_root}", flush=True)
 
     if failed:
         print(f"[batch_adapter] Batch failed", file=sys.stderr, flush=True)
