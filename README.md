@@ -52,10 +52,10 @@ python runner.py --config configs/weather_rmse_single_fengqing.py
 | **确定性连续量检验**（batch） | batch | 预报根目录 + era5 zarr + 气候态 | RMSE/ACC/活跃度/谱长表 | `weather_rmse_single_{fuxi,fgvp,fengqing}` |
 | **集合连续量检验**（batch） | batch | 同上（集合） | 同上 + CRPS/离散度 | `weather_rmse_ens_fuxi` |
 | **台风路径/强度检验** `typhoon` | capability | 预报场 + babj 实况 | `tc<编号>_<起报>.csv`：路径/强度误差 | `weather_typhoon_single_fuxi` |
-| **fdp 确定性场检验** `fdp_field_det` | capability | FCSTDATA DF 预报 nc + CRA 实况 + CLI 气候态 | 长表：z500/t2m/msl/u10/v10 的 RMSE/Bias，z500 另有 ACC | `fdp_field_det` |
-| **fdp 集合检验** `fdp_ens` | capability | ENS 预报 nc + CRA + 站点降水实况 | 长表：CRPS/离散度-误差比/集合平均 RMSE + BSS/AROC（0.1/4/13/25mm） | `fdp_ens` |
-| **fdp 活跃度+功率谱** `fdp_activity_spectrum` | capability | DF z500 + CRA + CLI 气候态 | 长表：activity_ratio；`_power_spectrum.csv`：逐波数功率预报 vs 实况 | `fdp_activity_spectrum` |
-| **fdp 确定性降水检验** `fdp_tp_det` | capability | DF tp + 站点实况(diamond 3) + CMPAS/CRA 网格 | 长表：6h(TS/Bias三档+FSS+综合)/24h(TS/Bias五档+综合)，`accum_hours` 列区分 | `fdp_tp_det` |
+| **fdp 确定性场检验** `fdp_field_det` | capability | FCSTDATA DF 预报 nc + CRA 实况 + CLI 气候态 | 长表：z500/t2m/msl/u10/v10 的 RMSE/Bias，z500 另有 ACC | `fdp_rmse_single_multi` |
+| **fdp 集合检验** `fdp_ens` | capability | ENS 预报 nc + CRA + 站点降水实况 | 长表：CRPS/离散度-误差比/集合平均 RMSE + BSS/AROC（0.1/4/13/25mm） | `fdp_crps_ens_multi` |
+| **fdp 活跃度+功率谱** `fdp_activity_spectrum` | capability | DF z500 + CRA + CLI 气候态 | 长表：activity_ratio；`_power_spectrum.csv`：逐波数功率预报 vs 实况 | `fdp_activity_single_multi` |
+| **fdp 确定性降水检验** `fdp_tp_det` | capability | DF tp + 站点实况(diamond 3) + CMPAS/CRA 网格 | 长表：6h(TS/Bias三档+FSS+综合)/24h(TS/Bias五档+综合)，`accum_hours` 列区分 | `fdp_ts_single_multi` |
 
 ## 评估指标说明
 
@@ -169,8 +169,10 @@ batch 配置语义：
 `fdp/` 下是示范计划检验包的 4 个 verifier（原样拷入，多模型：Fengqing / PuYun / YJ-TianJi / NJU-Earth / W2S）。`core/fdp_adapter.py` 把 config 的日期区间（`start_date`/`end_date`/`init_hour`）展开成逐起报时刻，每个起报拼 argv 后用 runpy 以 `__main__` 跑一遍原脚本——数据加载、单位转换、多线程、绘图全部零改动。
 
 ```bash
-python runner.py --config configs/fdp_field_det.py
+python runner.py --config configs/fdp_rmse_single_multi.py
 ```
+
+四个 config 按 `fdp_<能力>_<single/ens>_<模型>` 命名（single=确定性 DF、ens=集合预报；当前评 5 个模型所以后缀 `multi`，只评某一个模型时克隆改名）：
 
 - 单个起报失败只记日志、不中断区间；`resume: True` 时靠 `outputs/.temp/<output_name>/<date>.done` 标记跳过已完成起报。
 - fdp 原始逐日起报 CSV + 图留在 staging（`outputs/.temp/<output_name>/`）；跑完由 adapter 合并成带 `init_date` 列的长表，runner 落盘 `outputs/results/<output_name>/<capability>.csv`（活跃度能力另出 `_power_spectrum.csv`）。
