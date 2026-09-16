@@ -21,6 +21,7 @@ eval_pro/
 │   ├── categorical_ref.py    # 降水分类检验参考实现
 │   └── tc_ref.py             # 台风路径/强度检验参考实现
 ├── vfc/                 # 验证核心模块（拷自 xmetai_model_verification_xu）
+├── fdp/                 # 示范计划检验包（4 个 verifier 原样拷入，runpy 启动）
 ├── configs/            # 评测配置（Python dict，字面量默认值）
 ├── outputs/results/    # 评测产物
 ├── outputs/.temp/      # 断点续跑缓存（按 config 指纹分目录）
@@ -51,6 +52,10 @@ python runner.py --config configs/weather_rmse_single_fengqing.py
 | **确定性连续量检验**（batch） | batch | 预报根目录 + era5 zarr + 气候态 | RMSE/ACC/活跃度/谱长表 | `weather_rmse_single_{fuxi,fgvp,fengqing}` |
 | **集合连续量检验**（batch） | batch | 同上（集合） | 同上 + CRPS/离散度 | `weather_rmse_ens_fuxi` |
 | **台风路径/强度检验** `typhoon` | capability | 预报场 + babj 实况 | `tc<编号>_<起报>.csv`：路径/强度误差 | `weather_typhoon_single_fuxi` |
+| **fdp 确定性场检验** `fdp_field_det` | capability | FCSTDATA DF 预报 nc + CRA 实况 + CLI 气候态 | 长表：z500/t2m/msl/u10/v10 的 RMSE/Bias，z500 另有 ACC | `fdp_field_det` |
+| **fdp 集合检验** `fdp_ens` | capability | ENS 预报 nc + CRA + 站点降水实况 | 长表：CRPS/离散度-误差比/集合平均 RMSE + BSS/AROC（0.1/4/13/25mm） | `fdp_ens` |
+| **fdp 活跃度+功率谱** `fdp_activity_spectrum` | capability | DF z500 + CRA + CLI 气候态 | 长表：activity_ratio；`_power_spectrum.csv`：逐波数功率预报 vs 实况 | `fdp_activity_spectrum` |
+| **fdp 确定性降水检验** `fdp_tp_det` | capability | DF tp + 站点实况(diamond 3) + CMPAS/CRA 网格 | 长表：6h(TS/Bias三档+FSS+综合)/24h(TS/Bias五档+综合)，`accum_hours` 列区分 | `fdp_tp_det` |
 
 ## 评估指标说明
 
@@ -158,6 +163,18 @@ batch 配置语义：
 并行策略：起报日期按 `VFC_DATES_PER_CHILD`（=1）切块，短命 worker 每进程只跑一块，内存不跨日期累积。首次启动有 20 分钟左右的冷启动静默（48 个 worker 同时加载库/气候态），期间日志无输出是**正常现象**，等第一波 chunk 完成后进度会突然密集出现。
 
 **worker 数怎么定**（2026-09-15 480G/48核 全量日志实锤）：普通日期单 worker 常驻 <10G，48 并发吞吐最高（~4 日期/分钟）；OOM 只发生在坏数据日期上（单日 >40G，12 并发即崩）。所以 `n_workers=48` 起跑、fallback `[48, 4, 2]`——中间档（如 36/24/12）撞上坏日期一样崩，每档白死 ~10 分钟，不值得放阶梯里。换内存规格的机器按 `可用内存 × 0.7 ÷ 单 worker 峰值` 估算并发数。
+
+## fdp 评测（示范计划检验包）
+
+`fdp/` 下是示范计划检验包的 4 个 verifier（原样拷入，多模型：Fengqing / PuYun / YJ-TianJi / NJU-Earth / W2S）。`core/fdp_adapter.py` 把 config 的日期区间（`start_date`/`end_date`/`init_hour`）展开成逐起报时刻，每个起报拼 argv 后用 runpy 以 `__main__` 跑一遍原脚本——数据加载、单位转换、多线程、绘图全部零改动。
+
+```bash
+python runner.py --config configs/fdp_field_det.py
+```
+
+- 单个起报失败只记日志、不中断区间；`resume: True` 时靠 `outputs/.temp/<output_name>/<date>.done` 标记跳过已完成起报。
+- fdp 原始逐日起报 CSV + 图留在 staging（`outputs/.temp/<output_name>/`）；跑完由 adapter 合并成带 `init_date` 列的长表，runner 落盘 `outputs/results/<output_name>/<capability>.csv`（活跃度能力另出 `_power_spectrum.csv`）。
+- 模型清单、路径根（FCSTDATA / CRA / CLI / RDATA）都是 config 字面量，按环境改。
 
 ## 运行日志
 

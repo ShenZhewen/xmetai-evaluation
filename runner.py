@@ -18,6 +18,11 @@ CAPABILITIES = {
     "weather_ens_crps": ("core.api", "run_ens_crps"),
     "weather_ens_field_scores": ("core.api", "run_ens_field"),
     "typhoon": ("core.api", "run_tc"),
+    # fdp 参考实现（core/fdp_adapter.py → runpy 启动 fdp/ 原脚本）
+    "fdp_field_det": ("core.fdp_adapter", "run_field_det"),
+    "fdp_ens": ("core.fdp_adapter", "run_ens"),
+    "fdp_activity_spectrum": ("core.fdp_adapter", "run_activity_spectrum"),
+    "fdp_tp_det": ("core.fdp_adapter", "run_tp_det"),
 }
 
 
