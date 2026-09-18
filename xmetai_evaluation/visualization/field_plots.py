@@ -41,7 +41,9 @@ from xmetai_evaluation.visualization.precipitation_plots import setup_chinese_fo
 
 REQUIRED_COLUMNS = ("lead_h", "variable", "metric", "value")
 
-#: ``details`` 里逐波数谱的 group 形如 ``k=0`` / ``k=720``；``summary`` 是总功率行。
+#: 旧口径：``details`` 里逐波数谱的 group 形如 ``k=0`` / ``k=720``；``summary`` 是总功率行。
+#: 谱曲线现在由 ``spectrum`` writer 出成 ``diagnostics/spectrum_{var}.csv``，
+#: 只有早先归档里的 ``scores_detail.csv`` 还有这些行，所以这里保留读取能力。
 _WAVENUMBER_PATTERN = r"^k=\d+$"
 
 #: 读大明细表时只取这几列（实测 90 万行，全读没必要）。
@@ -104,6 +106,10 @@ def load_spectrum_details(
     path: Path, variable: Optional[str] = None, lead_h: Optional[float] = None
 ) -> pd.DataFrame:
     """读 ``diagnostics/scores_detail.csv`` 里的逐波数谱，按变量/时效过滤。
+
+    这是**旧口径**：谱曲线现在走 ``spectrum`` writer，新跑的批次在
+    ``diagnostics/spectrum_{var}.csv`` / ``spectrum_by_init.csv`` 里，明细表已无这些行；
+    保留读取能力只为早先的归档。
 
     明细表很大（本仓库实测 90 万行），所以只取用得上的几列再过滤。
 
@@ -421,8 +427,9 @@ class FieldScorePlotter:
             )
         elif spectrum_variable and not details_path:
             spectrum_note = (
-                "要求了谱曲线但没给明细表路径，未出图"
-                "（逐波数谱在 `diagnostics/scores_detail.csv` 里）。"
+                "要求了谱曲线但没给明细表路径，未出图（逐波数谱现在由 "
+                "`spectrum` writer 出成 `diagnostics/spectrum_{var}.csv`，"
+                "旧归档才在 `diagnostics/scores_detail.csv` 里）。"
             )
 
         report_path = output_dir / "REPORT.md"

@@ -176,6 +176,14 @@ class TestFuxiLayout:
         index = FuXiCatalog(root_dir=tmp_path).discover(request)
         assert len(index.available[0][init]) == 2
 
+        # 索引必须带着 lead 走：这个布局的 lead 是"文件顺序"推出来的，过滤后
+        # 顺序从 0 重排会把 12/24 的文件认成 6/12。分块执行按时效窗发请求，
+        # 请求的时效本来就不是从头开始的一段，错标会直接把样本静默丢掉。
+        reader = FuXiReader()
+        bundle = reader.read(request, index)
+        np.testing.assert_allclose(bundle.payload["tp"].lead_time.values, [12, 24])
+        assert reader.max_lead_hours(index) == 24
+
 
 def _write_member(directory: Path, value: float) -> None:
     directory.mkdir(parents=True, exist_ok=True)

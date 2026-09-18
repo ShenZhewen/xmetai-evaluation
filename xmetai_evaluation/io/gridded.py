@@ -184,9 +184,14 @@ class GriddedCatalog(DataCatalog):
         """把记录列表压成索引（形状由布局的 key_kind 决定）。"""
         kind = self.layout.key_kind
         if kind == "init":
-            by_init: Dict[datetime, List[Path]] = {}
+            # (lead, path) 成对存：这两个布局的 lead 是"文件顺序"推出来的
+            # （``lead_from="index"``），而请求按 lead_times 过滤之后顺序会从 0
+            # 重排——只存 path 的话还原时会把 24h 的文件认成 6h。
+            by_init: Dict[datetime, List[Tuple[Optional[float], Path]]] = {}
             for record in sorted(records, key=lambda item: (item.init_time, item.lead_time)):
-                by_init.setdefault(record.init_time, []).append(record.path)
+                by_init.setdefault(record.init_time, []).append(
+                    (record.lead_time, record.path)
+                )
             return by_init
         if kind == "init_member_lead":
             return {
@@ -241,14 +246,10 @@ class GriddedReader(Reader):
         records: List[GriddedRecord] = []
 
         if kind == "init":
-            for moment, paths in entries.items():
-                for position, path in enumerate(sorted(paths)):
+            for moment, items in entries.items():
+                for lead, path in items:
                     records.append(
-                        GriddedRecord(
-                            path=Path(path),
-                            init_time=moment,
-                            lead_time=(position + 1) * self.layout.step_hours,
-                        )
+                        GriddedRecord(path=Path(path), init_time=moment, lead_time=lead)
                     )
         elif kind == "time_group":
             for (moment, group), path in entries.items():
@@ -279,7 +280,7 @@ class GriddedReader(Reader):
     def available_init_times(self, index: DataIndex) -> List[datetime]:
         """索引里出现的起报时刻（去重、升序）。
 
-        调用方不需要知道索引内部是 {init: [paths]} 还是 {(init, member, lead): path}。
+        调用方不需要知道索引内部是 {init: [(lead, path)]} 还是 {(init, member, lead): path}。
         """
         return sorted(
             {
@@ -356,7 +357,13 @@ class GriddedReader(Reader):
 
         try:
             with self._open(record.path, None) as source:
-                dataset = source.load()
+                # 先在**惰性**数据集上做改名/挑选/换算，再 load——顺序反过来
+                # （先 load 再挑）会把文件里的变量**全部**读进内存，哪怕只请求了
+                # 其中几个。集合预报一个文件十来个要素，51 成员 × 4 时效 = 204 个
+                # 文件，差一个要素就是几个 GB 的峰值。
+                dataset = self._normalize(source, variables)
+                if dataset is not None:
+                    dataset = dataset.load()
         except DecodeError:
             raise
         except Exception as exc:
@@ -366,7 +373,7 @@ class GriddedReader(Reader):
                 path=str(record.path),
                 cause=exc,
             ) from exc
-        return self._normalize(dataset, variables)
+        return dataset
 
     def _open(self, path: Path, filter_by_keys: Optional[Dict[str, Any]]):
         if self.layout.engine == "cfgrib":
@@ -479,9 +486,16 @@ class GriddedReader(Reader):
                 for lead_time in sorted(by_init[init_time], key=lambda value: (value is None, value)):
                     merged = self._merge_members(by_init[init_time][lead_time])
                     lead_datasets.append(merged.expand_dims(lead_time=[lead_time]))
-                combined = xr.concat(lead_datasets, dim="lead_time")
+                # coords/compat 双双写死：xarray 的弃用预告成对出现，只写一个它会
+                # 接着问下一个（详见 matcher._add_valid_time 处的说明）。
+                # 两个值都是当前的默认值，写死 = 行为不变。
+                combined = xr.concat(
+                    lead_datasets, dim="lead_time", coords="different", compat="equals"
+                )
                 init_datasets.append(combined.expand_dims(init_time=[init_time]))
-            return xr.concat(init_datasets, dim="init_time")
+            return xr.concat(
+                init_datasets, dim="init_time", coords="different", compat="equals"
+            )
 
         by_time: Dict[datetime, List[xr.Dataset]] = {}
         for record, dataset in frames:
@@ -491,7 +505,9 @@ class GriddedReader(Reader):
             parts = by_time[moment]
             merged = parts[0] if len(parts) == 1 else xr.merge(parts)
             time_datasets.append(merged.expand_dims(valid_time=[moment]))
-        return xr.concat(time_datasets, dim="valid_time")
+        return xr.concat(
+            time_datasets, dim="valid_time", coords="different", compat="equals"
+        )
 
     def _merge_members(self, by_member: Dict[Any, List[xr.Dataset]]) -> xr.Dataset:
         """同一 (init, lead) 的多个成员拼成 member 维；同一成员的多个文件合并。"""
@@ -507,7 +523,9 @@ class GriddedReader(Reader):
         if name in merged_parts[0].dims:
             # 成员已经在文件内的维度里（如 Fengqing 内置 member 维）
             return merged_parts[0] if len(merged_parts) == 1 else xr.merge(merged_parts)
-        stacked = xr.concat(merged_parts, dim=name)
+        stacked = xr.concat(
+            merged_parts, dim=name, coords="different", compat="equals"
+        )
         return stacked.assign_coords({name: list(members)})
 
     def _build_bundle(

@@ -123,8 +123,8 @@ PIPELINE_TEMPLATES: Dict[str, PipelineTemplate] = {
             "        活跃度是距平统计，直接报错（不是静默出假数）\n"
             "  指标  rmse、acc、activity、zonal_spectrum\n"
             "        （max_k 由 metric_options 给，默认 30）\n"
-            "        产出 scores.csv、diagnostics/scores_detail.csv\n"
-            "        （逐波数谱曲线落在明细表里，group=k=<波数>）"
+            "        产出 scores.csv、diagnostics/spectrum_{var}.csv（全体均值曲线）、\n"
+            "        diagnostics/spectrum_by_init.csv（逐起报曲线）"
         ),
         transforms=[TransformSpec("ensemble_mean")],
         metrics=[
@@ -133,7 +133,7 @@ PIPELINE_TEMPLATES: Dict[str, PipelineTemplate] = {
             MetricSpec("activity"),
             MetricSpec("zonal_spectrum"),
         ],
-        writers=["csv_long", "details"],
+        writers=["csv_long", "spectrum"],
         options={"ensemble_reduction": "mean"},
     ),
     "weather_ens_crps": PipelineTemplate(
@@ -167,8 +167,8 @@ PIPELINE_TEMPLATES: Dict[str, PipelineTemplate] = {
             "  计算  grid_valid_time：格点有效时刻配对；集合均值另算\n"
             "        CRPS 直接吃原始成员，不走均值\n"
             "  指标  rmse、crps、acc、activity、zonal_spectrum\n"
-            "        产出 scores.csv、diagnostics/scores_detail.csv\n"
-            "        （逐波数谱曲线落在明细表里，group=k=<波数>）"
+            "        产出 scores.csv、diagnostics/spectrum_{var}.csv（全体均值曲线）、\n"
+            "        diagnostics/spectrum_by_init.csv（逐起报曲线）"
         ),
         transforms=[TransformSpec("ensemble_mean")],
         metrics=[
@@ -178,7 +178,7 @@ PIPELINE_TEMPLATES: Dict[str, PipelineTemplate] = {
             MetricSpec("activity"),
             MetricSpec("zonal_spectrum"),
         ],
-        writers=["csv_long", "details"],
+        writers=["csv_long", "spectrum"],
         options={"ensemble_reduction": "mean"},
     ),
     "fdp_ens_crps": PipelineTemplate(
@@ -277,11 +277,12 @@ PIPELINE_TEMPLATES: Dict[str, PipelineTemplate] = {
             "        谱口径与 weather_field_scores 的 zonal_spectrum 不同：\n"
             "        这里对原始场做二维 FFT、不减纬向均值\n"
             "  指标  activity（含 FC/OBS 活跃度与 BIAS）、spectrum（max_k=30）\n"
-            "        产出 scores.csv"
+            "        产出 scores.csv、diagnostics/spectrum_{var}.csv（全体均值曲线）、\n"
+            "        diagnostics/spectrum_by_init.csv（逐起报曲线）"
         ),
         transforms=[TransformSpec("ensemble_mean")],
         metrics=[MetricSpec("activity"), MetricSpec("spectrum")],
-        writers=["csv_long"],
+        writers=["csv_long", "spectrum"],
         options={"ensemble_reduction": "mean"},
     ),
 }

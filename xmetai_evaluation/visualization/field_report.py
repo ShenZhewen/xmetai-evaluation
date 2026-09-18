@@ -686,9 +686,11 @@ def build_field_report(
         "- **首/末时效不是稳定的统计量**：起报数与样本区间决定了这条曲线的形态，"
         "本报告里「涨到几倍」这类说法只在当前这套输入下成立，"
         "跨批次比较要用同样的起报集合与时段。",
-        "- **逐波数谱曲线不在 `scores.csv` 里**，在 `diagnostics/scores_detail.csv` 的"
-        "`group=k=<波数>` 行；本报告默认不读它（单变量单时效就有 721 个波数），"
-        "需要时用 `--spectrum-variable` / `--spectrum-lead` 按需出图。",
+        "- **逐波数谱曲线不在 `scores.csv` 里**，在 `spectrum` writer 出的"
+        "`diagnostics/spectrum_{var}.csv`（全体均值）与 `spectrum_by_init.csv`（逐起报）；"
+        "本报告默认不读它（单变量就有 721 个波数 × 几百个起报）。"
+        "早先的归档才在 `diagnostics/scores_detail.csv` 的 `group=k=<波数>` 行里，"
+        "那种格式下可用 `--spectrum-variable` / `--spectrum-lead` 按需出图。",
         "- 本报告**不重算任何指标**，只消费已落盘的长表；`scores.csv` 是唯一数值来源。",
     ]
 

@@ -39,6 +39,11 @@ from xmetai_evaluation.io.layouts import ERA5_ZARR_LAYOUT, GriddedLayout
 
 log = logging.getLogger(__name__)
 
+#: 已经告警过的「store 里没有的变量」组合。这是 store 内容的静态事实，但 read()
+#: 每块都调一次——不去重就是每块刷一条一模一样的 WARNING。同一条消息只打一次
+#: （进程各存一份，fork 下每段一次）。
+_WARNED_MISSING: set = set()
+
 #: 通道名清单的旁挂文件（与 store 同级的目录里）
 CHANNEL_NAMES_FILE = "channel_names.json"
 
@@ -384,7 +389,10 @@ class Era5ZarrReader(Reader):
                 resolved[str(name)] = found
         if unresolved:
             # 与参考实现一致：缺的要素跳过，不因此让整轮评测失败
-            log.warning("ERA5 zarr 里没有这些变量，已跳过: %s", ", ".join(unresolved))
+            message = ", ".join(unresolved)
+            if message not in _WARNED_MISSING:
+                _WARNED_MISSING.add(message)
+                log.warning("ERA5 zarr 里没有这些变量，已跳过: %s", message)
         if not resolved:
             raise DecodeError(
                 f"ERA5 zarr 里没有任何请求的变量可用: {list(request.variables)}"

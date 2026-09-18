@@ -14,6 +14,7 @@ from xmetai_evaluation.core.contracts import (
     SemanticMetadata,
 )
 from xmetai_evaluation.core.variables import DataKind, TemporalKind
+from xmetai_evaluation.pipeline import matcher as matcher_module
 from xmetai_evaluation.pipeline.matcher import (
     DERIVED_VARIABLES,
     Matcher,
@@ -149,6 +150,9 @@ def test_missing_variable_is_skipped_not_fatal(caplog):
         _observation(np.arange(-180.0, 180.0, 90.0)), "era5", DataKind.GRIDDED_OBSERVATION
     )
 
+    # 同一条「缺变量」告警每进程只发一次（每块都发会把日志刷爆），所以先清掉
+    # 本进程里可能已经记录过的组合，否则这条断言会依赖测试执行顺序。
+    matcher_module._WARNED_MISSING.clear()
     with caplog.at_level("WARNING"):
         batches = Matcher().match(
             forecast=forecast, observation=observation, variables=["z500", "q700"]

@@ -293,25 +293,8 @@ class PowerSpectrum(Metric):
         forecast_power = state.data["forecast_power"] / count
         observation_power = state.data["observation_power"] / count
 
-        # 曲线进 diagnostics（details 表），总功率比作为标量进长表
-        value: Dict[str, Any] = {}
-        for k in range(forecast_power.size):
-            value[f"k={k}"] = {
-                "wavenumber": int(k),
-                "power_forecast": float(forecast_power[k]),
-                "power_observation": float(observation_power[k]),
-            }
-        forecast_total = float(forecast_power.sum())
-        observation_total = float(observation_power.sum())
-        value["summary"] = {
-            "total_power_forecast": forecast_total,
-            "total_power_observation": observation_total,
-            "power_ratio": (
-                float(forecast_total / observation_total)
-                if observation_total > 0
-                else float("nan")
-            ),
-        }
+        # 总功率比作为标量进长表；逐波数曲线走 curve（见 MetricResult.curve）
+        value, curve = _spectrum_summary_and_curve(forecast_power, observation_power)
 
         return MetricResult(
             metric_name=self.name,
@@ -323,6 +306,7 @@ class PowerSpectrum(Metric):
             aggregation="wavenumber_spectrum",
             unit="1",  # 进长表的是无量纲的 power_ratio
             product_kind=self.PRODUCT_KIND,
+            curve=curve,
         )
 
 
@@ -360,6 +344,36 @@ def zonal_spectrum(
     )
     wshape = (1,) * (psd.ndim - 2) + (lat.size, 1)
     return (psd * w.reshape(wshape)).sum(axis=-2) / w.sum()
+
+
+def _spectrum_summary_and_curve(
+    forecast_power: np.ndarray, observation_power: np.ndarray
+):
+    """把逐波数功率曲线拆成「标量摘要 + 曲线」两半。
+
+    摘要进 ``MetricResult.value``（``power_ratio`` 落进长表）；曲线走
+    ``MetricResult.curve``，**不进 value**——value 里每个分组键都会在
+    ``build_tables`` 里展开成明细行，720 个波数 × 3 个字段就是 2165 行/样本，
+    全年段能撑到四千多万行。
+    """
+    forecast_total = float(forecast_power.sum())
+    observation_total = float(observation_power.sum())
+    summary = {
+        "total_power_forecast": forecast_total,
+        "total_power_observation": observation_total,
+        "power_ratio": (
+            float(forecast_total / observation_total)
+            if observation_total > 0
+            else float("nan")
+        ),
+    }
+    curve = {
+        "kind": "wavenumber_spectrum",
+        "wavenumber": np.arange(forecast_power.size, dtype="i8"),
+        "power_forecast": np.asarray(forecast_power, dtype="f8"),
+        "power_observation": np.asarray(observation_power, dtype="f8"),
+    }
+    return {"summary": summary}, curve
 
 
 class ZonalSpectrum(Metric):
@@ -450,24 +464,8 @@ class ZonalSpectrum(Metric):
         forecast_power = state.data["forecast_power"] / count
         observation_power = state.data["observation_power"] / count
 
-        value: Dict[str, Any] = {}
-        for k in range(forecast_power.size):
-            value[f"k={k}"] = {
-                "wavenumber": int(k),
-                "power_forecast": float(forecast_power[k]),
-                "power_observation": float(observation_power[k]),
-            }
-        forecast_total = float(forecast_power.sum())
-        observation_total = float(observation_power.sum())
-        value["summary"] = {
-            "total_power_forecast": forecast_total,
-            "total_power_observation": observation_total,
-            "power_ratio": (
-                float(forecast_total / observation_total)
-                if observation_total > 0
-                else float("nan")
-            ),
-        }
+        # 总功率比作为标量进长表；逐波数曲线走 curve（见 MetricResult.curve）
+        value, curve = _spectrum_summary_and_curve(forecast_power, observation_power)
 
         return MetricResult(
             metric_name=self.name,
@@ -479,4 +477,5 @@ class ZonalSpectrum(Metric):
             aggregation="wavenumber_spectrum",
             unit="1",  # 进长表的是无量纲的 power_ratio
             product_kind=self.PRODUCT_KIND,
+            curve=curve,
         )

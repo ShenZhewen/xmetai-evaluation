@@ -104,13 +104,15 @@ def test_leap_day_collapses_onto_feb_28(tmp_path):
 def test_366_day_file_keeps_feb_29_and_shifts_common_years(tmp_path):
     """366 天文件含 2/29；平年请求要跳过那一格。"""
     _write_per_variable(tmp_path, days=366)
+    # reader 会把请求时刻排序后再建 valid_time 轴，这里按时间顺序给，
+    # 下标才对得上（给乱序也能跑，只是 isel 的下标含义跟着 sorted 走）。
     bundle = _read(
-        tmp_path, ["z500"], [datetime(2024, 2, 29), datetime(2025, 3, 1), datetime(2025, 2, 28)]
+        tmp_path, ["z500"], [datetime(2024, 2, 29), datetime(2025, 2, 28), datetime(2025, 3, 1)]
     )
 
     np.testing.assert_allclose(_field(bundle, "z500", 0), 59.0)  # 闰年 2/29 就是第 59 格
-    np.testing.assert_allclose(_field(bundle, "z500", 1), 60.0)  # 平年 3/1 顺延到 60
-    np.testing.assert_allclose(_field(bundle, "z500", 2), 58.0)  # 2/28 不受影响
+    np.testing.assert_allclose(_field(bundle, "z500", 1), 58.0)  # 平年 2/28 不受影响
+    np.testing.assert_allclose(_field(bundle, "z500", 2), 60.0)  # 平年 3/1 顺延到 60
 
 
 def test_sub_daily_step_interpolates_linearly(tmp_path):

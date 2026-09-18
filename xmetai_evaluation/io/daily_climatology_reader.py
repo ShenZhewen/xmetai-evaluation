@@ -32,6 +32,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import xarray as xr
+from tqdm import tqdm
 
 from xmetai_evaluation.core.contracts import (
     DataBundle,
@@ -345,7 +346,16 @@ class DailyClimatologyReader(Reader):
             fields: Dict[str, xr.DataArray] = {}
             units: Dict[str, str] = {}
 
-            for order, name in enumerate(resolved, start=1):
+            for order, name in enumerate(
+                tqdm(
+                    resolved,
+                    desc=f"气候态 {path.name}",
+                    unit="要素",
+                    ncols=100,
+                    bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}]",
+                ),
+                start=1,
+            ):
                 field = self._field(dataset, name)
                 if field is None:
                     continue

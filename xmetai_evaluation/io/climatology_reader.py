@@ -147,7 +147,15 @@ class ClimatologyReader(Reader):
                 source_id=request.source_id,
             )
 
-        combined = frames[0] if len(frames) == 1 else xr.concat(frames, dim="valid_time")
+        # coords/compat 双双写死：xarray 的弃用预告成对出现，只写一个它会接着
+        # 问下一个；两个值都是当前默认，行为不变。
+        combined = (
+            frames[0]
+            if len(frames) == 1
+            else xr.concat(
+                frames, dim="valid_time", coords="different", compat="equals"
+            )
+        )
         return DataBundle(
             payload=combined,
             kind=DataKind.REFERENCE,

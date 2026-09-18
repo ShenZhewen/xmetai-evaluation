@@ -95,9 +95,13 @@
   只在内存和 `diagnostics/scores_detail.csv` 里有。
 - **首/末时效不是稳定的统计量**：起报数与时段决定曲线形态，
   "涨到几倍"只在当前这套输入下成立；跨批次比较要用同样的起报集合。
-- **逐波数谱曲线在 `diagnostics/scores_detail.csv`**，`group=k=<波数>` 行里
-  有 `wavenumber` / `power_forecast` / `power_observation` 三个字段，
-  另有 `group=summary` 行给总功率。文件很大（实测 90 万行），**默认不读**。
+- **逐波数谱曲线已不在 `scores_detail.csv` 里**，改由 `spectrum` writer 出成
+  `diagnostics/spectrum_{var}.csv`（全体样本均值）与 `diagnostics/spectrum_by_init.csv`
+  （逐起报一条曲线，在其时效上平均）。前者列是
+  `wavenumber,wavelength_km,pred_mean,obs_mean`，后者是
+  `variable,init_time,wavenumber,wavelength_km,pred,obs`；波长 = `40075 / k`，
+  只出 k=1..720。塞进 `scores_detail.csv` 曾按「一波数 × 三字段」展开成
+  2165 行/样本，全年段逐日起报是四千多万行，所以改走 `MetricResult.curve`。
 
 ---
 

@@ -11,7 +11,9 @@ cli 与各流程只按注册名查表构造组件，不再按类型分支判断�
 
 from __future__ import annotations
 
+import csv
 import json
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -391,6 +393,117 @@ def _writer_probability_wide(tables, context, output_dir: Path) -> Path:
     return path
 
 
+#: 赤道周长（km）。波长 = 赤道周长 / 纬向波数，与参考实现同一个常数。
+_EARTH_CIRCUMFERENCE_KM = 40075.0
+
+
+def _spectrum_number(value) -> str:
+    """按参考实现的 ``%.6g`` 输出，便于跟已有归档逐格对比。"""
+    return f"{float(value):.6g}"
+
+
+def _spectrum_curve_mean(entries: List[Any]):
+    """按样本数加权平均若干条功率谱曲线，返回 ``(pred, obs)`` 两条一维数组。
+
+    每条曲线本来就是「该结果自身样本的平均谱」，权重取该结果的 ``n_requested``
+    才等价于把所有样本一起平均（各结果的样本数不一定相同）。
+    """
+    import numpy as np
+
+    size = min(
+        min(
+            np.asarray(curve["power_forecast"]).size,
+            np.asarray(curve["power_observation"]).size,
+        )
+        for _, curve in entries
+    )
+    pred_total = np.zeros(size, dtype="f8")
+    observation_total = np.zeros(size, dtype="f8")
+    weight_total = 0
+    for weight, curve in entries:
+        keep = weight if weight > 0 else 1
+        pred_total += np.asarray(curve["power_forecast"], dtype="f8")[:size] * keep
+        observation_total += (
+            np.asarray(curve["power_observation"], dtype="f8")[:size] * keep
+        )
+        weight_total += keep
+    if weight_total == 0:
+        return None, None
+    return pred_total / weight_total, observation_total / weight_total
+
+
+def _writer_spectrum(tables, context, output_dir: Path) -> Path:
+    """逐波数功率谱：全体样本均值曲线 + 逐起报曲线。
+
+    对标参考实现的 ``det_summary_spectrum_{var}.csv`` / ``spectrum_{init}_{var}.csv``：
+    只出 k=1..720（k=0 去纬向均值后恒为 0，去掉），``wavelength_km = 40075 / k``。
+    每个起报一条曲线，是其 60 个时效的平均。
+
+    曲线不走 ``value``（那样每个波数都会展开成明细行），而是从 ``tables.curves``
+    直接取原始数组。
+    """
+    grouped: Dict[Any, List[Any]] = {}
+    for entry in tables.curves:
+        curve = entry.get("curve") or {}
+        if curve.get("kind") != "wavenumber_spectrum":
+            continue
+        base = entry.get("base") or {}
+        key = (str(base.get("variable", "")), str(base.get("init_time", "")))
+        grouped.setdefault(key, []).append((int(base.get("n_requested") or 0), curve))
+
+    diagnostics = Path(output_dir) / "diagnostics"
+    diagnostics.mkdir(parents=True, exist_ok=True)
+
+    per_variable: Dict[str, List[Any]] = {}
+    by_init_rows: List[List[Any]] = []
+    for (variable, init_time), entries in sorted(grouped.items()):
+        per_variable.setdefault(variable, []).extend(entries)
+        pred, obs = _spectrum_curve_mean(entries)
+        if pred is None:
+            continue
+        for k in range(1, pred.size):
+            by_init_rows.append(
+                [
+                    variable,
+                    init_time,
+                    k,
+                    _spectrum_number(_EARTH_CIRCUMFERENCE_KM / k),
+                    _spectrum_number(pred[k]),
+                    _spectrum_number(obs[k]),
+                ]
+            )
+
+    by_init_path = diagnostics / "spectrum_by_init.csv"
+    with by_init_path.open("w", encoding="utf-8", newline="") as stream:
+        out = csv.writer(stream)
+        out.writerow(
+            ["variable", "init_time", "wavenumber", "wavelength_km", "pred", "obs"]
+        )
+        out.writerows(by_init_rows)
+
+    summary_path: Optional[Path] = None
+    for variable, entries in sorted(per_variable.items()):
+        pred, obs = _spectrum_curve_mean(entries)
+        if pred is None:
+            continue
+        path = diagnostics / f"spectrum_{variable}.csv"
+        with path.open("w", encoding="utf-8", newline="") as stream:
+            out = csv.writer(stream)
+            out.writerow(["wavenumber", "wavelength_km", "pred_mean", "obs_mean"])
+            for k in range(1, pred.size):
+                out.writerow(
+                    [
+                        k,
+                        _spectrum_number(_EARTH_CIRCUMFERENCE_KM / k),
+                        _spectrum_number(pred[k]),
+                        _spectrum_number(obs[k]),
+                    ]
+                )
+        if summary_path is None:
+            summary_path = path
+    return summary_path or by_init_path
+
+
 # --------------------------------------------------------------------------
 # Protocol：只负责"样本空间怎么遍历、怎么配对"
 # --------------------------------------------------------------------------
@@ -409,16 +522,25 @@ def _protocol_grid_valid_time(spec):
 
 
 _REGISTERED = False
+_REGISTER_LOCK = threading.Lock()
 
 
 def register_builtin_components() -> None:
-    """注册全部内置组件（幂等）。"""
+    """注册全部内置组件（幂等、线程安全）。"""
     global _REGISTERED
+    # 快路径无锁；未注册过的线程再进锁里双检。标记在注册**完成之后**才置位，
+    # 保证别的线程看到 True 时全部组件都已可用。
     if _REGISTERED:
         return
-    # 先占用标记，避免注册过程中重入导致重复注册。
-    _REGISTERED = True
+    with _REGISTER_LOCK:
+        if _REGISTERED:
+            return
+        _register_all()
+        _REGISTERED = True
 
+
+def _register_all() -> None:
+    """一次性注册全部内置组件（只被 register_builtin_components 持锁调用）。"""
     register_reader("fuxi", "1.0.0", _fuxi_source, "FuXi 网格预报：root/YYYYMMDD/NNN.nc")
     register_reader(
         "fuxi_ens",
@@ -554,6 +676,12 @@ def register_builtin_components() -> None:
         "1.0.0",
         lambda **kw: _writer_probability_wide,
         "集合概率评分宽表（AROC/BS/BSS）",
+    )
+    register_writer(
+        "spectrum",
+        "1.0.0",
+        lambda **kw: _writer_spectrum,
+        "逐波数功率谱：全体均值曲线 + 逐起报曲线",
     )
 
 

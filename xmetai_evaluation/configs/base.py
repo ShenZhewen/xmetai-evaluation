@@ -47,7 +47,21 @@ class EvalConfig:
 
     # 运行配置
     log_level: str = "INFO"  # 日志级别
-    num_workers: int = 1  # 并行 worker 数（预留，暂未实现）
+    num_workers: int = 1  # 并行 worker 数（execution 没写 n_workers 且它 > 1 时生效）
+
+    # 执行策略（并发与数据加载）：不写就按指标族与数据源形态推导缺省。
+    # 全部键字面量，只覆盖写到的键：
+    #   mode: "serial" | "threads" | "processes" | "auto"（默认 auto：
+    #         单块=serial，重指标=processes，轻指标=threads）
+    #   n_workers: 进程/线程数（缺省 threads=4、processes=CPU 数）
+    #   chunk_days: 一个工作块装几个起报日（默认 1）——管起报跨度
+    #   lead_chunk_days: 一个工作块装几天时效（默认 1）——管时效跨度，是单块
+    #         内存的主旋钮；0 = 不切（整段时效一块，与改造前逐位一致，逃生口）
+    #   loads: {"observation": "slice"|"resident"|"window:30"|"window",
+    #           "reference": ...}（缺省：站点观测/气候态驻留，其余逐块直读；
+    #           裸 "window" = 按单块观测跨度自动定窗）
+    #   resume: True 时已完成块的指标状态落 output_dir/.states/，重跑跳过
+    execution: Dict[str, Any] = field(default_factory=dict)
 
     # 内部字段
     _source_path: str = field(init=False, repr=False, default="")

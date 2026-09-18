@@ -141,7 +141,11 @@ class TimeWindowAccumulator:
             )
 
         # 拼接所有累积结果
-        result = xr.concat(accumulated, dim=self.time_dim)
+        # coords/compat 双双写死：xarray 的弃用预告成对出现，只写一个它会接着
+        # 问下一个；两个值都是当前默认，行为不变。
+        result = xr.concat(
+            accumulated, dim=self.time_dim, coords="different", compat="equals"
+        )
 
         # 添加属性标记这是累积值
         result.attrs = data.attrs.copy()

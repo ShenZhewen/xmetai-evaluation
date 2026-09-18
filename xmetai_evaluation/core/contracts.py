@@ -172,6 +172,12 @@ class MetricResult:
     warnings: List[str] = field(default_factory=list)  # 非致命问题列表
     unit: Optional[str] = None  # 结果单位（无量纲指标写 "1"）
     product_kind: Optional[str] = None  # 产品类型：deterministic/categorical/probabilistic/ensemble/index
+    # 逐点曲线类诊断量（目前只有功率谱）。**不能塞进 value**：value 里每个分组键
+    # 都会在 build_tables 里展开成明细行，720 个波数 × 3 个字段 = 2165 行/样本，
+    # 全年段 20880 个样本就是四千多万行。曲线在这里原样带着（numpy 数组），
+    # 由 build_tables 收进 ResultTables.curves，writer 直接消费。
+    # 形状约定：{"kind": ..., 其余键由指标自定}。
+    curve: Optional[Dict[str, Any]] = None
 
     def __post_init__(self):
         """基础校验"""

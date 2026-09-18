@@ -133,11 +133,16 @@ class ResultTables:
         scores: 评分长表，列见 ``SCORE_COLUMNS``（额外带内部透视用的 ``group``）。
         details: 诊断量长表，列见 ``DETAIL_COLUMNS``。
         coverage: 覆盖率表，列见 ``COVERAGE_COLUMNS``。
+        curves: 逐点曲线类诊断量（来自 ``MetricResult.curve``），每项形如
+            ``{"base": <该结果的长表基准行>, "curve": <指标给的曲线字典>}``。
+            曲线**故意不展开成长表**——它们动辄上千点，展开就是几千万行；
+            writer 直接从这份原始数组里出派生视图。
     """
 
     scores: pd.DataFrame = field(default_factory=lambda: pd.DataFrame(columns=SCORE_COLUMNS))
     details: pd.DataFrame = field(default_factory=lambda: pd.DataFrame(columns=DETAIL_COLUMNS))
     coverage: pd.DataFrame = field(default_factory=lambda: pd.DataFrame(columns=COVERAGE_COLUMNS))
+    curves: List[Dict[str, Any]] = field(default_factory=list)
 
     @property
     def score_table(self) -> pd.DataFrame:
@@ -291,6 +296,7 @@ def build_tables(
     score_rows: List[Dict[str, Any]] = []
     detail_rows: List[Dict[str, Any]] = []
     coverage_rows: List[Dict[str, Any]] = []
+    curve_rows: List[Dict[str, Any]] = []
 
     for result in results:
         coordinates = dict(result.coordinates or {})
@@ -323,6 +329,9 @@ def build_tables(
             row["group"] = ""
             score_rows.append(row)
 
+        if result.curve is not None:
+            curve_rows.append({"base": base, "curve": result.curve})
+
     scores = pd.DataFrame(score_rows)
     details = pd.DataFrame(detail_rows)
     coverage = pd.DataFrame(coverage_rows)
@@ -351,6 +360,7 @@ def build_tables(
         scores=scores[score_columns],
         details=details[DETAIL_COLUMNS],
         coverage=coverage[COVERAGE_COLUMNS],
+        curves=curve_rows,
     )
 
 

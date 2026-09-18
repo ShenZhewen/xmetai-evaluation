@@ -294,3 +294,13 @@ def daily_times(start: datetime, end: datetime) -> List[datetime]:
         times.append(current)
         current += timedelta(days=1)
     return times
+
+
+def hourly_times(start: datetime, end: datetime) -> List[datetime]:
+    """[start, end] 区间内逐小时时刻列表（站点观测的请求跨度用）。"""
+    times: List[datetime] = []
+    current = start
+    while current <= end:
+        times.append(current)
+        current += timedelta(hours=1)
+    return times

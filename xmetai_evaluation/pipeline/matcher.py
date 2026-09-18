@@ -24,6 +24,11 @@ from xmetai_evaluation.transforms.regrid import compute_latitude_weights
 
 log = logging.getLogger(__name__)
 
+#: 已经告警过的「缺变量」组合。缺哪些变量是**数据源和配置**决定的静态事实，
+#: 但 match() 每块都调一次——不去重就是每个块 5568 行一模一样的 WARNING，
+#: 真正要看的告警会被淹掉。同一条消息只打一次（进程各存一份，fork 下每段一次）。
+_WARNED_MISSING: set = set()
+
 #: 由分量合成的派生变量：名字 -> (u 分量, v 分量)。风速 = sqrt(u²+v²)，m/s。
 DERIVED_VARIABLES: Dict[str, Any] = {
     "ws10m": ("u10m", "v10m"),
@@ -185,6 +190,7 @@ class Matcher:
         observation: DataBundle,
         reference: Optional[DataBundle] = None,
         variables: Optional[List[str]] = None,
+        sample_by: str = "valid_time",
     ) -> List[EvaluationBatch]:
         """
         配对预报与观测
@@ -194,9 +200,12 @@ class Matcher:
             observation: 观测数据（包含 valid_time 维度）
             reference: 可选的参考数据（如气候态）
             variables: 要评测的变量列表（None 表示全部）
+            sample_by: 批次的口径。``valid_time``（缺省）一个有效时刻一个批次，
+                多个起报够到同一时刻时只留最新起报；``init_lead`` 每个
+                (起报, 时效) 各出一个批次，同一个有效时刻有几个起报就有几个批次。
 
         Returns:
-            EvaluationBatch 列表（每个时次一个）
+            EvaluationBatch 列表
         """
         forecast_ds = forecast.payload if isinstance(forecast.payload, xr.Dataset) else forecast.payload.to_dataset()
         observation_ds = observation.payload if isinstance(observation.payload, xr.Dataset) else observation.payload.to_dataset()
@@ -236,7 +245,10 @@ class Matcher:
             if name not in forecast_ds.data_vars or name not in observation_ds.data_vars
         ]
         if missing:
-            log.warning("以下变量在预报或观测中不存在，已跳过: %s", ", ".join(missing))
+            message = ", ".join(missing)
+            if message not in _WARNED_MISSING:
+                _WARNED_MISSING.add(message)
+                log.warning("以下变量在预报或观测中不存在，已跳过: %s", message)
             variables = [name for name in variables if name not in missing]
 
         if not variables:
@@ -247,15 +259,26 @@ class Matcher:
         observation_ds = observation_ds[variables]
 
         # 计算 valid_time（如果预报有 init_time 和 lead_time）
-        sample_records = {}
+        #
+        # 配对记录是**与展平后的 valid_time 轴同序同长的位置列表**，不是按
+        # valid_time 索引的字典。字典口径下同一个有效时刻被多个 (起报, 时效)
+        # 够到时，后写的会把先写的挤掉，只留下最新起报——那是 valid_time 口径
+        # 要的语义，但 init_lead 口径要每个 (起报, 时效) 各算各的，键一撞就
+        # 整批丢掉（15 天只剩得下头几个时效）。按位置取就没有这回事。
+        flatten_times: List[Any] = []
+        sample_records: List[Dict[str, Any]] = []
         if "init_time" in forecast_ds.dims and "lead_time" in forecast_ds.dims:
             for init_time in forecast_ds.coords["init_time"].values:
                 for lead_time in forecast_ds.coords["lead_time"].values:
-                    valid_time = init_time + np.timedelta64(int(lead_time), "h")
-                    sample_records[valid_time] = {
-                        "init_time": str(init_time),
-                        "lead_h": float(lead_time),
-                    }
+                    flatten_times.append(
+                        init_time + np.timedelta64(int(lead_time), "h")
+                    )
+                    sample_records.append(
+                        {
+                            "init_time": str(init_time),
+                            "lead_h": float(lead_time),
+                        }
+                    )
             forecast_ds = self._add_valid_time(forecast_ds)
 
         # 集合处理
@@ -275,7 +298,7 @@ class Matcher:
         if aligned is not None:
             observation_ds = aligned
             self._spatial = "grids_identical"
-            log.info(
+            log.debug(
                 "预报与观测同网格（%d×%d），按索引对齐，跳过插值",
                 forecast_ds.sizes.get("lat", 0),
                 forecast_ds.sizes.get("lon", 0),
@@ -299,15 +322,38 @@ class Matcher:
 
         # 时间对齐：找到共同的 valid_time
         if "valid_time" in forecast_regridded.dims and "valid_time" in observation_ds.dims:
-            common_times = list(
-                set(forecast_regridded.coords["valid_time"].values) &
-                set(observation_ds.coords["valid_time"].values)
-            )
-            if not common_times:
-                raise AlignmentError("No common valid_time between forecast and observation")
+            if sample_by == "init_lead":
+                # 逐 (起报, 时效) 出样本时**不能**取交集再重排：按值取交集会把
+                # 同一个有效时刻的多个起报折叠成一个位置，与配对记录（按展平
+                # 顺序排的位置列表）错位。这里只按位置筛掉实况里没有的有效
+                # 时刻，顺序原样保留。
+                available = set(observation_ds.coords["valid_time"].values)
+                kept = [
+                    position
+                    for position, valid_time in enumerate(
+                        forecast_regridded.coords["valid_time"].values
+                    )
+                    if valid_time in available
+                ]
+                if not kept:
+                    raise AlignmentError(
+                        "No common valid_time between forecast and observation"
+                    )
+                forecast_regridded = forecast_regridded.isel(valid_time=kept)
+                observation_ds = observation_ds.sel(
+                    valid_time=forecast_regridded.coords["valid_time"].values
+                )
+                sample_records = [sample_records[position] for position in kept]
+            else:
+                common_times = list(
+                    set(forecast_regridded.coords["valid_time"].values) &
+                    set(observation_ds.coords["valid_time"].values)
+                )
+                if not common_times:
+                    raise AlignmentError("No common valid_time between forecast and observation")
 
-            forecast_regridded = forecast_regridded.sel(valid_time=common_times)
-            observation_ds = observation_ds.sel(valid_time=common_times)
+                forecast_regridded = forecast_regridded.sel(valid_time=common_times)
+                observation_ds = observation_ds.sel(valid_time=common_times)
 
         # 计算权重（纬度余弦权重）
         weights = compute_latitude_weights(observation_ds)
@@ -317,14 +363,48 @@ class Matcher:
 
         if "valid_time" in forecast_regridded.dims:
             moments = list(forecast_regridded.coords["valid_time"].values)
-            for valid_time in moments:
+            if sample_by == "init_lead":
+                if len(moments) != len(sample_records):
+                    log.warning(
+                        "配对记录 %d 条与有效时刻 %d 个对不上，按短的来",
+                        len(sample_records), len(moments),
+                    )
+                # 一个位置 = 一个 (起报, 时效)：按位置切，配对记录同序同长。
+                #
+                # 用**标量**位置索引，不能用 `isel(valid_time=[i])`：列表索引会
+                # 保留一个长度为 1 的 valid_time 维，而 valid_time 分支的
+                # `sel(valid_time=标量)` 会把它降掉，参考场 `_reference_for` 也是
+                # 标量 sel。三方形状必须一致，否则 ActivityRatio 这类逐格指标
+                # 直接抛「形状不一致：fc=(1,721,1440) … clim=(721,1440)」。
+                picks = [
+                    (
+                        moments[position],
+                        forecast_regridded.isel(valid_time=position),
+                        observation_ds.isel(valid_time=position),
+                        sample_records[position],
+                    )
+                    for position in range(min(len(moments), len(sample_records)))
+                ]
+            else:
+                # 一个值 = 一个有效时刻；同值的多个起报只留最新那个（与旧字典同）
+                records_by_time = dict(zip(flatten_times, sample_records))
+                picks = [
+                    (
+                        valid_time,
+                        forecast_regridded.sel(valid_time=valid_time),
+                        observation_ds.sel(valid_time=valid_time),
+                        records_by_time.get(valid_time, {}),
+                    )
+                    for valid_time in moments
+                ]
+            for valid_time, forecast_slice, observation_slice, record in picks:
                 batch = self._create_batch(
-                    forecast_regridded.sel(valid_time=valid_time),
-                    observation_ds.sel(valid_time=valid_time),
+                    forecast_slice,
+                    observation_slice,
                     weights,
                     valid_time,
                     reference,
-                    sample_records.get(valid_time, {}),
+                    record,
                 )
                 batches.append(batch)
                 if len(batches) % 20 == 0:
@@ -365,7 +445,14 @@ class Matcher:
                 ds_slice = ds_slice.expand_dims(valid_time=[valid_time])
                 forecast_flat.append(ds_slice)
 
-        forecast_ds = xr.concat(forecast_flat, dim="valid_time")
+        # xarray 的弃用预告是**成对**的：不写 coords 它问 coords，写了 coords 它
+        # 转头问 compat（"Cannot specify both coords='different' and
+        # compat='override'"）。两个都写死才是逐字复现今天的默认行为，
+        # 两条警告才会一起消失。这函数**每个批次调一次**，落一个就是几百行
+        # 一模一样的东西把日志糊死——真正要看的进度和告警全被埋掉。
+        forecast_ds = xr.concat(
+            forecast_flat, dim="valid_time", coords="different", compat="equals"
+        )
 
         return forecast_ds
 

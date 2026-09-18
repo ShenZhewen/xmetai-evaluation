@@ -141,9 +141,13 @@ def test_power_spectrum_metric_reports_curve_and_ratio():
     wide_observation = [[value * 2.0 for value in row] for row in wide_forecast]
     result = metric.compute(_batch(wide_forecast, wide_observation))
 
-    assert "summary" in result.value
+    assert set(result.value) == {"summary"}
     assert result.value["summary"]["power_ratio"] > 0
-    assert {f"k={k}" for k in range(5)}.issubset(set(result.value))
+    # 曲线走 curve，不进 value——进 value 就会在 build_tables 里展开成明细行
+    assert result.curve["kind"] == "wavenumber_spectrum"
+    assert len(result.curve["wavenumber"]) == 5
+    assert len(result.curve["power_forecast"]) == 5
+    assert len(result.curve["power_observation"]) == 5
 
 
 def test_power_spectrum_fills_nan_with_field_mean():
@@ -204,6 +208,10 @@ def test_zonal_spectrum_metric_reports_curve_and_ratio():
 
     result = ZonalSpectrum(max_wavenumber=4).compute(batch)
 
-    assert "summary" in result.value
+    assert set(result.value) == {"summary"}
     assert result.value["summary"]["power_ratio"] > 0
-    assert {f"k={k}" for k in range(5)}.issubset(set(result.value))
+    # 曲线走 curve，不进 value——进 value 就会在 build_tables 里展开成明细行
+    assert result.curve["kind"] == "wavenumber_spectrum"
+    assert len(result.curve["wavenumber"]) == 5
+    assert len(result.curve["power_forecast"]) == 5
+    assert len(result.curve["power_observation"]) == 5

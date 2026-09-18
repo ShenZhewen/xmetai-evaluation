@@ -7,7 +7,8 @@ import pytest
 from xmetai_evaluation.configs.base import EvalConfig
 from xmetai_evaluation.core.errors import DiscoveryError
 from xmetai_evaluation.pipeline.pipelines import get_template, list_pipelines
-from xmetai_evaluation.pipeline.runner import Runner, _metric_runs
+from xmetai_evaluation.execution.executor import metric_runs as _metric_runs
+from xmetai_evaluation.pipeline.runner import Runner
 from xmetai_evaluation.pipeline.spec import (
     MetricSpec,
     PipelineSpec,
@@ -179,7 +180,7 @@ def test_metrics_declare_whether_they_need_a_reference():
     """参考源只在有指标要用时才建——不然 24h 的 TS 段会白查一遍气候概率。"""
     from xmetai_evaluation.components import register_builtin_components
     from xmetai_evaluation.core.registry import ComponentType, get_registry
-    from xmetai_evaluation.pipeline.runner import _needs_reference
+    from xmetai_evaluation.execution.executor import needs_reference as _needs_reference
 
     register_builtin_components()
     registry = get_registry()

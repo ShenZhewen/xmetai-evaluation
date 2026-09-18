@@ -1,13 +1,12 @@
 # -*- coding: utf-8 -*-
 """唯一执行内核。
 
-整个框架只有一个样本循环、一处状态合并、一处落盘调用：都在这里。
-pipeline / 协议 / 指标都不允许再写循环。
+整个框架只有一处编排：这里。它把一段声明交给执行层（``execution/``）切成
+工作块、按策略并发执行、统一归并，然后做指标收尾与一次性落盘。样本循环
+本体在 ``execution/executor.py``（块口径），协议里不允许出现循环。
 
-    for sample in protocol.samples(context):
-        batch = protocol.build_batch(context, sample)
-        for metric in metrics:
-            metric.validate(batch); states[...].append(metric.accumulate(batch))
+    plan  = build_plan(spec)                 # 起报探测、切块、加载声明
+    merged = execute_chunks(plan) 合并        # 各块流水线 + 统一归并
     results = [metric.finalize(metric.merge(states)) for ...]
     store.write(results)
 """
@@ -18,67 +17,25 @@ import logging
 from dataclasses import asdict
 from pathlib import Path
 from time import perf_counter
-from typing import Any, Dict, List, NamedTuple, Optional, Sequence, Tuple, Union
-
-from tqdm import tqdm
+from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
 from xmetai_evaluation.components import register_builtin_components
 from xmetai_evaluation.core.contracts import MetricResult, ResultBundle
-from xmetai_evaluation.core.errors import EvaluationError, MetricError
-from xmetai_evaluation.core.registry import ComponentType, get_registry
-from xmetai_evaluation.pipeline.matcher import narrow_batch
-from xmetai_evaluation.pipeline.protocols import PipelineContext
+from xmetai_evaluation.core.errors import EvaluationError
+from xmetai_evaluation.execution import (
+    MergedOutcome,
+    WorkPlan,
+    build_plan,
+    execute_chunks,
+    merge_outcomes,
+    metric_runs,
+    needs_reference,
+)
+from xmetai_evaluation.execution.executor import MetricRun
 from xmetai_evaluation.pipeline.spec import PipelineSpec
 from xmetai_evaluation.results import ResultStore, RunContext
 
 log = logging.getLogger(__name__)
-
-
-class MetricRun(NamedTuple):
-    """一次指标执行：指标对象 + 这次执行针对的变量（None 表示整批，不做路由）。"""
-
-    metric: Any
-    variable: Optional[str]
-    label: str
-
-
-def _metric_runs(specs: List[Any], metrics: List[Any]) -> List[MetricRun]:
-    """把指标声明展开成执行单元。
-
-    指标声明了 ``variables`` 就逐变量各跑一次（对应参考实现的
-    ``--var-metrics z500:rmse,acc``，同一指标只作用于指定变量）；
-    没声明的保持原行为——整批跑一次，老配置完全不变。
-    """
-    runs: List[MetricRun] = []
-    for item, metric in zip(specs, metrics):
-        names = [str(name) for name in (item.params.get("variables") or [])]
-        if not names:
-            runs.append(MetricRun(metric=metric, variable=None, label=item.name))
-            continue
-        runs.extend(
-            MetricRun(metric=metric, variable=name, label=f"{item.name}[{name}]")
-            for name in names
-        )
-    return runs
-
-
-def _never_requires_reference() -> bool:
-    """没有 needs_reference() 的指标（如自定义实现）默认不需要参考源。"""
-    return False
-
-
-def _needs_reference(metrics: List[Any]) -> bool:
-    """这一段里有没有指标要用参考源。
-
-    配置里的参考源是所有段共用的，但某一段可能压根用不上（比如 24h 的 TS 段
-    配着 6h 概率段一起跑）。用不上就不该建：白建事小，参考目录缺时次时它抛的是
-    ConfigError（不是 MetricError），会被样本循环的兜底 except 静默吞掉，
-    表现成"这一段的结果莫名其妙少了一批样本"。
-    """
-    return any(
-        getattr(metric, "needs_reference", _never_requires_reference)()
-        for metric in metrics
-    )
 
 
 class Runner:
@@ -87,9 +44,21 @@ class Runner:
     可以一次跑多段（``spec`` 传列表）：每段有自己的流程模板与协议，结果合并后
     统一落盘到同一个 ``output_dir``——长表靠 ``window_h`` 之类的列区分是哪一段，
     所以配置写 ``pipeline=["a", "b"]`` 就只有一份 scores.csv。
+
+    Args:
+        spec: 一段或一段列表（来自 ``specs_from_config``）。
+        execution: 配置里的 ``execution`` 字典（并发与数据加载覆盖项；
+            不写就按指标族与数据源形态推导，见 ``execution/strategy.py``）。
+        num_workers: 旧字段 ``EvalConfig.num_workers``：execution 没给
+            n_workers 且它 > 1 时当作 n_workers 用。
     """
 
-    def __init__(self, spec: Union[PipelineSpec, Sequence[PipelineSpec]]):
+    def __init__(
+        self,
+        spec: Union[PipelineSpec, Sequence[PipelineSpec]],
+        execution: Optional[Dict[str, Any]] = None,
+        num_workers: int = 1,
+    ):
         self.specs: List[PipelineSpec] = (
             list(spec) if isinstance(spec, (list, tuple)) else [spec]
         )
@@ -98,6 +67,8 @@ class Runner:
         #: 第一段。单段时就是它；多段时只用来取两段共有的东西
         #: （output_dir / name / description / 数据源），各段的算法口径一律看段自己。
         self.spec = self.specs[0]
+        self.execution = dict(execution or {})
+        self.num_workers = int(num_workers or 1)
 
     def run(self) -> ResultBundle:
         """执行评测并写出标准产物。
@@ -110,174 +81,49 @@ class Runner:
                 也不静默少一段结果。
         """
         register_builtin_components()
-        registry = get_registry()
         started = perf_counter()
 
         results: List[MetricResult] = []
-        contexts: List[PipelineContext] = []
-        protocols: List[Any] = []
+        plans: List[WorkPlan] = []
+        merged_segments: List[MergedOutcome] = []
         processed = 0
         skipped = 0
         for order, spec in enumerate(self.specs, start=1):
-            segment = self._run_segment(spec, registry, order, len(self.specs))
-            results.extend(segment[0])
-            contexts.append(segment[1])
-            protocols.append(segment[2])
-            processed += segment[3]
-            skipped += segment[4]
-
-        return self._persist(contexts, protocols, results, processed, skipped, started)
-
-    def _run_segment(
-        self, spec: PipelineSpec, registry: Any, order: int, total: int
-    ) -> Tuple[List[MetricResult], PipelineContext, Any, int, int]:
-        """跑一段（一套流程模板 + 一份数据）：准备、配对、累积、收尾。
-
-        返回 ``(结果, 上下文, 协议, 成功样本数, 跳过样本数)``。
-        """
-        log.info("=" * 80)
-        if total > 1:
-            log.info(
-                "开始评测任务: %s（第 %d/%d 段: %s，窗口 %dh）",
-                spec.name,
-                order,
-                total,
-                spec.pipeline,
-                spec.window_hours,
+            plan = build_plan(
+                spec,
+                execution=self.execution,
+                num_workers=self.num_workers,
+                order=order,
+                total=len(self.specs),
             )
-        else:
-            log.info("开始评测任务: %s", spec.name)
-            log.info("描述: %s", spec.description)
-        log.info("协议: %s", spec.protocol)
-
-        forecast = registry.build(
-            ComponentType.READER, spec.forecast.reader, **spec.forecast.params
-        )
-        observation = registry.build(
-            ComponentType.READER,
-            spec.observation.reader,
-            **spec.observation.params,
-        )
-        transforms = {
-            item.name: registry.build(ComponentType.TRANSFORM, item.name, **item.params)
-            for item in spec.transforms
-        }
-        metrics = [
-            registry.build(ComponentType.METRIC, item.name, **item.params)
-            for item in spec.metrics
-        ]
-        reference = None
-        if spec.reference is not None and _needs_reference(metrics):
-            reference = registry.build(
-                ComponentType.READER,
-                spec.reference.reader,
-                **spec.reference.params,
+            outcomes = execute_chunks(plan, order)
+            merged = merge_outcomes(outcomes, spec)
+            if merged.processed == 0:
+                raise EvaluationError(
+                    f"流程 {spec.pipeline or spec.name} 没有成功处理任何评测批次"
+                )
+            runs = metric_runs(spec.metrics, plan.metrics)
+            results.extend(
+                self._finalize(
+                    spec, runs, merged.states, merged.coordinates, merged.defaults
+                )
             )
-        elif spec.reference is not None:
-            log.info("本段指标都不需要参考源，跳过构建 %s", spec.reference.reader)
-        runs = _metric_runs(spec.metrics, metrics)
-        log.info("指标: %s", [run.label for run in runs])
-        context = PipelineContext(
-            spec=spec,
-            forecast=forecast,
-            observation=observation,
-            reference=reference,
-            transforms=transforms,
-            metrics=metrics,
-        )
+            plans.append(plan)
+            merged_segments.append(merged)
+            processed += merged.processed
+            skipped += merged.skipped
 
-        protocol = registry.build(ComponentType.PROTOCOL, spec.protocol, spec=spec)
-        protocol.prepare(context)
-
-        states: Dict[Tuple[int, Tuple], List[Any]] = {}
-        coordinates: Dict[Tuple[int, Tuple], Dict[str, Any]] = {}
-        processed = 0
-        skipped = 0
-
-        progress = tqdm(
-            desc="评测进度",
-            unit="样本",
-            ncols=100,
-            bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]",
-        )
-        try:
-            for sample in protocol.samples(context):
-                expected = protocol.expected_samples()
-                if expected and progress.total != expected:
-                    progress.total = expected
-                    progress.refresh()
-
-                success = False
-                try:
-                    batch = protocol.build_batch(context, sample)
-                    if batch is not None:
-                        for index, run in enumerate(runs):
-                            # 路由到某个变量的指标只看该变量；数据源缺它就跳过这个 run
-                            target = (
-                                narrow_batch(batch, run.variable)
-                                if run.variable
-                                else batch
-                            )
-                            if target is None:
-                                continue
-                            run.metric.validate(target)
-                            states.setdefault((index, sample.key), []).append(
-                                run.metric.accumulate(target)
-                            )
-                            coordinates.setdefault(
-                                (index, sample.key),
-                                {
-                                    **sample.coordinates,
-                                    **(
-                                        {"variable": run.variable}
-                                        if run.variable
-                                        else {}
-                                    ),
-                                },
-                            )
-                            success = True
-                except MetricError:
-                    # 指标与输入不匹配属于配置错误（如集合未降维），必须立刻暴露，
-                    # 不能当成"这条样本坏了"跳过。
-                    raise
-                except Exception as exc:
-                    log.debug("样本 %s 处理失败: %s", sample.key, exc)
-
-                if success:
-                    processed += 1
-                else:
-                    skipped += 1
-                progress.update(1)
-                progress.set_postfix_str(f"成功={processed} 跳过={skipped}")
-                if processed and processed % 500 == 0:
-                    log.info(
-                        "进度：已处理 %d 个样本（跳过 %d），最近样本 %s",
-                        processed,
-                        skipped,
-                        sample.key,
-                    )
-        finally:
-            progress.close()
-
-        log.info("样本处理完成：成功=%d，跳过=%d", processed, skipped)
-        if processed == 0:
-            raise EvaluationError(
-                f"流程 {spec.pipeline or spec.name} 没有成功处理任何评测批次"
-            )
-
-        results = self._finalize(spec, protocol, context, runs, states, coordinates)
-        return results, context, protocol, processed, skipped
+        return self._persist(plans, merged_segments, results, processed, skipped, started)
 
     def _finalize(
         self,
         spec: PipelineSpec,
-        protocol: Any,
-        context: PipelineContext,
         runs: List[MetricRun],
         states: Dict[Tuple[int, Tuple], List[Any]],
         coordinates: Dict[Tuple[int, Tuple], Dict[str, Any]],
+        defaults: Dict[str, Any],
     ) -> List[MetricResult]:
-        defaults = protocol.defaults(context)
+        """指标收尾：每键合并状态 -> finalize -> 补长表坐标。"""
         results: List[MetricResult] = []
         for index, run in enumerate(runs):
             keys = sorted(key for (metric_index, key) in states if metric_index == index)
@@ -306,8 +152,8 @@ class Runner:
 
     def _persist(
         self,
-        contexts: List[PipelineContext],
-        protocols: List[Any],
+        plans: List[WorkPlan],
+        merged_segments: List[MergedOutcome],
         results: List[MetricResult],
         processed: int,
         skipped: int,
@@ -318,46 +164,55 @@ class Runner:
         只能写一次：``ResultStore`` 是平铺写 ``output_dir`` 的（没有 run_id 子
         目录），两段各写一次 scores.csv / manifest.json 会互相覆盖。
         """
-        context = contexts[0]
-        protocol = protocols[0]
-        forecast = context.forecast
-        observation = context.observation
+        spec = self.spec
+        forecast = plans[0].handles["forecast"]
+        observation = plans[0].handles["observation"]
+        merged = merged_segments[0]
         # 视图取各段的并集：24h 段要宽表 A，6h 段要宽表 B，合并后两个都要出。
         # 每个宽表 writer 自己按 product_kind 过滤，所以只会取到属于它的那一段。
         writers: List[str] = []
-        for spec in self.specs:
-            for name in spec.output_writers:
+        for item in self.specs:
+            for name in item.output_writers:
                 if name not in writers:
                     writers.append(name)
         store = ResultStore(
-            Path(self.spec.output_dir),
+            Path(spec.output_dir),
             RunContext(
-                run_id=self.spec.name,
+                run_id=spec.name,
                 model_id=forecast.source_id,
                 dataset_id=observation.source_id,
-                protocol_id=self.spec.protocol,
+                protocol_id=spec.protocol,
             ),
-            defaults=protocol.defaults(context),
+            defaults=merged.defaults,
         )
         manifest = {
-            "description": self.spec.description,
+            "description": spec.description,
             # 各段之和才与 scores_rows 对得上
             "n_processed_batches": processed,
             "n_skipped_batches": skipped,
             "forecast_source": forecast.source_id,
             "observation_source": observation.source_id,
-            **protocol.summary(),
+            # 执行口径进 manifest：结果可比的前提是知道它是在什么策略下算的
+            "execution": self._execution_summary(plans),
+            **merged.summary,
         }
+        failures = [
+            {"chunk": chunk_id, "error": reason}
+            for segment in merged_segments
+            for chunk_id, reason in segment.failures
+        ]
+        if failures:
+            manifest["failed_chunks"] = failures
         if len(self.specs) > 1:
             manifest["segments"] = [
                 {
-                    "pipeline": spec.pipeline,
-                    "protocol": spec.protocol,
-                    "window_h": spec.window_hours,
+                    "pipeline": item.pipeline,
+                    "protocol": item.protocol,
+                    "window_h": item.window_hours,
                 }
-                for spec in self.specs
+                for item in self.specs
             ]
-        resolved_config = asdict(self.spec)
+        resolved_config = asdict(spec)
         artifacts = store.write(
             results,
             manifest=manifest,
@@ -368,8 +223,25 @@ class Runner:
             log.info("产物 %s -> %s", name, path)
         log.info("评测完成：耗时 %.1fs", perf_counter() - started)
         return ResultBundle(
-            run_id=self.spec.name,
+            run_id=spec.name,
             results=results,
             manifest=manifest,
             resolved_config=resolved_config,
         )
+
+    @staticmethod
+    def _execution_summary(plans: List[WorkPlan]) -> Dict[str, Any]:
+        """manifest 里的执行口径摘要（按段）。"""
+        summary: Dict[str, Any] = {}
+        for plan in plans:
+            mode = plan.strategy.resolve_mode(len(plan.chunks), plan.profile)
+            summary[plan.spec.pipeline or plan.spec.name] = {
+                "mode": mode,
+                "n_workers": plan.strategy.resolve_workers(mode),
+                "chunk_days": plan.strategy.chunk_days,
+                "lead_chunk_days": plan.strategy.lead_chunk_days,
+                "n_chunks": len(plan.chunks),
+                "loads": dict(plan.strategy.loads),
+                "profile": plan.profile.as_dict(),
+            }
+        return summary

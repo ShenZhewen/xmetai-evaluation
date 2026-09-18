@@ -62,8 +62,11 @@ def test_reference_is_selected_by_valid_time_and_regridded():
     field = protocol._reference_for(batch)
 
     assert field is not None
-    assert field.dims == ("lat", "lon")
-    np.testing.assert_allclose(field.values, 7.0)
+    # 返回的是 Dataset（全部观测变量，由 narrow_batch 按变量取用），所以
+    # ``.dims`` 是尺寸映射而不是维度元组；这里要验的是"valid_time 已被压掉、
+    # 落在实况网格上"。
+    assert dict(field.sizes) == {"lat": len(LATS), "lon": len(LONS)}
+    np.testing.assert_allclose(field["z500"].values, 7.0)
 
 
 def test_no_reference_source_means_no_reference_field():

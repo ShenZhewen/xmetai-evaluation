@@ -23,11 +23,16 @@ def run_evaluation(cfg) -> int:
     """执行一次评测（EvalConfig -> PipelineSpec -> Runner）。
 
     配置里的 ``pipeline`` 可以是一串流程模板，那样就是一条命令跑多段、
-    结果合并落同一个 ``output_dir``。
+    结果合并落同一个 ``output_dir``。并发与数据加载由 ``execution`` 字典
+    覆盖，不写就按指标族与数据源形态推导。
 
     程序化入口：集成测试直接构造 EvalConfig 调用这里，绕过 argparse。
     """
-    Runner(specs_from_config(cfg)).run()
+    Runner(
+        specs_from_config(cfg),
+        execution=dict(getattr(cfg, "execution", None) or {}),
+        num_workers=int(getattr(cfg, "num_workers", 1) or 1),
+    ).run()
     return 0
 
 
