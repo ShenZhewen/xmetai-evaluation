@@ -46,11 +46,6 @@ def _sph_block():
         return 16
 
 
-def _spectrum_bands_enabled() -> bool:
-    return os.environ.get("VFC_SPECTRUM_BANDS", "1").strip().lower() not in (
-        "0", "false", "no", "off")
-
-
 def _band_power_frame(pred, obs, lat, leads, bands=DEFAULT_BANDS):
     """本模块的带功率表：列名契约与球谐降级逻辑都在 vfc.metrics.spectrum，
     这里只补上本入口自己的分块旋钮。球谐带功率只对「全球含极」网格有定义
@@ -345,9 +340,9 @@ def verify_pair(obs_path, pred_path, variables=None, metrics=("rmse",),
                     with np.errstate(divide="ignore", invalid="ignore"):
                         d["pred/obs"] = d["pred"] / d["obs"]
                     spectra[v] = d.iloc[1:]            # k=0 已置零，不输出
-                    if _spectrum_bands_enabled():
-                        spectra_bands[v] = _band_power_frame(
-                            p_al[m], o_al[m], lat_sub, leads_real[m])
+                    # 带功率与谱同进同出（与 regr_ens 集合路径一致，无开关）
+                    spectra_bands[v] = _band_power_frame(
+                        p_al[m], o_al[m], lat_sub, leads_real[m])
 
         # q700/q2m 统一按 g/kg 报告（内部 kg/kg；rmse/fa/谱 ×1000/×1e6）
         _Q_VARS = tuple(v for v, s in VAR_SPECS.items()

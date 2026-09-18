@@ -16,9 +16,10 @@ CONFIG = {
     # 只被打印，不决定落盘位置（真实归档见 outputs/results/<output_name>/<指纹>/）。
     "outdir_root": "/workspace/szwCode/xmetai-eval_pro/outputs",
     "periods": [
-        ("20250101", "20250630"),
-        # 20251217 起预报数据缺失/无效，不参与评测。
-        ("20250701", "20251216"),
+        # 单段整段跑完：summarize 按当前 periods 覆写 summary，拆两段会把前一段
+        # 挤掉（正是上次 349 目录只有 169 行的原因）。20251217 起预报数据缺失/
+        # 无效，右端收到 20251216。
+        ("20250101", "20251216"),
     ],
     "metrics": ["rmse", "crps", "acc", "fa", "spectrum"],
     "variables": ["z500", "msl", "u200", "v200", "ws200"],

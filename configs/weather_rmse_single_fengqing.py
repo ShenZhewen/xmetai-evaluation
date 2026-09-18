@@ -19,7 +19,9 @@ CONFIG = {
         "/workspace/data/liujunjie/era5_foundation_store2/era5_sfc_2025.01-2026.07.c15.p25.h6.zarr",
         "/workspace/data/liujunjie/era5_foundation_store2/era5_pl_2025.01-2026.07.c84.p25.h6.zarr",
     ],
-    "outdir_root": "/workspace/_XMETAI_test_results/single_fengqing",
+    # 只被打印，不决定落盘（真实归档 outputs/results/<output_name>/<配置指纹>/，
+    # 见 core/batch_adapter.py:290 的 outdir_root=str(work_root)）。
+    "outdir_root": "/workspace/szwCode/xmetai-eval_pro/outputs",
     "periods": [
         # 20251217 起预报数据缺失/无效（q700 全 NaN、单日内存暴涨 10 倍），止于 20251216。
         # **不要**再拆回 (0101-0630)+(0701-1216) 两段：regr_ens 的收尾步骤只按
