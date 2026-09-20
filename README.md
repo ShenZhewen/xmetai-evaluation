@@ -42,9 +42,10 @@ xmetai-evaluation/
 │   │   ├── base.py                 # EvalConfig 定义 + load_config()
 │   │   ├── weather_ts_det_fgvp.py       # FuXi 确定性降水分类检验
 │   │   ├── weather_ts_ens_fuxi.py       # FuXi 集合降水：24h TS + 6h 概率两段一趟跑完
-│   │   ├── weather_field_scores_fuxi.py # FuXi 确定性连续量检验（RMSE/ACC/FA/谱）
-│   │   ├── weather_ens_crps_fuxi.py     # FuXi 集合连续评分（CRPS/Spread-Error）
-│   │   └── fdp_field_scores_fengqing.py # 要素场检验（RMSE/Bias/ACC）
+│   │   ├── weather_field_scores_era5_fuxi.py     # FuXi 确定性连续量（RMSE/谱/ACC/活跃度）
+│   │   ├── weather_field_scores_era5_fengqing.py # 风清单卡确定性连续量（同上，15 要素）
+│   │   ├── weather_ens_field_scores_era5_fuxi.py # FuXi 集合场（RMSE/CRPS/ACC/活跃度/谱）
+│   │   └── fdp_field_scores_fengqing.py          # FDP 要素检验（z500 的 RMSE/Bias/ACC）
 │   ├── core/                       # contracts / errors / registry / variables
 │   ├── execution/                  # 执行层：profiles / strategy / plan / loader / executor
 │   ├── io/                         # gridded / layouts / station_reader / climatology_reader / netcdf_reader / base
@@ -90,7 +91,12 @@ cli → load_config(EvalConfig) → PipelineSpec(流程模板+数据)
    |---|---|---|
    | `slice` | 每块现读现弃 | 预报（恒为此策略）、格点实况（`cra`/`era5_zarr`） |
    | `resident` | 整个 run 读一次驻留 | 站点观测、气候态参考场（CRA CLI_6HOUR / 日序） |
-   | `window:W` | 按 W 天块滚动缓存（LRU） | 大气候态/大实况手动指定 |
+   | `window:W` | 按 W 天块滚动缓存，保留当前块 ±1（回跳要用） | 格点实况（`cra`/`era5_zarr`）**推荐**显式改成它，推导缺省仍是 `slice` |
+
+   格点实况的推导缺省是 `slice`，但**配 `window` 基本总是更好**：块序会让观测读
+   反复回跳（原因见本节末「`loads` 的自动定窗」那段），`slice` 下每个观测日被重读
+   十几遍。现有 era5 配置一律写 `window:16`。代价是窗块真占内存且**每个子进程各
+   一份**（不像 `resident` 那样 fork 共享），所以它是和 `n_workers` 绑在一起的一笔账。
 
    数据源按「角色 × 类」归类（16 个注册名），缺省驻留策略由类决定：
 
@@ -136,22 +142,140 @@ execution = {
 一开，单块的成员场自然就小了。
 
 
-`loads` 里的 `window` 可以不带数字（`{"observation": "window"}`）：计划层按
-**单块观测跨度**自动定窗宽 = 单块时效跨度（`lead_chunk_days` 天；只有
-`lead_chunk_days: 0` 不切时才是整个时效跨度）+ 预热 + 块内起报跨度
-（`chunk_days` 天），threads 下再加 (并发数−1)×`chunk_days` 的相邻日跨度
-（processes 段内串行，这项为 0）。落成的具体值（如 `"window:3"`）会回写进
-manifest 的 `execution.loads` 供核对。
+`loads` 里的 `window` 可以不带数字（`{"observation": "window"}`）：计划层自动定窗宽
+= **整段时效跨度**（`max(leads)/24` 天）+ 预热 + 块内起报跨度（`chunk_days` 天），
+threads 下再加 (并发数−1)×`chunk_days` 的相邻日跨度（processes 段内串行，这项为 0）。
+落成的具体值（如 `"window:16"`）会回写进 manifest 的 `execution.loads` 供核对。
 
-窗宽必须按**单块**跨度定、不能按整个时效跨度定：切了时效之后每个块只读一个
-时效窗，再按整个时效跨度定窗的话，每个块都从一个 16 天的窗块里读 1 天，
-读放大十几倍。
+`window:W` 里的 **W 是上限**：实际用 `min(W, 自动值)`。比自动值大不会减少重读、只多占
+内存（进程模式下窗块是每个子进程各一份）；比它小则是主动拿内存换 IO。两个值不一样时
+日志会另打一行说明实际收到多少。
+
+> ⚠ **这条 2026-09 反转过，别按旧口径理解。** 窗宽要按**整个时效跨度**定，不是按
+> 单块的时效窗宽（`lead_chunk_days`）定。原因在块序：块序是「起报日外层、时效窗
+> 内层」，一个起报日组要顺次扫完全部时效窗（观测日 D … D+L），下一组又从头开始
+> （D+1 …），所以观测读是"向前扫 L 天、再回跳 L−2 天"。窗宽 ≥ 整个时效跨度，回跳
+> 时上一轮读过的窗块才还在缓存里（loader 另外保留当前块 **±1** 块），一个观测日整
+> run 只读一次。
+>
+> 旧写法按单块时效窗宽（1 天）+ 预热 + `chunk_days` 定，算出来只有 2~3 天：回跳落空，
+> 读放大约 L 倍，`window` 相比 `slice` 几乎没有改善。loader 的块保留同样是配套改的
+> ——只留当前块、或只留"前一块"，回跳都会落空；必须**前后各留一块**。这三处（定窗
+> 基数、±1 保留、预取闸门）是一组，改一处要一起看。
 
 `window` 切的是**时间跨度**不是文件：窗口块调 `builder((start, end))`，
 reader 自己决定读文件哪些部分（NetCDF/HDF5 支持索引级部分读；日序气候态
 按 day-of-year 只挑请求日子 ± 平滑窗的几行，还分纬度带读）。大 NC 走
 window 从不需要整文件进内存；同一进程先后处理相邻块直接命中窗口缓存，
 全年顺序跑每段数据基本只从盘上读一次。
+
+### 数据预取：把下一个窗块提前读进来
+
+`window` 角色的读盘可以和块内计算叠起来：读完当前覆盖的块之后，后台线程把
+**按日期顺序的下一个块**预读进待用槽；下一个请求到了直接命中，省掉一次同步读。
+实现全在 `execution/loader.py` 的 `_schedule_next_block` / `_prefetch_loop`。
+
+**什么时候开。** `RunLoader(prefetch=...)` 由计划层按并发形态定：`processes` 与
+`serial` 开，`threads` 关。threads 下多个块并发读同一个 loader，各自排一个预取只会
+互相顶掉；而且它本来就有 N 路并发读，轮不到预取补空档。另外**只有 `window` 角色会排**
+——`slice` 没有"下一个块"的概念，`resident` 整 run 只读一次。
+
+**预取哪个块。** `max(本次请求覆盖的块号) + 1`。依据是请求跨度随时间**单调向后延伸**
+（时效窗推进抬 `lead_max`、起报组推进抬起报），下一次要读的块几乎总是当前最大块号 +1。
+块号不存在（已经是最后一块）就不排。
+
+**结构：一条队列 + 一个线程 + 每角色一个待用槽。**
+
+```
+_schedule_next_block()        在物化路径里同步调用
+    ├─ 过三道闸（见下）
+    ├─ 懒启后台线程（daemon，全 loader 只 1 个，名 runloader-prefetch）
+    └─ queue.put((role, spec, 块号, 块跨度))
+
+_prefetch_loop()              后台线程
+    while True:
+        role, spec, index, span = queue.get()
+        bundle = self._build(spec, span)      ← 同一个 builder
+        if 槽里没有更新的块: 槽 = (index, bundle)
+```
+
+预取走的是**同一个 builder**，所以它花的读盘时间同样计入 `builder_seconds`，读来的块
+也照样算进日志里那个「物化 N 次」——这是有意的，让"预取多读了几次、值不值"可测。
+
+**领取。** 请求进来先看待用槽：块号还在本次请求里、且窗块缓存中没有，就直接搬进窗块
+缓存（跳过同步读）；块号已经落到请求后面（`< min(wanted)`）就扔掉；其余留在槽里等下次。
+
+**三道防白读的闸。**
+
+1. 槽里已经是同一个块 → 不重排。
+2. 该块**已经在窗块缓存里**（±1 保留正好把它留着）→ 不重排。没有这道闸，预取会在
+   **每个请求**上重读一次"当前块的下一个块"——±1 保留恰好让目标块常驻。
+3. 后台线程读得慢、期间又排了更新的块 → 旧结果丢掉（槽只放一个）。
+
+**代价。** 内存每角色 +1 个窗块（稳态窗块缓存是当前块 ±1 共 3 块，加预取最多 4 块）。
+**正确性零代价**：预取不参与计算、不改变任何结果，猜错只是白读一次，真正的请求到了
+按正常路径物化；预取失败只记 DEBUG、不抛。
+
+**值不值。** 上限收益 ≈ `min(1, 读盘/计算)`——计算占九成时它只值一成。看日志那行
+
+    读盘占比：builder 累计 X.Xs / 容量 Y.Ys（… × N worker）= ZZ%；物化 N 次、缓存命中 N 次
+
+`ZZ%` 只有个位数就说明读盘本来不是瓶颈，预取白占内存；关掉的方式是把 `plan.py` 里的
+`prefetch=mode != "threads"` 改成 `False`。
+
+> **一条必须守住的不变量**：预取线程绝不能在 **fork 之前**启动过。`threading.Lock`
+> 不可重入、fork 又不复制持锁的线程，父进程若在 fork 前起过预取线程并恰好持锁，
+> 子进程里那把锁就是死的。现在靠"父进程只 `loader.warm()` 读 `resident`、从不读窗块"
+> 保证。spawn 平台无此问题（`__setstate__` 会把线程与队列重建）。
+
+### 块大小什么时候调：`chunk_days` / `lead_chunk_days`
+
+**调大省的是"每块的固定开销"，不是 IO，也不是计算。** 每块都要从头重建一遍东西
+（`executor.py:collect_chunk_states`）：
+
+```python
+register_builtin_components()
+registry.build(READER, 预报)   registry.build(READER, 观测)   registry.build(READER, 参考)
+transforms = {...build(TRANSFORM)...}      metrics = [...build(METRIC)...]
+```
+
+再加上 reader 构造时开 zarr/GRIB、catalog discover、预报目录索引。这一坨与块内实际
+算了多少无关，块数按 `chunk_days` × `lead_chunk_days` 线性降，它就线性降。
+
+**IO 不会跟着降。** `window` 生效后每个观测日整 run 只读一次；块变宽 → 每块跨度变宽、
+块数同比例变少，**总读取量是常数**（`slice` 同理）。
+
+| | 块数（era5 det：348 起报 × 16 窗，`1/1`） |
+|---|---|
+| `chunk_days: 1`, `lead_chunk_days: 1` | 5568 |
+| `lead_chunk_days: 2` | 2784 |
+| `chunk_days: 2` | 2784 |
+| `2 / 2` | 1392 |
+
+**什么时候该动：**
+
+| 症状 | 动作 |
+|---|---|
+| 每块耗时很短、日志读盘占比又高 | 固定开销是大头 → 调大 `lead_chunk_days`（1 → 2 起步） |
+| 子进程空转，块数 < `n_workers` | 块数太少 → 调大 `lead_chunk_days`（这条也正是段数 = `min(n_workers, 待跑块数)` 的后果） |
+| 内存吃紧 / 要保 `n_workers` | 调小 → 单块工作集线性降；`lead_chunk_days` 是**单块内存的主旋钮** |
+| 想改块大小但不想动别处 | 别碰 `chunk_days`，见下面那个坑 |
+
+**代价三条**：单块内存线性涨；负载均衡变差——段数 = `min(n_workers, 块数)`，块数远大于
+`n_workers` 时段数不变、只是每段块数变少，块数掉到 `n_workers` 附近才会空转（与下面
+「时效切块的调度」那条一致）；resume 粒度变粗（崩一次重算的块更大）。
+
+**怎么判断。** 两个观测点：日志的 `读盘占比 … = ZZ%`，和 tqdm 报的**每块耗时**
+
+    段 2/5 进度 150/1114 块（已用 540s，3.60s/块，…）
+
+每块几秒钟就完了、读盘占比又高 → 固定开销是主要成本，调大立竿见影；反过来块内本来就
+在算谱、算 CRPS，固定开销占比小，调大收益有限。
+
+> ⚠ **改 `chunk_days` 会抬高自动定窗的最小值**（`_auto_window_days` 里 `+ chunk_days`
+> 那一项），而你写死的 `"window:16"` 会被 `min(16, 新最小值)` 夹住、**不会自动跟着涨**。
+> `chunk_days: 2` 时最小值变 17、仍用 16，量级无害；调到 8（最小值 23）就明显偏小了。
+> 要一起调就把 `loads` 改成裸写 `"window"` 让它自己跟。
 
 ### 时效切块的调度
 
@@ -322,12 +446,9 @@ echo "已用: $(cat /sys/fs/cgroup/memory.current)"
   fork 下由父进程预热 resident 缓存、子进程写时复制共享；spawn 平台没有
   共享，但角色声明是可序列化的，子进程会反序列化一份 loader 副本自建
   缓存（段内窗块照样复用，代价是内存 ×段数）。两条路都不改变结果。
-- **窗块预取**：非 threads 形态下，读满一个 `window` 块后，后台线程会把
-  **按日期顺序的下一个块**提前读进来（请求跨度随时间单调后移，所以"下一
-  个块号"就是最可能的下一段读取）。代价封顶为 +1 个窗块，猜错只是白读
-  一次。threads 形态下关掉：多个块并发读同一个 loader，各自排预取只会互
-  相顶掉，而且它本来就有 N 路并发读、轮不到预取补空档。
-  想看预取值不值得，看日志里那行「读盘占比」——它就是预取的收益上限。
+- **窗块预取**：非 threads 形态下，读满一个 `window` 块后，后台线程会把下一个
+  块提前读进来。完整口径（开关条件、预测依据、三道防白读的闸、值不值的判据）
+  见上面「[数据预取](#数据预取把下一个窗块提前读进来)」。
 - **块级进度看哪行**：进程模式下父进程要等**整段**返回才拿到结果（那条 tqdm
   因此全程不动，`.states/` 也是段末才一次性落盘），所以块级进度由子进程自己报：
   每 `PROGRESS_EVERY` 块（`execution/executor.py`，默认 50）打一行
@@ -392,10 +513,11 @@ echo "已用: $(cat /sys/fs/cgroup/memory.current)"
 | **降水空间检验**<br>`fdp_precip_fss` | 格点降水预报 + 格点降水实况（CRA / CMPAS） | `scores.csv` | `fss`（阈值 13 mm × 邻域窗口 1/3/5/15/31/63，每个组合一行）<br>明细 `window`/`n_points` | 重·整场 · processes |
 | **活跃度比 / 功率谱**<br>`fdp_activity_spectrum` | 格点场预报（z500）+ 格点实况 + 气候态（活跃度比必需） | `scores.csv`、`diagnostics/spectrum_{var}.csv`、`diagnostics/spectrum_by_init.csv` | `activity_ratio`、`activity_forecast`、`activity_observation`、`activity_bias`、`spectrum_power_ratio`（二维谱，不减纬向均值）<br>逐波数谱曲线另出宽表 | 重·参考·整场 · processes |
 
-内置配置里 `weather_field_scores_fuxi` 与 `fdp_field_scores_fengqing` 另外声明了 `json` writer，
-会多写一份 `scores.json`；那是配置的选择，不属于流程模板的产出。
+内置配置里 `fdp_field_scores_fengqing` 另外声明了 `json` writer，会多写一份 `scores.json`；
+`weather_field_scores_era5_*` 与 `weather_ens_field_scores_era5_fuxi` 声明的是 `spectrum`。
+那都是配置的选择，不属于流程模板的产出。
 注意配置里的 `writers` 是**替换**模板自带的那一份、不是追加，所以
-`weather_field_scores_fuxi` 要把模板的 `details` 一并写上，谱曲线才有落盘的地方。
+`weather_field_scores_era5_fuxi` 要把模板的 `details` 一并写上，谱曲线才有落盘的地方。
 
 ### 评估指标说明
 
@@ -474,7 +596,7 @@ echo "已用: $(cat /sys/fs/cgroup/memory.current)"
 | `diagnostics/probability_wide.csv` | 概率评分宽表（阈值 × 时效：AROC/BS/BSS + `BS_ref`/`base_rate`/`n_points`） |
 | `scores.json` | 评分 JSON 快照 |
 
-当前已接好的内置任务配置（`configs/`）：`weather_ts_det_fgvp`（FGVP 确定性降水）、`weather_ts_ens_fuxi`（FuXi 集合降水，24h TS + 6h 概率两段一趟跑完）、`weather_field_scores_fuxi`（FuXi 确定性连续量）、`weather_ens_crps_fuxi`（FuXi 集合连续评分）、`fdp_field_scores_fengqing`（Fengqing 要素场）。
+当前已接好的内置任务配置（`configs/`）：`weather_ts_det_fgvp`（FGVP 确定性降水）、`weather_ts_ens_fuxi`（FuXi 集合降水，24h TS + 6h 概率两段一趟跑完）、`weather_field_scores_era5_fuxi`（FuXi 确定性连续量）、`weather_field_scores_era5_fengqing`（风清单卡确定性连续量）、`weather_ens_field_scores_era5_fuxi`（FuXi 集合场，含 CRPS）、`fdp_field_scores_fengqing`（FDP 要素检验）。
 
 ## 评测数据与格式
 
@@ -601,7 +723,10 @@ observation_reader={
   366 天的保留真日序、平年跳过 2/29。
 - `time:units` **只用单位**（days / hours / …），起算时刻被忽略——索引的是"年内位置"，
   不是绝对时刻。
-- `window`（默认 15 天）是环形平滑窗，读取时算；可选 `scales` / `units` 覆盖换算。
+- `smooth_days`（默认 15 天）是**环形平滑天数**：取场前对年内日序做中心对齐的滑动
+  平均（±7.5 天，跨年首尾相接），抹平单日气候态的天气尺度噪声，与参考实现的
+  `--climo-window` 同口径。取 1 = 不平滑。这是气象参数，跟 `execution.loads` 的
+  `window:W`（IO 窗块滚动缓存）**不是一回事**。可选 `scales` / `units` 覆盖换算。
 - 整年 × 全球很大，按纬度分块惰性读，峰值与分块有关、不整块载入。
 
 ⚠️ 两种气候态**不能混用**：把日序单文件接到按 `MMDDHH` 找文件的 Catalog 上，会把整份
@@ -673,7 +798,7 @@ observation_reader={
 | `era5_zarr` | `stores`（`{"pl": …, "sfc": …}`） | `variable` 或 `variables`、`source_id` |
 | `station` / `diamond_station` | `root_dir` | `station_whitelist` 或 `station_list`、`source_id` |
 | `climatology` | `root_dir` | `engine`（默认 `cfgrib`）、`source_id` |
-| `daily_climatology` | `root_dir` | `window`（默认 15）、`scales`、`units`、`source_id` |
+| `daily_climatology` | `root_dir` | `smooth_days`（默认 15）、`scales`、`units`、`source_id` |
 | `ref_probability` | `root_dir` | `source_id`（不可配 `loads`） |
 
 `variable` 给单个变量名、`variables` 给列表，两者都认；不写则用流程模板声明的。
@@ -711,7 +836,10 @@ cfg = EvalConfig(
 
 要注意 `transform_options` / `metric_options` / `options` 是**各段共用**的：配置里写 `{"time_window_accumulator": {"window_hours": 6}}` 会把每一段的窗口都改成 6。窗口属于"怎么算"，写在模板里（`pipeline/pipelines.py`）。多段的完整例子见 `configs/weather_ts_ens_fuxi.py`。
 
-内置配置用环境变量覆盖数据路径与时段，例如 `weather_field_scores_fuxi` / `weather_ens_crps_fuxi` 支持 `FUXI_OUTPUT` / `FUXI_ENS_OUTPUT`、`CRA_ROOT`、`CRA_CLI_ROOT`（前者 ACC/活跃度需要）、`START_DATE`、`END_DATE`、`EVAL_OUTPUT`。
+内置配置用环境变量覆盖数据路径与时段：`START_DATE` / `END_DATE` / `EVAL_OUTPUT` 各配置通用；
+数据路径按配置各取所需——`FUXI_OUTPUT` / `FUXI_ENS_OUTPUT`（FuXi 确定性 / 集合）、`FENGQING_OUTPUT`、
+`FGVP_OUTPUT`、`STATION_OBS` / `STATION_LIST`（站点观测与白名单）、`BSS_REF`（气候概率参考）、
+`ERA5_CLIMO`（ERA5 气候态）、`FDP_CRA_ROOT` / `CRA_CLI_ROOT`（FDP 的要素场与气候态参考）。
 
 ## 如何扩展
 

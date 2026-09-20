@@ -19,6 +19,8 @@ from pathlib import Path
 from time import perf_counter
 from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
+from tqdm import tqdm
+
 from xmetai_evaluation.components import register_builtin_components
 from xmetai_evaluation.core.contracts import MetricResult, ResultBundle
 from xmetai_evaluation.core.errors import EvaluationError
@@ -97,6 +99,16 @@ class Runner:
                 total=len(self.specs),
             )
             outcomes = execute_chunks(plan, order)
+            # 这一刻 24 个子进程已经全退了，后面三步（归并 / 指标收尾 / 落盘）
+            # 全在本进程单线程跑，峰值内存也全压在本进程头上——没有这行的话，
+            # 收尾期间日志里一个字都没有，看着就像"卡住了"。
+            log.info(
+                "第 %d/%d 段 %s 进入收尾：归并 %d 个块的状态，随后收尾指标并落盘",
+                order,
+                len(self.specs),
+                spec.pipeline or spec.name,
+                len(outcomes),
+            )
             merged = merge_outcomes(outcomes, spec)
             if merged.processed == 0:
                 raise EvaluationError(
@@ -125,27 +137,45 @@ class Runner:
     ) -> List[MetricResult]:
         """指标收尾：每键合并状态 -> finalize -> 补长表坐标。"""
         results: List[MetricResult] = []
-        for index, run in enumerate(runs):
-            keys = sorted(key for (metric_index, key) in states if metric_index == index)
-            if not keys:
-                # 路由到某个变量却一个结果都没有，通常是数据源里没这个变量——
-                # 不告警的话表现是"结果里静静少了一项"。
-                log.warning(
-                    "指标 %s 没有产生任何结果%s（数据源里没有该变量？）",
-                    run.metric.name,
-                    f"（变量 {run.variable}）" if run.variable else "",
+        # 进度按 (指标, 键) 的总数报：这条循环在一段几万个键时要跑几分钟，
+        # 期间一个字都不出的话，日志和"卡死"没法区分。
+        progress = tqdm(
+            total=len(states),
+            desc=f"{spec.pipeline or spec.name} 指标收尾",
+            unit="项",
+            ncols=100,
+            bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}]",
+        )
+        try:
+            for index, run in enumerate(runs):
+                keys = sorted(
+                    key for (metric_index, key) in states if metric_index == index
                 )
-                continue
-            for key in keys:
-                merged = run.metric.merge(states[(index, key)])
-                result = run.metric.finalize(merged)
-                result.coordinates = {**defaults, **coordinates.get((index, key), {})}
-                result.product_kind = result.product_kind or getattr(
-                    run.metric, "PRODUCT_KIND", ""
-                )
-                result.unit = result.unit or str(defaults.get("unit") or "")
-                result.protocol_id = result.protocol_id or spec.protocol
-                results.append(result)
+                if not keys:
+                    # 路由到某个变量却一个结果都没有，通常是数据源里没这个变量——
+                    # 不告警的话表现是"结果里静静少了一项"。
+                    log.warning(
+                        "指标 %s 没有产生任何结果%s（数据源里没有该变量？）",
+                        run.metric.name,
+                        f"（变量 {run.variable}）" if run.variable else "",
+                    )
+                    continue
+                for key in keys:
+                    merged = run.metric.merge(states[(index, key)])
+                    result = run.metric.finalize(merged)
+                    result.coordinates = {
+                        **defaults,
+                        **coordinates.get((index, key), {}),
+                    }
+                    result.product_kind = result.product_kind or getattr(
+                        run.metric, "PRODUCT_KIND", ""
+                    )
+                    result.unit = result.unit or str(defaults.get("unit") or "")
+                    result.protocol_id = result.protocol_id or spec.protocol
+                    results.append(result)
+                    progress.update(1)
+        finally:
+            progress.close()
         if not results:
             raise EvaluationError("没有可输出的指标结果")
         return results
@@ -213,6 +243,12 @@ class Runner:
                 for item in self.specs
             ]
         resolved_config = asdict(spec)
+        log.info(
+            "写入产物：%d 个指标结果，视图 %s -> %s",
+            len(results),
+            "、".join(writers) or "（无）",
+            spec.output_dir,
+        )
         artifacts = store.write(
             results,
             manifest=manifest,

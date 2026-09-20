@@ -13,6 +13,8 @@ diamond  3 2025年1月1日0时1小时降水(逐时)
 45004 114.1728 22.3119 66.4 0.0
 """
 
+import logging
+import time
 from pathlib import Path
 from typing import List, Dict, Any, Optional
 from datetime import datetime
@@ -22,6 +24,7 @@ import numpy as np
 from tqdm import tqdm
 
 from xmetai_evaluation.io.base import Reader, DataCatalog
+from xmetai_evaluation.logging_util import peak_rss_text
 from xmetai_evaluation.core.contracts import (
     DataRequest,
     DataIndex,
@@ -32,6 +35,8 @@ from xmetai_evaluation.core.contracts import (
 )
 from xmetai_evaluation.core.errors import DiscoveryError, DecodeError
 from xmetai_evaluation.core.variables import TemporalKind
+
+log = logging.getLogger(__name__)
 
 
 class DiamondStationCatalog(DataCatalog):
@@ -155,17 +160,35 @@ class DiamondStationReader(Reader):
         # 使用参考实现同样的 NumPy 路径组装二维站点数组。
         # 不把所有时次拼成超大 DataFrame，也不使用 pandas Python engine。
         parsed = []
+        total = len(index.available)
+        # tqdm 只写 stderr、原地刷新，重定向到日志文件就什么都看不见；整段
+        # 全年观测要解析几分钟到几十分钟，没有落进日志的进度行就会被当成卡死。
+        # 小批量（按块现读现弃时一次几十个文件）不值得逐条刷屏，那时只留首尾。
+        step = max(1, total // 20) if total >= 200 else 0
+        log.info(
+            "站点观测读取 %d 个文件（白名单 %s 个站）……",
+            total,
+            len(self.station_whitelist) if self.station_whitelist else "不限",
+        )
+        started = time.perf_counter()
+        # 解析结果全部攒在 parsed 里、读完才拼稠密数组，所以这个累计值就是
+        # 读取阶段的真实内存成本（远超最后留下的那个二维数组）。
+        held_bytes = 0
         pbar = tqdm(
             index.available,
             desc="解析站点文件",
             unit="文件",
             ncols=100,
         )
-        for fpath in pbar:
+        for done, fpath in enumerate(pbar, start=1):
             try:
                 item = self._parse_diamond_file(fpath)
                 if item is not None:
                     parsed.append(item)
+                    held_bytes += sum(
+                        item[key].nbytes
+                        for key in ("station_id", "lon", "lat", "altitude", "precipitation")
+                    )
             except Exception as exc:
                 raise DecodeError(
                     f"Failed to parse station file {fpath}: {exc}",
@@ -173,6 +196,17 @@ class DiamondStationReader(Reader):
                     path=str(fpath),
                     cause=exc,
                 ) from exc
+            if step and (done % step == 0 or done == total):
+                log.info(
+                    "解析站点文件 %d/%d（%.0f%%），已用 %.1fs，已解析累计 %.2f GB，"
+                    "进程峰值 RSS %s",
+                    done,
+                    total,
+                    100.0 * done / total,
+                    time.perf_counter() - started,
+                    held_bytes / 1024**3,
+                    peak_rss_text(),
+                )
         pbar.close()
 
         if not parsed:
@@ -222,6 +256,18 @@ class DiamondStationReader(Reader):
         order = np.argsort(np.asarray(time_index))
         precip_data = precip_data[order]
         time_index = [time_index[i] for i in order]
+
+        log.info(
+            "站点观测读取完成：%d/%d 个文件，%d 个时次 × %d 个站，"
+            "稠密数组 %.2f GB，总耗时 %.1fs，进程峰值 RSS %s",
+            len(parsed),
+            total,
+            n_times,
+            n_stations,
+            precip_data.nbytes / 1024**3,
+            time.perf_counter() - started,
+            peak_rss_text(),
+        )
 
         ds = xr.Dataset(
             {"precipitation": (["time", "station"], precip_data)},

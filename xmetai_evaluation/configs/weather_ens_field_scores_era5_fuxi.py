@@ -64,6 +64,17 @@ cfg = EvalConfig(
             "FUXI_ENS_OUTPUT", "/workspace/data/shenzw/fuxi_ens_output"
         ),
         "variables": VARS,
+        "step_hours": 6.0,      # 布局步长：lead_from="index"，001.nc → +6h
+        # 时效列表（小时）。**不写 = 从目录索引推**：取目录里的最大时效 lead_max，
+        # 按 step_hours 从 0 铺起（0, 6, 12, …, lead_max）。要"不限制"写 None 或
+        # 整个键不写，两者等价。
+        #
+        # 与降水流程（weather_ts_det / weather_ts_ens）不同，本流程**没有累积窗**
+        # ——weather_ens_field_scores 的变换只有 ensemble_mean，每个读到的时效都是
+        # 独立样本，所以这里可以自由写稀疏集，不会出现"凑不齐窗、一个样本都没有"：
+        #     "lead_times": [24, 48, 72, 96, 120],   # 只评前 5 天，省读盘省内存
+        # 写出来就是**覆盖**：框架不再从目录推，块也只按列表里的时效读。
+        "lead_times": None,
     },
     observation_reader={
         "type": "era5_zarr",
@@ -82,11 +93,14 @@ cfg = EvalConfig(
     reference_reader={
         "type": "daily_climatology",
         "root_dir": os.environ.get("ERA5_CLIMO", "/workspace/data/worm/era5_clim_phys_14.nc"),
-        "window": 15,
+        # 15 天环形平滑（±7.5 天，跨年首尾相接）：取场前对年内日序做中心对齐的
+        # 滑动平均，抹平单日气候态的天气尺度噪声。与 xu 的 --climo-window 同口径，
+        # 是**气象参数**，跟 execution.loads 的 window:W（IO 窗块缓存）没有关系。
+        "smooth_days": 15,
     },
 
     start_date=os.environ.get("START_DATE", "20250102"),
-    end_date=os.environ.get("END_DATE", "20251215"),
+    end_date=os.environ.get("END_DATE", "20250104"),
     limit=None,  # 限起报数，直接改这里；None = 不限
 
     output_dir=os.environ.get(
@@ -130,17 +144,29 @@ cfg = EvalConfig(
     # 总量 ≈ 5.6 + 1.7 × n_workers —— n_workers=24 时约 47G。卡口是核数不是内存。
     # 驻留那 5.6G 是 fork 前预热、子进程 COW 共享的**固定份额**，与 worker 数无关，
     # 所以加 worker 只在工作集上线性花钱。
-    # ⚠ 若把 VARS 放回上面注释里那 5 个要素：气候态 resident 涨到 ~67G、工作集 ×5，
-    #   n_workers=24 就是 240G 量级 —— 那种配法必须把 n_workers 降到 8~12。
+    #
+    # ⚠ 观测的 window 是**另一笔账**（2026-09 从 slice 改过来）：era5_zarr 是立即读进
+    # numpy 的，窗块真占内存、而且每进程一份（不像 resident 那样 fork 共享）。稳态留
+    # 3 个块（当前块 ±1，回跳要用），单通道一个 16 天块 ≈ 0.27G，3 块 ≈ 0.8G/进程
+    # × 24 ≈ 19G —— 本配置只有 z500，加得起。
+    # ⚠ 若把 VARS 放回上面注释里那 5 个要素：气候态 resident 涨到 ~67G、工作集 ×5、
+    #   窗缓存 ×5（~95G），n_workers=24 就是 400G 量级 —— 那种配法必须把 n_workers
+    #   降到 8~12，或者把 observation 退回 slice。
     execution={
         "mode": "processes",
         "n_workers": 24,       # 24 核 → 24 进程：np.fft 单线程，1 worker≈1 核不超订
         "chunk_days": 1,        # 一个块装 1 个起报日
         "lead_chunk_days": 1,   # 一个块装 1 天时效（= 4 个 6h 时效）
-        # loads 这两行就是推导值，写出来是为了好改。代价：写死之后不再自动
-        # 跟随数据源——换了观测/参考读取器要记得回来核对一遍。
+        # observation 从推导缺省的 slice 改成 window：块序是「起报日外层、时效窗
+        # 内层」，相邻起报组的观测日大面积重叠（扫完 16 天再回跳 14 天），滚动窗块
+        # 让一个观测日整 run 只读一次，而不是每个块都重读。16 = 整段时效跨度 15 天
+        # + 1 天起报跨度，即自动定窗的值（见 execution/plan.py 的 _auto_window_days）；
+        # 写更大不会更省，只会多占内存，所以写 16 与裸写 "window" 等价。
+        # **预报不在这里**：预报恒为 slice，且根本不在 loads 的角色表里
+        # （strategy.LOAD_ROLES 只有 observation / reference），写它直接报配置错。
+        # 窗缓存的内存账见上面那段——本配置只有 z500，约 19G，可接受。
         "loads": {
-            "observation": "slice",      # era5_zarr 按请求跨度切，现读现弃
+            "observation": "window:16",
             "reference": "resident",     # 日序气候态整 run 驻留（z500 实测 5.6G，fork 共享 1 份）
         },
         "resume": True,         # 长时段正式跑建议开：中断后接着算

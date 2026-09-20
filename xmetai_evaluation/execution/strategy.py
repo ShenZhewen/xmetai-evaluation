@@ -6,7 +6,9 @@
 
     execution = {
         "mode": "auto",       # serial / threads / processes / auto
-        "n_workers": 4,       # 进程/线程数；不写就 threads=4、processes=CPU 数
+        "n_workers": 4,       # 进程/线程数；不写就 threads=4、processes=可用核数
+                              # （可用核数 = affinity mask，认 cgroup/cpuset 配额，
+                              #  不是 os.cpu_count() 报的宿主机核数）
         "chunk_days": 1,      # 一个工作块装几个起报日
         "lead_chunk_days": 1, # 一个工作块装几天时效；0 = 不切（整段时效一块）
         "loads": {"observation": "resident", "reference": "window:30"},
@@ -73,6 +75,24 @@ _RESIDENT_READERS = frozenset(
 _UNMANAGED_READERS = frozenset({"ref_probability"})
 
 
+def usable_cpu_count() -> int:
+    """本进程**实际能用**的核数——不是宿主机的核数。
+
+    ``os.cpu_count()`` 报的是宿主机的逻辑核数，它不看 cgroup / cpuset 配额：
+    在有配额的环境（Slurm、容器、``taskset``）上会严重高估。实测在一台配额
+    24 核的机器上返回 192，于是开了 192 个进程，每个都要物化一整块集合预报场
+    （51 成员），几分钟内全被 OOM 打死——症状是满屏 ``BrokenProcessPool``，
+    离真正的原因（核数读错了）隔着十万八千里。
+
+    ``sched_getaffinity`` 读的是 affinity mask，也就是认配额的核数。Windows /
+    macOS 没有这个接口，退回 ``os.cpu_count()``。
+    """
+    try:
+        return max(1, len(os.sched_getaffinity(0)))
+    except AttributeError:
+        return max(1, os.cpu_count() or 1)
+
+
 def parse_load_policy(value: str) -> tuple:
     """把驻留策略声明解析成 (策略, 窗口天数)。
 
@@ -119,11 +139,11 @@ class ExecutionStrategy:
         return "processes" if profile.compute_class == "heavy" else "threads"
 
     def resolve_workers(self, mode: str) -> int:
-        """worker 数缺省：processes 用满 CPU，threads 给 4。"""
+        """worker 数缺省：processes 用满**可用**核数，threads 给 4。"""
         if self.n_workers and int(self.n_workers) > 0:
             return int(self.n_workers)
         if mode == "processes":
-            return max(1, os.cpu_count() or 1)
+            return usable_cpu_count()
         return 4
 
     def load_policy(self, role: str) -> tuple:

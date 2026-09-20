@@ -233,7 +233,9 @@ def _discover_leads(
     步长展开成 0..max。展开结果只会是真实时效的超集——块执行时协议按
     实际读到的时效发请求，多出来的时刻只是留在驻留缓存里没人用。
     """
-    declared = [float(value) for value in spec.forecast.params.get("lead_times", [])]
+    # ``or []``：键写了但值是 None 时也要当"没声明"。只写 ``.get(..., [])``
+    # 的话，键在、值是 None 拿到的是 None 而不是那个缺省，下一句遍历就 TypeError。
+    declared = [float(value) for value in spec.forecast.params.get("lead_times") or []]
     if declared:
         return declared
     request = DataRequest(
@@ -264,11 +266,18 @@ def _warmup_hours(spec: PipelineSpec, step_hours: float) -> float:
     （``transforms/temporal.py``），所以一个时效窗要出第一个样本，读取集必须
     往前多带 ``(窗口步数 - 1)`` 个时效。没有累积变换的流程（预报文件本身就是
     窗口累积量，如 6h 降水）不需要预热。
+
+    **至少带 1 步**，即使 ``窗口步数 == 1``（窗口长度恰好等于时效步长，如 6h
+    窗配 6h 预报）。那种流程数学上不需要累积，但累加器要先拿 ``np.diff`` 反推
+    步长才能算出窗口要几步——读取集只有一个时效时它推不出来，直接抛
+    "Need at least 2 time steps"，于是**每段时效的最后一个窗永远出不了样本**
+    （实测 6h 段顶边块全灭）。多带一步给的是步长这个信息，不是精度：那个多出
+    来的窗不在 ``sample_leads`` 里，协议会跳过，不会多出样本。
     """
     if spec.transform("time_window_accumulator") is None:
         return 0.0
     steps = int(round(spec.window_hours / float(step_hours)))
-    return max(0, steps - 1) * float(step_hours)
+    return max(1, steps - 1) * float(step_hours)
 
 
 def _sample_values(spec: PipelineSpec, leads: List[float]) -> List[float]:
@@ -389,16 +398,16 @@ def _grid_valid_times(init_times: List[datetime], leads: List[float]) -> List[da
     )
 
 
-def _lead_window_days(strategy: ExecutionStrategy, leads: List[float]) -> int:
-    """单块实际读的时效跨度（天）。
+def _lead_window_days(leads: List[float]) -> int:
+    """整段时效跨度（天）——自动定窗的基数。
 
-    切了时效就是窗宽本身；只有 ``lead_chunk_days=0``（不切）时才是整个时效
-    跨度。窗宽必须按这个算而不是按 ``max(leads)``：切了时效后每个块只读一个
-    时效窗，再按整个时效跨度定窗的话，每个块都从一个十几天的窗块里读一天，
-    读放大十几倍。
+    这里是**整个时效跨度**（``max(leads)``），不是单块的时效窗宽
+    （``lead_chunk_days``）。块序是「起报日外层、时效窗内层」：一个起报日组
+    要顺次扫完所有时效窗，用到的观测日跨度就是整个时效跨度；组与组之间还要
+    回跳（扫完 L 天、回跳 L-2 天）。窗宽只有 ≥ 这个跨度，回跳时上一轮读过的
+    块才还留在缓存里（配合 loader 的 ±1 块保留），一个观测日整 run 只读一次。
+    ``lead_chunk_days=0``（不切时效）时两种口径本就相同。
     """
-    if strategy.lead_chunk_days > 0:
-        return strategy.lead_chunk_days
     return max(1, math.ceil(max(leads) / 24.0)) if leads else 1
 
 
@@ -409,23 +418,24 @@ def _auto_window_days(
     leads: List[float],
     warmup_hours: float = 0.0,
 ) -> int:
-    """``window`` 不带数字时的自动窗宽：单块观测跨度 + 并发跨度。
+    """自动窗宽（同时也是配置窗宽的**上限**）：观测日跨度 + 并发跨度。
 
-    单块观测跨度 = 单块时效窗宽 + 预热 + 块内起报跨度（``chunk_days`` 天）。
+    需要的最小窗宽 = 一个起报日组扫完所有时效窗所碰到的观测日跨度
+    = 整段时效跨度 + 预热 + 块内起报跨度（``chunk_days`` 天）。
 
     threads 下并发块时间相邻（队列按序领块），再加 (并发数-1)*chunk_days；
     processes 下每进程段内串行、一次只跑一块，这项为 0。目的是让并发中的
-    所有块的观测跨度都落进**同一个**窗块——跨界就得同时驻留两个块。
+    所有块的观测跨度都落进**相邻两个**窗块（loader 保留 ±1 块）。
 
-    不切时效（``lead_chunk_days=0``）时它退化成「整个时效跨度 + 并发跨度 +
-    1」——``chunk_days=1`` 且无预热时与原式逐值相同；有预热或多起报日时比
-    原式大 1~2 天（更贴合实际跨度，原来那 1 天余量盖不住）。
+    再宽没有收益：读量只取决于"装不装得下一个组的观测日跨度"，装得下之后
+    加宽只多占内存——而且进程模式下窗块是每个子进程各一份，加宽的钱按
+    worker 数翻。
     """
     mode = strategy.resolve_mode(n_chunks, profile)
     workers = strategy.resolve_workers(mode)
     spread = (workers - 1) * strategy.chunk_days if mode == "threads" else 0
     return (
-        _lead_window_days(strategy, leads)
+        _lead_window_days(leads)
         + math.ceil(warmup_hours / 24.0)
         + max(1, strategy.chunk_days)
         + spread
@@ -440,23 +450,44 @@ def _resolve_window(
     leads: List[float],
     warmup_hours: float = 0.0,
 ) -> Tuple[str, int]:
-    """拿角色的 (驻留策略, 窗宽)；自动窗在这里落成具体天数并回写声明。
+    """拿角色的 (驻留策略, 窗宽)；window 的最终窗宽在这里落定并回写声明。
 
-    回写 ``strategy.loads`` 是为了 manifest 的 execution 段显示最终值
-    （如 ``"window:21"``），跑完可核对当时算的是多少。
+    最终窗宽 = ``min(算出来的最小窗宽, 配置里的值)``：
+
+        ``window``      不写数字 —— 直接用算出来的最小值；
+        ``window:W``    配置值当**上限**用 —— 比最小值小就照用小值（读会变多、
+                        缓存变小，是拿内存换 IO 的主动选择）；比最小值大就收到
+                        最小值（再宽不减少重读，只多占内存，而进程模式下窗块是
+                        每个子进程各一份，加宽的钱按 worker 数翻）。
+
+    回写 ``strategy.loads`` 是为了 manifest 的 execution 段显示**实际用的**值
+    （如 ``"window:16"``），跑完可核对当时算的是多少——配置写了 32 而实际用了
+    16 时，manifest 里看到的是 16，收到的动作在日志里另有一行。
     """
     policy, window = strategy.load_policy(role)
-    if policy == "window" and window is None:
-        window = _auto_window_days(strategy, n_chunks, profile, leads, warmup_hours)
-        strategy.loads[role] = f"window:{window}"
+    if policy != "window":
+        return policy, int(window or 0)
+    minimum = _auto_window_days(strategy, n_chunks, profile, leads, warmup_hours)
+    requested = None if window is None else int(window)
+    final = minimum if requested is None else min(requested, minimum)
+    if requested is None:
         log.info(
-            "角色 %s 自动定窗：%d 天（单块时效跨度 %d 天 × 起报跨度 %d 天 + 预热/并发）",
+            "角色 %s 自动定窗：%d 天（整段时效跨度 %d 天 + 起报跨度 %d 天 + 预热/并发）",
             role,
-            window,
-            _lead_window_days(strategy, leads),
+            final,
+            _lead_window_days(leads),
             max(1, strategy.chunk_days),
         )
-    return policy, int(window or 0)
+    elif final != requested:
+        log.info(
+            "角色 %s 配置窗宽 %d 天，收到 %d 天（整段时效跨度 %d 天；再宽只多占内存，不减少重读）",
+            role,
+            requested,
+            final,
+            _lead_window_days(leads),
+        )
+    strategy.loads[role] = f"window:{final}"
+    return policy, final
 
 
 def _build_roles(

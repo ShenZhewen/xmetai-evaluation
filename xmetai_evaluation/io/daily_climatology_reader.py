@@ -15,7 +15,12 @@
     366 天文件    真日序（含 2/29）；平年 d>=59 加 1，跳过 2/29 那一格
 
 ``time:units`` 只取**单位**（days / hours / …），起算时刻被忽略——气候态索引的是
-"年内位置"，不是绝对时刻。15 天环形平滑在读取时算（``--climo-window`` 口径）。
+"年内位置"，不是绝对时刻。
+
+另有一道**气象上的**平滑：取场前对年内日序做 ``smooth_days`` 天的环形滑动平均
+（默认 15 天，与参考实现 ``--climo-window`` 同口径）——把单日气候态里的天气尺度
+噪声抹平，季节循环保留。它和 ``execution.loads`` 的 ``window:W``（IO 窗块滚动缓存）
+**没有任何关系**，一个是"读出来的数怎么算"，一个是"读几次、留多久"。
 
 内存：整年 × 全球 × 14 要素很大，所以按纬度分块惰性读，峰值只与分块有关，
 不把整年整块载入。
@@ -47,8 +52,9 @@ from xmetai_evaluation.io.base import DataCatalog, Reader
 
 log = logging.getLogger(__name__)
 
-#: 默认平滑窗口（天），与参考实现 ``--climo-window`` 一致
-DEFAULT_WINDOW = 15
+#: 默认平滑天数：取场前对年内日序做这么多天的环形滑动平均
+#: （与参考实现 ``--climo-window`` 同口径）。**不是** IO 的窗块缓存。
+DEFAULT_SMOOTH_DAYS = 15
 
 #: time:units 的单位 -> 小时换算系数
 _HOURS_PER_UNIT = {
@@ -160,20 +166,25 @@ class DailyClimatologyReader(Reader):
     """把单文件日序气候态读成 ``(valid_time, lat, lon)`` 的参考场。
 
     按 ``request.init_times``（协议传的是有效时刻）取场，日序索引 + 线性插值，
-    取场前先做 ``window`` 天的环形滑动平均。
+    取场前先对年内日序做 ``smooth_days`` 天的环形滑动平均（年内首尾相接）。
+
+    ``smooth_days`` 是气象参数，不是 IO 参数：它只决定"气候态数值被抹平多少"，
+    与 ``execution.loads`` 的 ``window:W``（窗块滚动缓存）毫无关系。取 1 = 不平滑
+    （逐日原值，噪声大），越大越平滑（季节循环也被抹），0 或负数等同不平滑。
     """
 
     def __init__(
         self,
         source_id: str = "daily_climatology",
         version: str = "1.0.0",
-        window: int = DEFAULT_WINDOW,
+        smooth_days: int = DEFAULT_SMOOTH_DAYS,
         scales: Optional[Dict[str, float]] = None,
         units: Optional[Dict[str, str]] = None,
         chunk_points: int = 200_000_000,
     ):
         super().__init__(source_id=source_id, version=version)
-        self.window = int(window)
+        #: 环形平滑天数（取场前对年内日序做中心对齐的滑动平均）
+        self.smooth_days = int(smooth_days)
         self.scales = {str(key): float(value) for key, value in (scales or {}).items()}
         self.units = dict(units or {})
         #: 单次读取的点数预算。取到 200M（f4 约 800MB）是为了让常见的几十步窗口
@@ -313,7 +324,11 @@ class DailyClimatologyReader(Reader):
             steps_per_day = self._steps_per_day(hours, path)
             year_days = self._year_length(hours, steps_per_day, path)
             total_steps = hours.size
-            half = int((self.window * steps_per_day) // 2)
+            # smooth_days 天 -> 步数 -> 半径 half：实际窗宽是 2*half+1 步，
+            # 中心对齐（half 步前 ~ half 步后），跨年首尾相接。
+            # 例：6h 步长（steps_per_day=4）、smooth_days=15 -> 60 步 -> half=30
+            #     -> 每个日序取前后各 30 步（7.5 天）共 61 步的算术平均。
+            half = int((self.smooth_days * steps_per_day) // 2)
             half = max(0, min(half, (total_steps - 1) // 2))
 
             available = self._variable_names(dataset)

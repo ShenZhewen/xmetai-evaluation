@@ -114,14 +114,38 @@ def test_resident_policy_reads_once_and_slices():
 def test_window_policy_loads_and_evicts_by_block():
     times = [BASE + timedelta(days=d, hours=h) for d in range(4) for h in (0, 12)]
     spec, calls = _role(times, "window", window_days=2)
-    loader = RunLoader({"observation": spec})
+    # 关掉预取：本条测的是按块加载与滚动淘汰，预取会额外多读一块干扰计数
+    loader = RunLoader({"observation": spec}, prefetch=False)
 
     loader.materialize("observation", _request(BASE, BASE))
     loader.materialize("observation", _request(BASE + timedelta(days=3), BASE + timedelta(days=3)))
     # 第一窗（0-1 日）一个块、第二窗（2-3 日）一个块，互不重叠
     assert [call[1] for call in calls] == [4, 4]
-    # 滚动淘汰：第二窗请求后，第一窗的块已不在缓存里
-    assert list(loader._window_blocks["observation"]) == [1]
+    # 滚动淘汰：留的是"当前块 ±1"。第二窗请求后第一窗的块还在（它正是前一块），
+    # 再往前没有别的块可留
+    assert list(loader._window_blocks["observation"]) == [0, 1]
+
+
+def test_window_keeps_the_previous_block_for_the_sawtooth():
+    """观测读是锯齿（向前扫 L 天、再回跳 L-2 天）：留 ±1 块才接得住回跳。
+
+    块序是「起报日外层、时效窗内层」，扫到尾部后下一个起报日组又从头开始。
+    只留当前块时那个"从头"必然落空重读；留 ±1 块则块 0 一直躺在缓存里。
+    """
+    times = [BASE + timedelta(days=d) for d in range(6)]
+    spec, calls = _role(times, "window", window_days=1)
+    loader = RunLoader({"observation": spec}, prefetch=False)
+
+    for offset in (0, 1):
+        loader.materialize(
+            "observation",
+            _request(BASE + timedelta(days=offset), BASE + timedelta(days=offset)),
+        )
+    assert len(calls) == 2  # 块 0、块 1 各读一次
+
+    loader.materialize("observation", _request(BASE, BASE))  # 回跳到块 0
+    assert len(calls) == 2  # 块 0 还在缓存里，不重读
+    assert list(loader._window_blocks["observation"]) == [0, 1]
 
 
 def test_materialize_requires_known_role_and_times():
@@ -410,17 +434,40 @@ def test_auto_window_days_covers_leads_and_thread_spread():
     # 没有时效信息时按 1 天兜底
     assert _auto_window_days(strategy, 90, ResourceProfile(), []) == 6
 
-    # 切了时效（缺省 1 天）：窗宽按**单块**时效跨度算，不再按整个 15 天，
-    # 否则每个块都从一个 16 天的窗块里读 1 天 → 读放大 16 倍。
-    # 1（时效窗）+ 0（预热）+ 1（块内起报跨度）+ 0（processes 无并发跨度）
+    # 切了时效（缺省 1 天）：窗宽仍按**整个时效跨度**算，不是按单块时效窗宽。
+    # 块序是「起报日外层、时效窗内层」，一个起报日组要把所有时效窗顺次扫一遍，
+    # 碰到的观测日跨度就是整个跨度；组与组之间还要回跳，窗宽不够回跳就落空重读。
+    # 15（整段时效跨度）+ 0（预热）+ 1（块内起报跨度）+ 0（processes 无并发跨度）
     strategy = ExecutionStrategy(mode="processes", n_workers=12, chunk_days=1)
-    assert _auto_window_days(strategy, 90, heavy, leads) == 2
+    assert _auto_window_days(strategy, 90, heavy, leads) == 16
     # 预热单独占一天：24h 累积窗 / 6h 步长 → 18h 预热
-    assert _auto_window_days(strategy, 90, heavy, leads, warmup_hours=18.0) == 3
+    assert _auto_window_days(strategy, 90, heavy, leads, warmup_hours=18.0) == 17
 
-    # threads 下切时效：1（时效窗）+ 1（起报跨度）+ (5-1)*1（并发跨度）
+    # threads 下切时效：15（整段时效跨度）+ 1（起报跨度）+ (5-1)*1（并发跨度）
     strategy = ExecutionStrategy(mode="threads", n_workers=5, chunk_days=1)
-    assert _auto_window_days(strategy, 90, ResourceProfile(), leads) == 6
+    assert _auto_window_days(strategy, 90, ResourceProfile(), leads) == 20
+
+
+def test_configured_window_is_capped_by_the_auto_minimum():
+    """配置的窗宽当**上限**用：比自动值大就收到自动值，比它小则照用小值。"""
+    from xmetai_evaluation.execution.plan import _resolve_window
+    from xmetai_evaluation.execution.profiles import ResourceProfile
+    from xmetai_evaluation.execution.strategy import ExecutionStrategy
+
+    leads = [0.0, 6.0, 12.0, 360.0]  # 自动值 = 15（整段时效跨度）+ 1 = 16
+    heavy = ResourceProfile(compute_class="heavy")
+
+    def _resolve(value):
+        strategy = ExecutionStrategy(
+            mode="processes", n_workers=12, chunk_days=1, loads={"observation": value}
+        )
+        return _resolve_window("observation", strategy, 90, heavy, leads)
+
+    assert _resolve("window") == ("window", 16)  # 裸写 = 自动值
+    assert _resolve("window:16") == ("window", 16)
+    assert _resolve("window:90") == ("window", 16)  # 比自动值大 → 收到自动值
+    assert _resolve("window:4") == ("window", 4)  # 比自动值小 → 照用小值
+    assert _resolve("slice") == ("slice", 0)
 
 
 

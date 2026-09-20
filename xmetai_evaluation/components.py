@@ -184,7 +184,7 @@ def _climatology_source(**params) -> SourceHandle:
 def _daily_climatology_source(**params) -> SourceHandle:
     """单文件日序气候态（与按 MMDDHH 找文件的 climatology 是两种索引方式）。"""
     from xmetai_evaluation.io.daily_climatology_reader import (
-        DEFAULT_WINDOW,
+        DEFAULT_SMOOTH_DAYS,
         DailyClimatologyCatalog,
         DailyClimatologyReader,
     )
@@ -194,7 +194,7 @@ def _daily_climatology_source(**params) -> SourceHandle:
     return SourceHandle(
         reader=DailyClimatologyReader(
             source_id=source_id,
-            window=int(params.get("window", DEFAULT_WINDOW)),
+            smooth_days=int(params.get("smooth_days", DEFAULT_SMOOTH_DAYS)),
             scales=params.get("scales"),
             units=params.get("units"),
         ),

@@ -49,6 +49,12 @@ log = logging.getLogger(__name__)
 #: 想更密/更疏直接改这个数：5568 块 / 5 段 ≈ 1114 块一段，50 → 每段约 22 行。
 PROGRESS_EVERY = 50
 
+#: ``*_input_files`` 清单**写进 manifest** 的条数上限（真实条数另记 ``n_<键>``）。
+#: 清单是逐块并起来的：集合预报一块 4 个时效 × 51 个成员 = 204 条，5568 块就是
+#: 一百多万条。manifest 是给人看的，整份清单没人读得完，写进 JSON 还要上百 MB。
+#: 超限的只留前 N 条样本——够看出"读了哪一批文件"了。
+SUMMARY_INPUT_FILES_LIMIT = 20
+
 
 class MetricRun(NamedTuple):
     """一次指标执行：指标对象 + 这次执行针对的变量（None 表示整批，不做路由）。"""
@@ -183,6 +189,13 @@ def collect_chunk_states(
         return ChunkOutcome(chunk_id=label, ok=False, error=repr(exc))
 
     if processed == 0:
+        # 这条路径原来一行日志都不打：块没抛异常、协议也没产出样本时，日志里
+        # 只剩归并阶段那句「有 N 个工作块失败」，既看不出是哪一块，也看不出
+        # 为什么——段一的 91 个块就是这么静默消失的。这里至少把块号点出来，
+        # 块内原因由协议自己打（见 ``protocols.py`` 的「起报窗口无样本可评」）。
+        log.warning(
+            "工作块 %s 没有任何样本可评（跳过 %d 个批次）", chunk_label, skipped
+        )
         return ChunkOutcome(
             chunk_id=chunk_label,
             ok=False,
@@ -207,6 +220,10 @@ def _sample_loop(protocol: Any, context: PipelineContext, runs: List[MetricRun])
     coordinates: Dict[Tuple[int, Tuple], Dict[str, Any]] = {}
     processed = 0
     skipped = 0
+    #: 第一个失败样本是否已经报过（见下面 except 里的理由）。每个样本都会犯的
+    #: 错——缺依赖、路径不对——否则就是满屏 ERROR 配一句"没有成功处理任何评测
+    #: 批次"，真原因埋在 DEBUG 里。
+    reported_failure = False
     for sample in protocol.samples(context):
         success = False
         try:
@@ -240,7 +257,16 @@ def _sample_loop(protocol: Any, context: PipelineContext, runs: List[MetricRun])
             # 不能当成"这条样本坏了"跳过。
             raise
         except Exception as exc:
-            log.debug("样本 %s 处理失败: %s", sample.key, exc)
+            # 第一条失败提级到 WARNING，后面的仍只记 DEBUG：整块失败时块错误
+            # 只有一句常量（见上面 ``processed == 0`` 那个分支），不在这里留
+            # 一条可见的日志，真实原因就只存在于 DEBUG 里了。
+            if reported_failure:
+                log.debug("样本 %s 处理失败: %s", sample.key, exc)
+            else:
+                reported_failure = True
+                log.warning(
+                    "样本 %s 处理失败（后续失败仍只记 DEBUG）: %s", sample.key, exc
+                )
 
         if success:
             processed += 1
@@ -606,6 +632,13 @@ def execute_chunks(plan: Any, order: int = 1) -> List[ChunkOutcome]:
             _sum_stats(plan.loader.stats(), worker_stats),
         )
 
+    # 缓存放掉再进收尾。resident 驻留只为 fork 前的写时复制而存在，进程池一关
+    # 子进程就没了，父进程再揣着它纯是白占——而归并 / 指标收尾 / 落盘全在这一个
+    # 进程里跑，峰值内存从"按 worker 分担"变回"父进程一个人扛"。
+    freed = plan.loader.release()
+    if freed > 0:
+        log.info("释放加载缓存 %.2f GB（块已跑完，收尾阶段不再需要）", freed)
+
     merged_list = [outcome for outcome in outcomes if outcome is not None]
     if not any(outcome.ok for outcome in merged_list):
         reasons = "; ".join(
@@ -695,7 +728,17 @@ def merge_outcomes(outcomes: List[ChunkOutcome], spec: PipelineSpec) -> MergedOu
     policy = str(getattr(protocol, "duplicate_key_policy", "append"))
 
     merged = MergedOutcome()
-    for outcome in outcomes:
+    #: 列表型 summary 键的跨块判重索引。必须活过整个循环——每个块调一次
+    #: ``_merge_summary``，索引重建一次就是又一遍线性扫描（见那边 docstring）。
+    summary_state: Dict[str, Any] = {}
+    progress = tqdm(
+        outcomes,
+        desc=f"{spec.pipeline or spec.name} 归并",
+        unit="块",
+        ncols=100,
+        bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}]",
+    )
+    for outcome in progress:
         if not outcome.ok:
             merged.failures.append((outcome.chunk_id, outcome.error or "未知原因"))
             # 失败块仍计入跳过数，manifest 的口径才对得上"请求了多少"
@@ -719,7 +762,9 @@ def merge_outcomes(outcomes: List[ChunkOutcome], spec: PipelineSpec) -> MergedOu
                 merged.coordinates.setdefault(
                     key, outcome.coordinates.get(key, {})
                 )
-        merged.summary = _merge_summary(merged.summary, outcome.summary)
+        merged.summary = _merge_summary(merged.summary, outcome.summary, summary_state)
+        progress.set_postfix_str(f"状态 {len(merged.states)} 键")
+    progress.close()
     if merged.failures:
         log.warning(
             "段 %s 有 %d 个工作块失败（其余 %d 个成功块的结果继续）",
@@ -730,19 +775,38 @@ def merge_outcomes(outcomes: List[ChunkOutcome], spec: PipelineSpec) -> MergedOu
     return merged
 
 
-def _merge_summary(base: Dict[str, Any], extra: Dict[str, Any]) -> Dict[str, Any]:
+def _merge_summary(
+    base: Dict[str, Any],
+    extra: Dict[str, Any],
+    state: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
     """协议 summary 的跨块合并。
 
     计数键（``n_`` 前缀）跨块相加；列表（输入文件清单、``*_times`` 时刻清单）
     取并集；其余数值与字符串都是口径描述（如 window_hours=24、forecast_reader），
     保留首个——相加反而会把 window_hours 变成"窗口数 × 块数"的假数。
 
-    ``*_times`` 列表的计数**不能**靠相加：切时效后同一个起报/有效时刻会出现在
-    多个块里，相加得到的是"块数 × 时刻数"。这里统一由并集后的列表长度得出，
-    协议因此报列表而不报 ``n_`` 计数。
+    列表键有个绕不开的现实：**清单是逐块进来的，总量能到上百万条**（5568 块 ×
+    每块 204 个成员文件）。所以并集不能是 ``item not in current`` 的线性扫描——
+    那是 O(总条数²)，百万条时实测几小时都跑不完，表现就是收尾阶段"卡住不动但
+    进程还在"。这里改成走 ``state`` 里的判重索引（dict，O(1)），索引必须**跨块
+    带着**，每次重建等于又退化成一遍扫描。
+
+    ``*_times`` 列表的计数**不能**靠各块相加：切时效后同一个起报/有效时刻会出现
+    在多个块里，相加得到的是"块数 × 时刻数"。统一由并集后的**真实条数**得出
+    （``n_<键>``），协议因此报列表而不报计数。
+
+    进 manifest 的 ``*_input_files`` 只留前 ``SUMMARY_INPUT_FILES_LIMIT`` 条，
+    但 ``n_<键>`` 报的仍是去重后的真实条数——截断只为好看，不改变账。
     """
     merged = dict(base)
+    state = {} if state is None else state
+    # 列表放第二遍处理：n_ 计数要等并集算完才能落地，先处理会被标量分支抢走
+    lists: List[Tuple[str, List[Any]]] = []
     for key, value in extra.items():
+        if isinstance(value, list):
+            lists.append((key, value))
+            continue
         if key not in merged:
             merged[key] = value
             continue
@@ -755,12 +819,44 @@ def _merge_summary(base: Dict[str, Any], extra: Dict[str, Any]) -> Dict[str, Any
             and isinstance(value, (int, float))
         ):
             merged[key] = current + value
-        elif isinstance(current, list) and isinstance(value, list):
-            for item in value:
-                if item not in current:
-                    current.append(item)
         # 其余类型（字符串、口径数值）块间理应一致，不一致就保留首个
-    for key, value in list(merged.items()):
-        if isinstance(value, list) and key.endswith("_times"):
-            merged[f"n_{key}"] = len(value)
+
+    for key, value in lists:
+        record = state.get(key)
+        current = merged.get(key)
+        if record is None:
+            # 首次见到这个键：先拷一份，别就地改调用方传进来的列表
+            current = list(current) if isinstance(current, list) else []
+            merged[key] = current
+            try:
+                index: Optional[Dict[Any, None]] = {item: None for item in current}
+            except TypeError:
+                index = None  # 元素不可哈希，本键退回线性扫描
+            record = [index, len(current)]
+            state[key] = record
+            if key.endswith("_input_files"):
+                del current[SUMMARY_INPUT_FILES_LIMIT:]
+        index, total = record
+        for item in value:
+            if index is None:
+                if item in current:
+                    continue
+            else:
+                try:
+                    if item in index:
+                        continue
+                    index[item] = None
+                except TypeError:
+                    # 这一条不可哈希：本键退回线性扫描，得在原地重判一次
+                    index = None
+                    if item in current:
+                        continue
+            total += 1
+            if len(current) < SUMMARY_INPUT_FILES_LIMIT or not key.endswith(
+                "_input_files"
+            ):
+                current.append(item)
+        record[0] = index
+        record[1] = total
+        merged[f"n_{key}"] = total
     return merged

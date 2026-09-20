@@ -91,6 +91,19 @@ cfg = EvalConfig(
             "FUXI_OUTPUT", "/workspace/data/shenzw/fuxi_single_output"
         ),
         "variables": VARS,
+        "step_hours": 6.0,      # 布局步长：lead_from="index"，001.nc → +6h
+        # 时效列表（小时）。**不写这一行 = 从目录索引推**：取目录里的最大时效
+        # lead_max，按 step_hours 从 0 铺起（0, 6, 12, …, lead_max）——本配置的
+        # 目录推到 360h，61 个时效，与把这 61 个显式写出来等价。
+        #
+        # 与降水流程（weather_ts_det / weather_ts_ens）不同，本流程**没有累积窗**
+        # ——weather_field_scores 的变换只有 ensemble_mean，不做
+        # time_window_accumulator，所以每个读到的时效都是一个独立样本，这里可以
+        # 自由写稀疏集，不会出现"凑不齐窗、一个样本都没有"的问题：
+        #     "lead_times": [24, 48, 72, 96, 120],   # 只评前 5 天，省读盘省内存
+        # 写出来就是**覆盖**：框架不再从目录推，块也只按列表里的时效读。
+        #
+        # 要"不限制"就整个键都别写，或者显式写 ``None``——两者等价。
     },
     observation_reader={
         "type": "era5_zarr",
@@ -109,8 +122,10 @@ cfg = EvalConfig(
     reference_reader={
         "type": "daily_climatology",
         "root_dir": os.environ.get("ERA5_CLIMO", "/workspace/data/worm/era5_clim_phys_14.nc"),
-        # 与 xu 的 --climo-window 一致：15 天环形平滑
-        "window": 15,
+        # 15 天环形平滑：取场前对年内日序做中心对齐的滑动平均（±7.5 天，跨年首尾
+        # 相接），把单日气候态的天气尺度噪声抹平。与 xu 的 --climo-window 同口径，
+        # 是**气象参数**，跟 execution.loads 的 window:W（IO 窗块缓存）没有关系。
+        "smooth_days": 15,
     },
 
     start_date=os.environ.get("START_DATE", "20250102"),
@@ -162,10 +177,13 @@ cfg = EvalConfig(
     #                      slice      每个块现读现弃
     #                      resident   整个 run 读一次驻留内存
     #                      window:W   按 W 天块滚动缓存（LRU），省相邻块的重复读
-    #                      window     裸写不带数字 = 自动定窗，计划层按**单块**
-    #                                 观测跨度算（时效窗 + 预热 + 起报跨度，threads
-    #                                 下再加并发跨度）；落成的值会回写成 "window:N"
-    #                                 记进 manifest 的 execution.loads 供核对
+    #                      window     裸写不带数字 = 自动定窗，按**一个起报日组的
+    #                                 观测日跨度**算（整段时效跨度 + 预热 + 起报跨度，
+    #                                 threads 下再加并发跨度）
+    #                      window:W   W 是**上限**，实际用 min(W, 自动值)——比自动值
+    #                                 大不减少重读、只多占内存；比它小则是主动拿内存
+    #                                 换 IO。实际落成的值一律回写成 "window:N" 记进
+    #                                 manifest 的 execution.loads 供核对
     #                    推导缺省：站点观测 / 气候态 = resident，其余 = slice。
     #                    参考源是 ref_probability 时逐样本直读，不可配这项
     #   resume           True 时已完成块的状态落 output_dir/.states/，重跑跳过
@@ -182,6 +200,13 @@ cfg = EvalConfig(
     # 所以加 worker 只在工作集上线性花钱。别把它改成 window:——窗块是每个子进程
     # 各自物化的（不共享），日序气候态一个 3 天窗块就 ~6G，24 个进程反而比 67G 贵。
     # 单块工作集 = 预报窗口 + 观测切片 + 配对批次，随 chunk_days × lead_chunk_days 线性缩。
+    #
+    # ⚠ 观测的 window 是**另一笔账**（2026-09 从 slice 改过来）：era5_zarr 是立即读进
+    # numpy 的，窗块真占内存、而且每进程一份（不像 resident 那样 fork 共享）。稳态留
+    # 3 个块（当前块 ±1，回跳要用），单通道一个 16 天块 ≈ 0.27G，3 块 ≈ 0.8G/进程
+    # ——现在 VARS 只有 z500，24 进程 ≈ 19G，可忽略。**但把上面注释里那 12 个要素放
+    # 回来就是 ~10G/进程、24 进程 ~250G**，那时必须同时把 n_workers 压到 6~8，
+    # 或者退回 slice。改 VARS 时记得回来一起看这一条。
     # 反过来，块数变多会让**每块的固定开销**（重建组件、catalog discover、预报
     # 索引）按块数线性涨；真嫌这块慢，把 lead_chunk_days 调到 2~3 减块数。
     execution={
@@ -189,10 +214,16 @@ cfg = EvalConfig(
         "n_workers": 24,       # 24 核 → 24 进程：np.fft 单线程，1 worker≈1 核不超订
         "chunk_days": 1,        # 一个块装 1 个起报日
         "lead_chunk_days": 1,   # 一个块装 1 天时效（= 4 个 6h 时效）
-        # loads 这两行就是推导值，写出来是为了好改。代价：写死之后不再自动
-        # 跟随数据源——换了观测/参考读取器要记得回来核对一遍。
+        # observation 从推导缺省的 slice 改成 window：块序是「起报日外层、时效窗
+        # 内层」，相邻起报组的观测日大面积重叠（扫完 16 天再回跳 14 天），滚动窗块
+        # 让一个观测日整 run 只读一次，而不是每个块都重读。16 = 整段时效跨度 15 天
+        # + 1 天起报跨度，即自动定窗的值（见 execution/plan.py 的 _auto_window_days）；
+        # 写更大不会更省，只会多占内存，所以写 16 与裸写 "window" 等价。
+        # **预报不在这里**：预报恒为 slice，且根本不在 loads 的角色表里
+        # （strategy.LOAD_ROLES 只有 observation / reference），写它直接报配置错。
+        # ⚠ 代价见上面的内存账——这份现在是单要素，便宜；VARS 放回 12 个时要一起看。
         "loads": {
-            "observation": "slice",      # era5_zarr 按请求跨度切，现读现弃
+            "observation": "window:16",
             "reference": "resident",     # 日序气候态整 run 驻留（实测 67G，fork 共享 1 份）
         },
         "resume": True,         # 长时段正式跑建议开：中断后接着算

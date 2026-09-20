@@ -191,7 +191,11 @@ class StationValidTimeProtocol(Protocol):
         #: 会出现在多个块里，跨块相加会把一个坏起报数成好几个。
         self.skipped_init_times: List[str] = []
         self.ref_reader = None
-        self._diagnostics_left = 3
+        #: 每块前 N 个样本打一条"样本诊断"（形状 + 有效站数），用来定位"样本
+        #: 出不来"。**它是块口径、不是 run 口径**：这个协议实例每个工作块重建
+        #: 一次（``executor.collect_chunk``），所以实际条数是 N × 块数——全年那趟
+        #: 五千多块就是一万六千多行。默认关掉，排查样本层问题时再改回 3。
+        self._diagnostics_left = 0
 
     def prepare(self, context: PipelineContext) -> None:
         forecast = context.forecast
@@ -310,6 +314,11 @@ class StationValidTimeProtocol(Protocol):
             getattr(metric, "needs_members", _never_requires_members)()
             for metric in (context.metrics or [])
         )
+        # 这一块到底产出了什么：一个样本都没产出时，块层面只会记成「没有成功
+        # 处理任何评测批次」，原因得由这里说清楚。
+        emitted = 0
+        seen_leads: set = set()
+        read_failures = 0
 
         for init_time in self.init_times:
             try:
@@ -321,6 +330,10 @@ class StationValidTimeProtocol(Protocol):
                 field = bundle.payload[self.forecast_var].isel(init_time=0)
                 # 预报已是窗口累积量（如 6h 降水文件）时无需再累积
                 windows = accumulator.transform(field) if accumulator is not None else field
+                if "lead_time" in windows.coords:
+                    seen_leads.update(
+                        float(value) for value in windows.lead_time.values
+                    )
                 member_windows = None
                 if keep_members:
                     if "member" in windows.dims:
@@ -331,6 +344,7 @@ class StationValidTimeProtocol(Protocol):
                         )
             except Exception as exc:
                 self.skipped_init_times.append(init_time.isoformat())
+                read_failures += 1
                 log.exception("起报 %s 预报读取失败: %s", init_time, exc)
                 continue
 
@@ -351,6 +365,7 @@ class StationValidTimeProtocol(Protocol):
             for lead in self.window_leads:
                 if lead not in windows.lead_time.values:
                     continue
+                emitted += 1
                 lead_key = int(lead) if float(lead).is_integer() else float(lead)
                 yield Sample(
                     key=("lead_h", lead_key),
@@ -367,6 +382,19 @@ class StationValidTimeProtocol(Protocol):
                         "member_windows": member_windows,
                     },
                 )
+
+        if emitted == 0:
+            # 一个样本都没产出：块会记成「没有成功处理任何评测批次」。原因无非
+            # 两种——声明要评的时效根本没被累积器产出（多因该起报的预报文件不
+            # 够窗口所需步数，且预报侧静默丢了帧），或者起报在读取阶段就全失败
+            # 了（那种情况上面已有 ERROR）。这里把两者一起打出来，省得再猜。
+            log.warning(
+                "起报窗口无样本可评：声明采样时效 %s，累积器只产出时效 %s，"
+                "预报读取失败 %d 个起报",
+                self.window_leads,
+                sorted(seen_leads)[:20],
+                read_failures,
+            )
 
     def _apply_bundle_transforms(self, context: PipelineContext, bundle: Any) -> Any:
         """按声明顺序应用作用于 DataBundle 的变换（如集合降维）。"""
@@ -586,7 +614,10 @@ class GridValidTimeProtocol(Protocol):
         log.debug(
             "起报时间: %s 到 %s，共 %d 个", init_times[0], init_times[-1], len(init_times)
         )
-        lead_times = [float(value) for value in self.spec.forecast.params.get("lead_times", [])]
+        # ``or []``：键写了但值是 None（"不限制时效"）时也要当"没声明"。
+        lead_times = [
+            float(value) for value in self.spec.forecast.params.get("lead_times") or []
+        ]
         # 采样时效（窗口内要出分的样本）与读取时效（可能带累积预热）是两回事：
         # 分块执行时计划层只声明前者，后者是 lead_times。
         sample_lead_times = [

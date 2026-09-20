@@ -20,6 +20,24 @@ class BeijingFormatter(logging.Formatter):
         return dt.isoformat(timespec="seconds")
 
 
+def peak_rss_text() -> str:
+    """当前进程的峰值常驻内存，格式化成日志里能直接用的字符串。
+
+    取自 ``resource.getrusage`` 的 ``ru_maxrss``——它是**只增不减**的峰值，
+    正好用来判断离内存天花板还有多远（Linux 单位是 KB，macOS 是字节）。
+    取不到就返回 ``"n/a"``：Windows 没有 ``resource`` 模块，不影响别处。
+    """
+    try:
+        import resource
+
+        rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    except Exception:
+        return "n/a"
+    if sys.platform == "darwin":
+        return f"{rss / 1024 ** 3:.2f} GB"
+    return f"{rss / 1024 ** 2:.2f} GB"
+
+
 def configure_logging(
     level: str = "INFO",
     log_file: Optional[Path] = None,

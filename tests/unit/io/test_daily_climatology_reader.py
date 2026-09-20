@@ -68,9 +68,9 @@ def _write_legacy(root, days=365, variables=("z500", "t2m"), name="legacy.nc"):
     dataset.to_netcdf(root / name)
 
 
-def _read(root, variables, moments, window=1):
+def _read(root, variables, moments, smooth_days=1):
     catalog = DailyClimatologyCatalog(root_dir=root)
-    reader = DailyClimatologyReader(window=window)
+    reader = DailyClimatologyReader(smooth_days=smooth_days)
     request = DataRequest(source_id="daily_climatology", variables=variables, init_times=moments)
     return reader.read(request, catalog.discover(request))
 
@@ -172,8 +172,8 @@ def test_smoothing_averages_a_spike_over_the_window(tmp_path):
     dataset["time"].attrs["units"] = "days since 2020-01-01 00:00:00"
     dataset.to_netcdf(tmp_path / "spike.nc")
 
-    raw = _read(tmp_path, ["z500"], [datetime(2025, 1, 1)], window=1)
-    smoothed = _read(tmp_path, ["z500"], [datetime(2025, 1, 1)], window=15)
+    raw = _read(tmp_path, ["z500"], [datetime(2025, 1, 1)], smooth_days=1)
+    smoothed = _read(tmp_path, ["z500"], [datetime(2025, 1, 1)], smooth_days=15)
 
     np.testing.assert_allclose(_field(raw, "z500"), 365.0)
     np.testing.assert_allclose(_field(smoothed, "z500"), 365.0 / 15.0)
@@ -191,7 +191,7 @@ def test_smoothing_wraps_across_year_end(tmp_path):
     dataset["time"].attrs["units"] = "days since 2020-01-01 00:00:00"
     dataset.to_netcdf(tmp_path / "wrap.nc")
 
-    bundle = _read(tmp_path, ["z500"], [datetime(2025, 1, 1)], window=15)
+    bundle = _read(tmp_path, ["z500"], [datetime(2025, 1, 1)], smooth_days=15)
 
     np.testing.assert_allclose(_field(bundle, "z500"), 365.0 / 15.0)
 

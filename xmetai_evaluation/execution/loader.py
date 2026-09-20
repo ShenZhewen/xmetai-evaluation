@@ -28,6 +28,7 @@ import xarray as xr
 
 from xmetai_evaluation.core.contracts import DataRequest
 from xmetai_evaluation.core.errors import ConfigError
+from xmetai_evaluation.logging_util import peak_rss_text
 
 log = logging.getLogger(__name__)
 
@@ -231,12 +232,46 @@ class RunLoader:
                 if role not in self._resident:
                     self._resident[role] = self._build(spec, None)
                 bundle = self._resident[role]
+            # 「驻留」是载荷口径（array.nbytes 之和），不含读取过程中的中间
+            # 对象；「进程峰值」是进程实际到过的最高水位。两个数一起看才知道
+            # 这个角色把内存推到了哪，以及中间态比最终态多花了多少。
             log.info(
-                "角色 %s 预热完成：耗时 %.1fs，驻留 %.2f GB",
+                "角色 %s 预热完成：耗时 %.1fs，驻留 %.2f GB，进程峰值 RSS %s",
                 role,
                 perf_counter() - started,
                 _payload_gb(bundle.payload),
+                peak_rss_text(),
             )
+
+    def release(self) -> float:
+        """放掉缓存里已物化的数据，返回释放掉的载荷 GB。**终止操作**：调用后
+        这个 loader 不再可用。
+
+        resident 驻留只在 **fork 之前**有意义——子进程写时复制共享的是父进程
+        那一份，进程池一关子进程就没了，父进程再揣着这几十 GB 纯是白占。而
+        紧接着的归并 / 指标收尾 / 落盘**恰恰是在这同一个父进程里跑**：峰值内存
+        从"按 worker 分担"变回"父进程一个人扛"。实测 reference 驻留 22.42 GB 的
+        run 就是在收尾阶段被 OOM 打死的。
+
+        统计计数器（物化次数 / 缓存命中 / 读盘秒数）不清：执行器要先报完读盘
+        占比，且这几个数只在执行期内有意义。
+        """
+        with self._lock:
+            freed = sum(_payload_gb(bundle.payload) for bundle in self._resident.values())
+            freed += sum(
+                _payload_gb(bundle.payload)
+                for blocks in self._window_blocks.values()
+                for bundle in blocks.values()
+            )
+            freed += sum(
+                _payload_gb(bundle.payload) for _, bundle in self._prefetched.values()
+            )
+            self._resident.clear()
+            self._window_blocks.clear()
+            self._prefetched.clear()
+            # 关掉预取：缓存都放掉了，后台线程再读进来的块没人认领、白占内存
+            self._prefetch = False
+        return freed
 
     def stats(self) -> Dict[str, Any]:
         """加载统计（写进日志，方便核对策略有没有生效）。
@@ -313,9 +348,22 @@ class RunLoader:
             for index in missing:
                 block_span = next(item[1] for item in wanted if item[0] == index)
                 blocks[index] = self._build(spec, block_span)
-            # 滚动窗口：只留本次请求覆盖到的块，内存峰值 ≈ 一个窗口
+            # 滚动窗口：留本次请求覆盖的块 + **前后各一块**。
+            #
+            # 为什么前后都要留：块序是「起报日外层、时效窗内层」，一个起报日组
+            # 要从头扫到尾（观测日 D … D+L），下一组又从头开始（D+1 …），于是
+            # 观测读是"向前扫 L 天、再回跳 L-2 天"。只要窗宽 W ≥ L，这一轮扫描
+            # 的观测日跨度就装得进相邻两个块；留着 ±1 块，回跳时上一轮读过的块
+            # 还在，一个观测日整 run 只读一次。
+            #   只留当前块（原行为）：回跳必落空，读放大 ~L 倍；
+            #   只留"前一块"：回跳的目标块会在下一组开头被挤掉，同样落空。
+            # 代价：内存峰值从 1 个窗块变成最多 3 个（典型 2 个）。
+            keep = set(wanted_ids)
+            for index in wanted_ids:
+                keep.add(index - 1)
+                keep.add(index + 1)
             for index in list(blocks):
-                if index not in wanted_ids:
+                if index not in keep:
                     del blocks[index]
         self._schedule_next_block(role, spec, wanted)
         return [blocks[index] for index, _ in wanted]
@@ -338,6 +386,12 @@ class RunLoader:
         index, block_span = target
         if self._prefetched.get(role, (None,))[0] == index:
             return  # 已经备好了同一个块
+        # 该块已经在窗块缓存里（``_blocks`` 的 ±1 保留正好把它留着）：再读一遍
+        # 是纯白读，而且读来的副本没人认领、会一直占着 _prefetched 那个槽。
+        # 没有这道闸，预取会在每个请求上重读一次当前块的下一个块。
+        with self._lock:
+            if index in self._window_blocks.get(role, {}):
+                return
         self._start_prefetch_worker()
         self._prefetch_queue.put((role, spec, index, block_span))
 
@@ -364,6 +418,8 @@ class RunLoader:
                     log.debug("预取角色 %s 的窗块 %d 失败: %s", role, index, exc)
                     continue
                 with self._lock:
+                    if not self._prefetch:
+                        continue  # 缓存已经被 release() 放掉了，这份没人认领
                     current = self._prefetched.get(role)
                     # 同时只备一个块：已有更新的就丢掉这次的结果
                     if current is None or current[0] <= index:
