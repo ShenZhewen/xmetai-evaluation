@@ -34,6 +34,8 @@ SCORE_COLUMNS: List[str] = [
     "aggregation",
     "weights_id",
     "region",
+    # 分组指标的组标签（球谐带的 "1_4" 等）；非分组指标为空
+    "group",
     "threshold",
     "window_h",
     "lead_h",
@@ -135,7 +137,8 @@ class ResultTables:
     """统一长表集合。
 
     Attributes:
-        scores: 评分长表，列见 ``SCORE_COLUMNS``（额外带内部透视用的 ``group``）。
+        scores: 评分长表，列见 ``SCORE_COLUMNS``；``group`` 是分组指标的组标签
+            （球谐带 ``1_4`` 等、分类检验的阈值名），非分组指标为空。
         details: 诊断量长表，列见 ``DETAIL_COLUMNS``。
         coverage: 覆盖率表，列见 ``COVERAGE_COLUMNS``。
         curves: 逐点曲线类诊断量（来自 ``MetricResult.curve``），每项形如
@@ -341,7 +344,7 @@ def build_tables(
     details = pd.DataFrame(detail_rows)
     coverage = pd.DataFrame(coverage_rows)
 
-    score_columns = SCORE_COLUMNS + ["group"]
+    score_columns = SCORE_COLUMNS
     if scores.empty:
         scores = pd.DataFrame(columns=score_columns)
     else:
