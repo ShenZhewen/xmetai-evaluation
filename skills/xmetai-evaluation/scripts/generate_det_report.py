@@ -9,15 +9,22 @@
       --model AIFS=/workspace/_XMETAI_test_results/single_aifs \\
       --model FuXi=/workspace/_XMETAI_test_results/single_fuxi \\
       --model FengQing=/workspace/_XMETAI_test_results/single_fengqing \\
-      --out reports/det_4models
+      --result reports/det_4models
 
-``--model NAME=目录`` 可重复，至少两个。目录是 ``vfc/regr_ens.py`` 批量跑出来的
-**批次归档目录**（``summary.csv`` + ``batch_meta.json`` + ``<YYYYMMDD>/``），
-不是 ``weather_field_scores`` 的产物目录——那条链路走 ``generate_report.py``。
+``--model NAME=目录`` 可重复，至少两个。目录是**评估产物目录**
+（``scores.csv`` + ``manifest.json`` + ``diagnostics/``），与
+``generate_report.py`` 吃的是同一种形状——差别在**吃几份**：那边一份出一份
+单模型报告，这边 N 份出一份横向对比报告。所以 TS 的产物目录喂不进来
+（本入口要 ``scores.csv`` 里 ``metric="rmse"`` 且
+``product_kind="deterministic"`` 的行），而集合的产物喂得进来却不该喂
+（形状一样，出的却是 ``_single`` 的章节口径）。
+
+``NAME`` 是**报告里显示的模型名**，由调用方给——不从目录名、也不从
+``manifest.run_id`` 猜（``run_id`` 是**配置名**，三者可以全都不一样）。
 
 其余选项：
 
-    --out DIR                   报告输出目录（必给，不存在会建）
+    --result DIR                   报告输出目录（必给，不存在会建）
     --title TEXT                覆盖报告标题那一行
     --change TEXT               本次改动说明，写进第一节
     --archive TEXT              归档名，写进报告抬头的「归档：」
@@ -74,13 +81,13 @@ def main(argv=None) -> int:
         description="按多个批次归档目录出图并写多模型确定性评估报告",
         epilog="示例: python skills/xmetai-evaluation/scripts/generate_det_report.py "
         "--model FGVP=evaluation_results/weather_rmse_single_fgvp "
-        "--model FuXi=evaluation_results/weather_rmse_single_fuxi --out reports/det_2models",
+        "--model FuXi=evaluation_results/weather_rmse_single_fuxi --result reports/det_2models",
     )
     parser.add_argument(
         "--model", action="append", default=None, metavar="NAME=目录", required=True,
         help="模型的批次归档目录（可重复，至少两个）",
     )
-    parser.add_argument("--out", type=Path, required=True, help="报告输出目录")
+    parser.add_argument("--result", type=Path, required=True, help="报告输出目录")
     parser.add_argument("--title", default=None, help="覆盖报告标题那一行")
     parser.add_argument("--change", default=None, help="本次改动说明，写进报告第一节")
     parser.add_argument("--archive", default=None, help="归档名，写进报告抬头的「归档：」")
@@ -111,12 +118,12 @@ def main(argv=None) -> int:
         declared[name] = variables
 
     sys.path.insert(0, str(REPO_ROOT))
-    from visualization.det_report import build_det_report, load_archive
+    from xmetai_evaluation.visualization.det_report import build_det_report, load_archive
 
     archives = [load_archive(name, directory) for name, directory in models]
     artifacts = build_det_report(
         archives,
-        args.out,
+        args.result,
         title=args.title,
         change=args.change,
         archive=args.archive,

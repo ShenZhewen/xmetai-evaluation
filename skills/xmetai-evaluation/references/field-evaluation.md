@@ -98,8 +98,12 @@
 - **`level` / `region` / `threshold` / `window_h` / `weights_id` 恒为空**：
   这是 `grid_valid_time` 协议 `defaults()` 的设计（默认口径只有
   `variable` / `sample_unit` / `unit`），不是缺数据。
-- **`group` 列不在 `scores.csv` 里**（落盘时被 `reindex(columns=SCORE_COLUMNS)` 剥掉了），
-  只在内存和 `diagnostics/scores_detail.csv` 里有。
+- **`group` 列在 `scores.csv` 里**（2026-09 起随 `SCORE_COLUMNS` 落盘，此前被
+  `reindex(columns=SCORE_COLUMNS)` 剥掉了）：球谐带行是带名（`1_4` / `5_20` …），
+  其余指标为空。按 `(variable, metric, lead_h)` 透视球谐指标时**必须带上 `group`**，
+  否则 5 个带会被平均成一个数。
+- `diagnostics/scores_detail.csv` 里的 `group` 是另一套口径：逐波数谱用
+  `k=<波数>`，总功率行用 `summary`。
 - **首/末时效不是稳定的统计量**：起报数与时段决定曲线形态，
   "涨到几倍"只在当前这套输入下成立；跨批次比较要用同样的起报集合。
 - **逐波数谱曲线在 `diagnostics/scores_detail.csv`**，`group=k=<波数>` 行里

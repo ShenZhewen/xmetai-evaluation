@@ -156,7 +156,7 @@ weather_rmse_single_fgvp    ← RMSE 批次家族
 |---|---|---|
 | 1 | `<capability>.json` | 文件名就是能力名（如 `weather_ts_det.json`） |
 | 2 | `_meta.json` 的字段组合 | `mode` + `n_members` + `aroc_windows` + `ts_windows`，见下表 |
-| 3 | `<name>.csv` 的表头 | 13 列 TS 表 vs `summary.csv` vs 其他 |
+| 3 | `<name>.csv` 的表头 | 13 列 TS 表 vs 23/24 列长表 `scores.csv` vs 其他 |
 | 4 | 目录名 | **只作最后佐证，不作为判据** |
 
 ### 归类对照表
@@ -166,7 +166,7 @@ weather_rmse_single_fgvp    ← RMSE 批次家族
 | 13 列 TS 表 + `mode: deterministic`（或 `n_members: 1`） | **确定性 TS** | `weather_ts_det` → `weather_ts_single.md` |
 | 同一套表 + `mode: ensemble` / `n_members > 1` | **集合 TS** | `weather_ts_ens` → `weather_ts_ens.md` |
 | 同上，且 `aroc_windows` 非空、目录里有 `*aroc_bss*.csv` | **概率评分也有** | 集合骨架的第六节终于有数据了（见 `precipitation-evaluation.md` §2.1） |
-| `summary.csv` + `batch_meta.json` + `<YYYYMMDD>/` | **RMSE 批次家族** | 按支线选入口：`_single`→`generate_det_report.py`、`_ens`→`generate_ens_report.py`、`_wave`→`generate_wave_report.py`，见 `rmse-batch-evaluation.md` |
+| `scores.csv`（长表）+ `manifest.json` + `diagnostics/`，`resolved_config.pipeline` 是 `weather_field_scores` | **RMSE 批次家族**（连续场） | 按支线选入口：`_single`→`generate_det_report.py`、`_ens`→`generate_ens_report.py`、`_wave`→`generate_wave_report.py`，见 `rmse-batch-evaluation.md`。**想出一份单模型的连续场报告**走 `generate_report.py`（吃同样形状，只吃一份） |
 | `_meta.json` 里有 `babj` / `tcid` / `forecast_type` | **台风路径** | `forecast_type: "det"` → `weather_typhoon_single.md`；`"ens"` → `weather_typhoon_ens.md`（**渲染器都还没做**，见下） |
 | 一堆积分清单一（`mni_csv` 那种） | **结构演示/假数据** | 用户没点名就别当结果用 |
 
@@ -221,7 +221,7 @@ results/ 下 9 个目录：
 
 ```bash
 python skills/xmetai-evaluation/scripts/generate_report.py <主模型产物目录> \
-  --out report/<报告名> --model <主模型简称> \
+  --result report/<报告名> --model <主模型简称> \
   --compare "FuXi=outputs/results/weather_ts_single_fuxi/ts_fuxi_2025.csv" \
   --compare "AIFS=outputs/results/weather_ts_single_aifs/ts_aifs_2025.csv"
 ```
@@ -276,7 +276,7 @@ python skills/xmetai-evaluation/scripts/generate_report.py <主模型产物目�
 **这些判断已经在代码里实现了**，直接调（见工作流第 4 步）：
 
 ```bash
-python skills/xmetai-evaluation/scripts/generate_report.py <产物目录> --out reports/<名字>
+python skills/xmetai-evaluation/scripts/generate_report.py <产物目录> --result reports/<名字>
 ```
 
 它会自己认能力、派发到对应模板。认不出、或者认出来但**报告模板还没做**时，
@@ -291,17 +291,19 @@ python skills/xmetai-evaluation/scripts/generate_report.py <产物目录> --out 
 | `typhoon`（`forecast_type: ens`） | 同上，集合口径（方案 A/B）+ 离散度 | ⚠️ 骨架 [`weather_typhoon_ens.md`](./assets/templates/weather_typhoon_ens.md)，**渲染器还没做** |
 | 其余流程 | CRPS、FSS、概率评分…… | ⛔ 还没做，会明确报错 |
 
-> **RMSE 批次家族不走这条路由**：`weather_rmse_<模型>_single` / `_ens` / `_wave` 吃的是多份
-> **批次归档目录**（`summary.csv` + `batch_meta.json` + `<YYYYMMDD>/`），没有
-> `manifest.json` 可供认能力，所以各走各的独立入口——`scripts/` 下
+> **RMSE 批次家族（`weather_rmse_single_<模型>` / `weather_rmse_ens_<模型>`）走的是多模型对比入口，
+> 不是因为形状不同**：它们的产物就是标准评估产物目录（`scores.csv` + `manifest.json` +
+> `diagnostics/`），`pipeline` 也正是上表里的 `weather_field_scores`，
+> 所以 `generate_report.py` 同样认得出、同样能出——**只是它一次只吃一份，出单模型报告**。
+> 要多模型横向对比就各走各的独立入口——`scripts/` 下
 > `generate_det_report.py`（单成员）/ `generate_ens_report.py`（集合）/
-> `generate_wave_report.py`（谱检验补充）。
+> `generate_wave_report.py`（谱检验补充），都是 `--model NAME=目录` 给 N 份（≥2）。
 > 骨架分别是 [`weather_rmse_single.md`](./assets/templates/weather_rmse_single.md)（单成员）、
 > [`weather_rmse_ens.md`](./assets/templates/weather_rmse_ens.md)（集合）与
 > [`weather_rmse_wave.md`](./assets/templates/weather_rmse_wave.md)（纬向 FFT + 球谐带功率谱补充分析）。
-> **三份的渲染器都能跑，但入口不能混用**：`_ens` / `_wave` 的归档喂给
-> `generate_det_report.py` 不会报错（它认 `*_ensmean.csv`），出的却是 `_single` 的章节口径。
-> 归档形状、派生指标（相对 RMSE / FA 偏差 / 频谱对数 RMS；集合对数用 **ln**、单成员用 **log10**）
+> **三份的渲染器都能跑，但入口不能混用**：集合与单成员的产物目录**形状完全一样**，
+> 集合产物喂给 `generate_det_report.py` 不会报错，出的却是 `_single` 的章节口径。
+> 产物形状、派生指标（相对 RMSE / FA 偏差 / 频谱对数 RMS；集合与谱检验用 **ln**、单成员用 **log10**）
 > 与必须一致的口径参数见 `references/rmse-batch-evaluation.md`。
 
 > 三条 TS 流程写的产物表结构相同，走的是**同一个渲染器** `ts_report.py`。
@@ -499,10 +501,11 @@ REPORT.md
      **三方交集为 0**，目前只能出 FuXi↔AIFS 那份（27 天，低于 30 天样本下限，
      报告自己会标「方向性参考」）；
   3. 概率评分（AROC / BSS）取数与绘图那一层还没做，`weather_ts_ens_prob` 标着 `[BLOCKED]`；
-  4. 球谐带功率**已经有了**（`vfc/metrics/spectrum.py:210` + `band_power_frame`），
-     `wave_report` 的 5.1–5.3 三节能渲染；但**列名前缀同族归档不一致**
-     （`spherical_pred_1_4` / `ensmean_spherical_pred_1_4`），见
-     `references/rmse-batch-evaluation.md` §5.6；
+  4. 球谐带功率**已经有渲染器**（`wave_report` 的 §5.1–5.3），数据取自长表里
+     `spherical_bands` 展开的三行，靠 **`group` 列**区分频带。
+     但**现存归档的 `scores.csv` 缺 `group` 这一列**（契约 24 列、实拍 23 列），
+     5 个频带的行混在一起认不出来，这三节会走 `SPHERICAL_ABSENT` 标「本批未出」
+     ——**重跑评测即可**，不是报告端的问题。见 `references/rmse-batch-evaluation.md` §5.6；
   5. **台风两份骨架的渲染器还没做**（`weather_typhoon_single` / `_ens`）。
      而且 `weather_typhoon_ens.md` 里的列名**全部是从 `core/tc_ref.py` 的集合分支
      读出来的，不是实拍**——第一次真跑之后要拿真实表头回来核一遍。

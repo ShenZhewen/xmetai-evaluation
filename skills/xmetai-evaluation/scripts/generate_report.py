@@ -6,7 +6,7 @@
 
     python skills/xmetai-evaluation/scripts/generate_report.py <产物目录> [选项]
 
-    --out DIR       报告输出目录（默认 reports/<run_id>）
+    --result DIR       报告输出目录（默认 reports/<run_id>）
     --model NAME    报告标题里的模型名（默认取 manifest 的 run_id）
     --change TEXT   本次改动说明，写进报告第一节
     --compare 名字=CSV路径
@@ -50,10 +50,10 @@ def main(argv=None) -> int:
     parser = argparse.ArgumentParser(
         description="按评测产物目录自动选模板，出图并写 Markdown 报告",
         epilog="示例: python skills/xmetai-evaluation/scripts/generate_report.py "
-        "evaluation_results/weather_ts_single_fgvp --out reports/weather_ts_single_fgvp",
+        "evaluation_results/weather_ts_single_fgvp --result reports/weather_ts_single_fgvp",
     )
     parser.add_argument("output_dir", type=Path, help="评测产物目录（含 manifest.json 与结果表）")
-    parser.add_argument("--out", type=Path, default=None, help="报告输出目录（默认 reports/<run_id>）")
+    parser.add_argument("--result", type=Path, default=None, help="报告输出目录（默认 reports/<run_id>）")
     parser.add_argument("--model", default=None, help="模型名（默认取 manifest 的 run_id）")
     parser.add_argument("--change", default=None, help="本次改动说明，写进报告第一节")
     parser.add_argument(
@@ -62,24 +62,24 @@ def main(argv=None) -> int:
     )
     parser.add_argument(
         "--spectrum-variable", default=None,
-        help="要看逐波数谱曲线的变量（会去读很大的 scores_detail.csv），"
+        help="要点名看某一个起报的谱曲线的变量（读 diagnostics/spectrum_by_init.csv），"
         "只在连续场链路上有意义；该变量得真算过纬向谱",
     )
     parser.add_argument(
-        "--spectrum-lead", type=float, default=None,
-        help="谱曲线的时效(h)，省略取该变量的最大时效",
+        "--spectrum-init", default=None,
+        help="谱曲线的起报时刻，按子串匹配 init_time（如 20250102），省略取最后一个起报",
     )
     args = parser.parse_args(argv)
 
     sys.path.insert(0, str(REPO_ROOT))
-    from visualization.report import build_report
+    from xmetai_evaluation.visualization.report import build_report
 
     artifacts = build_report(
         args.output_dir,
-        out_dir=args.out,
+        out_dir=args.result,
         model_name=args.model,
         spectrum_variable=args.spectrum_variable,
-        spectrum_lead=args.spectrum_lead,
+        spectrum_init=args.spectrum_init,
         change_description=args.change,
         compare=args.compare,
     )

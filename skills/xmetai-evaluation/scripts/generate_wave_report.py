@@ -1,33 +1,36 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""多个批次归档目录 → 纬向 FFT 与球谐谱补充分析报告（确定性单成员）。
+"""多个评估产物目录 → 纬向 FFT 与球谐谱补充分析报告（确定性单成员）。
 
 用法::
 
     python skills/xmetai-evaluation/scripts/generate_wave_report.py \\
-      --model AIFS=outputs/results/weather_rmse_single_aifs/single_aifs \\
-      --model FengQing=outputs/results/weather_rmse_single_fengqing/d2d283c6a2618455 \\
-      --model FGVP=outputs/results/weather_rmse_single_fgvp/single_fgvp \\
-      --model FGVP_pinpu=outputs/results/weather_rmse_single_fgvp_pinpu/dc849c75feb7d393 \\
-      --model FuXi=outputs/results/weather_rmse_single_fuxi/single_fuxi \\
-      --out report/wave_5models
+      --model AIFS=/path/to/weather_rmse_single_aifs \\
+      --model FuXi=/path/to/weather_rmse_single_fuxi \\
+      --result report/wave_2models
 
-``--model NAME=目录`` 可重复，至少两个。目录是 ``vfc/regr_ens.py`` 批量跑出来的
-**批次归档目录**（``summary.csv`` + ``batch_meta.json`` + ``<YYYYMMDD>/``），
-与 ``generate_det_report.py`` 吃的是同一种归档——两条支线的差别只在报告口径。
+``--model NAME=目录`` 可重复，至少两个。目录是**评估产物目录**
+（``scores.csv`` + ``manifest.json`` + ``diagnostics/``），与
+``generate_det_report.py`` / ``generate_ens_report.py`` 吃的是同一种形状
+——三条支线的差别只在报告口径。
+
+``NAME`` 是**报告里显示的模型名**，由调用方给——不从目录名、也不从
+``manifest.run_id`` 猜。
 
 其余选项：
 
-    --out DIR       报告输出目录（必给，不存在会建）
+    --result DIR       报告输出目录（必给，不存在会建）
     --archive TEXT  归档名，写进报告抬头与附录的「归档文件」
 
 **与 `_single` 支线的差别**：纬向谱 log-RMS 这里用 **ln**（骨架 §2.1 的定义），
 `generate_det_report.py` 用 **log10**，两者差 ×2.3026，不要互相对数。
 
-**球谐带（§5.1–5.3）的数据来自归档里的 `spherical_bands_<日期>_<变量>.csv`**
-（`vfc/regr_ens.py` 跑批量时逐 lead 落盘，列名契约见
-`vfc.metrics.spectrum.band_power_frame`）。**老归档没有这两类文件**，
-此时报告保留节位并明确标注「本批未出」，不静默省略、也不留空表。
+**球谐带（§5.1–5.3）的数据来自长表里 `spherical_bands` 展开的三行**
+（``spherical_band_power_forecast`` / ``_observation`` / ``_ratio``），
+靠 ``group`` 列区分频带（``1_4`` / ``5_20`` …）。两种情况会让这三节标
+「本批未出」：配置里没有 ``spherical_bands`` 指标；或者算了，但产物
+**缺 ``group`` 列**（长表契约是 24 列，修复前的产物只有 23 列）——
+后者重跑评测即可，不用改报告端。
 
 **本脚本只做入口**：解析参数 → 把仓库根加进 ``sys.path`` → 调
 ``visualization.wave_report.build_wave_report`` → 打印产物清单。
@@ -67,13 +70,13 @@ def main(argv=None) -> int:
         epilog="示例: python skills/xmetai-evaluation/scripts/generate_wave_report.py "
         "--model FGVP=outputs/results/weather_rmse_single_fgvp/single_fgvp "
         "--model FGVP_pinpu=outputs/results/weather_rmse_single_fgvp_pinpu/dc849c75feb7d393 "
-        "--out report/wave_2models",
+        "--result report/wave_2models",
     )
     parser.add_argument(
         "--model", action="append", default=None, metavar="NAME=目录", required=True,
         help="模型的批次归档目录（可重复，至少两个）",
     )
-    parser.add_argument("--out", type=Path, required=True, help="报告输出目录")
+    parser.add_argument("--result", type=Path, required=True, help="报告输出目录")
     parser.add_argument("--archive", default=None,
                         help="归档名，写进报告抬头与附录的「归档文件」")
     args = parser.parse_args(argv)
@@ -91,11 +94,11 @@ def main(argv=None) -> int:
         parser.error(f"模型名重复了: {names}")
 
     sys.path.insert(0, str(REPO_ROOT))
-    from visualization.det_report import load_archive
-    from visualization.wave_report import build_wave_report
+    from xmetai_evaluation.visualization.det_report import load_archive
+    from xmetai_evaluation.visualization.wave_report import build_wave_report
 
     archives = [load_archive(name, directory) for name, directory in models]
-    artifacts = build_wave_report(archives, args.out, archive=args.archive)
+    artifacts = build_wave_report(archives, args.result, archive=args.archive)
 
     print(f"\n产出 {len(artifacts)} 个文件：")
     for name, path in artifacts.items():

@@ -16,9 +16,9 @@
 
 | 能力（流程名） | 覆盖 | 状态 |
 |---|---|---|
-| `weather_field_scores` | 确定性连续场：RMSE / ACC / 预报活跃度 / 纬向谱 | ⚠️ 能力与渲染器在，格式契约骨架已删 |
+| `weather_field_scores` | 确定性连续场：RMSE / ACC / 预报活跃度 / 纬向谱 | ⚠️ 能力与渲染器在，格式契约骨架已删（单模型报告走 `generate_report.py`） |
 | TS 系列（`weather_ts_det` / `weather_ts_ens` / `fdp_precip_ts` …） | 站点降水分类检验：TS / POD / FAR / 频率偏差 | ✅ 骨架分确定性 / 集合两份 |
-| RMSE 批次家族（`weather_rmse_<模型>_single` / `_ens` / `_wave`） | 格点 RMSE / ACC / FA / 纬向谱，多模型对比 | ⚠️ 只有 `_single` 的渲染器做了 |
+| RMSE 批次家族（`weather_rmse_single_<模型>` / `weather_rmse_ens_<模型>`，外加谱检验补充报告） | 格点 RMSE / ACC / FA / 纬向谱，**多模型横向对比** | ✅ 三份骨架 + 三个渲染器都做了（`generate_det_report.py` / `_ens_` / `_wave_`） |
 | 其余流程（CRPS、FSS、概率评分、台风…） | — | ⛔ 报告模板还没做，调用时会明确报错 |
 
 **能力身份自动识别**：给一个评测产物目录，skill 从 `manifest.json` 的
@@ -32,7 +32,7 @@
 智能体跑的就是这一条：
 
 ```bash
-python skills/xmetai-evaluation/scripts/generate_report.py <产物目录> --out reports/<名字>
+python skills/xmetai-evaluation/scripts/generate_report.py <产物目录> --result reports/<名字>
 ```
 
 它从 `manifest.json` 自己认出能力（TS 系列 / 连续场），派发到对应模板，出图并写 `REPORT.md`。
@@ -51,12 +51,20 @@ Claude Code 认的是**目录形式**：`.claude/skills/<name>/SKILL.md`。
 本仓库用**复制**（不是符号链接——Windows 建符号链接要管理员或开发者模式）：
 
 ```bash
+rm -rf .claude/skills/xmetai-evaluation
 mkdir -p .claude/skills/xmetai-evaluation
 cp -r skills/xmetai-evaluation/. .claude/skills/xmetai-evaluation/
+diff -rq skills/xmetai-evaluation/ .claude/skills/xmetai-evaluation/   # 应当无输出
 ```
 
 > **改完源文件要重新复制**。`skills/` 下的是源，`.claude/skills/` 下的是副本，
 > 两边不会自动同步。
+>
+> **先 `rm -rf` 再复制，不要只 `cp -r`**：`cp -r` 只增不减，**源里删掉的文件
+> 在副本里会一直留着**。这不是假设——2026-09-21 同步时实测副本的
+> `assets/templates/` 里还躺着两份早已作废的 `README.md` 与 `ts.md`，
+> 而源目录里那 7 份 `weather_*.md` 一份都没有。没装 `rsync` 就照上面这三条来，
+> 最后那条 `diff -rq` 是验收动作。
 
 ### 2. 使用 Skill
 
@@ -135,12 +143,16 @@ skills/
 只有数值位置用 `{…}` 空着。**不是说明文档，也不参与渲染**：
 报告由主仓库的渲染器逐行拼出，骨架是给人看、给测试对的真值来源。
 按**能力家族**分文件、不按流程分——确定性两条 TS 流程共用一份 `weather_ts_single.md`。
-**文件名就是 config 名**（`weather_rmse_single_<模型>` 对 `weather_rmse_single.md`、
-`weather_rmse_ens_<模型>` 对 `weather_rmse_ens.md`、`weather_rmse_wave_<模型>` 对
-`weather_rmse_wave.md`、`weather_ts_det_*` / `fdp_precip_ts_*` 对 `weather_ts_single.md`、
+**文件名跟 config 名走**（`weather_rmse_single_<模型>` 对 `weather_rmse_single.md`、
+`weather_rmse_ens_<模型>` 对 `weather_rmse_ens.md`、
+`weather_ts_det_*` / `fdp_precip_ts_*` 对 `weather_ts_single.md`、
 `weather_ts_ens_*` 对 `weather_ts_ens.md`），
 两字母缩写（`det` / `ts` / `field`）和家族简称（`precip_ts` / `rmse_single`）都不再用。
-**`weather_field_scores` 这一族现在没有骨架了**（`field_scores.md` 已删）。
+**例外是 `weather_rmse_wave.md`**：它不由 config 名而来——**没有
+`weather_rmse_wave_*` 这个 config**，那份报告吃的是 `weather_rmse_single_<模型>` /
+`weather_rmse_ens_<模型>` 的同一批产物，只是换个口径重讲一遍谱。
+**`weather_field_scores` 这一族现在没有骨架了**（`field_scores.md` 已删）；
+注意它与 RMSE 批次家族**是同一个 pipeline**——前者出单模型报告，后者出多模型对比。
 `tests/unit/visualization/test_ts_report.py` 会实跑一遍逐项比对：
 改了渲染器的章节结构就必须同步改骨架，否则测试红。
 逐字扫描只能钉住**不含占位符**的行，所以另有一组「编号与排版」用例
@@ -343,7 +355,44 @@ skills/
     **三方共同日期为 0**，所以本轮只用 FuXi↔AIFS 的 27 天验证渲染器，
     正式三方报告等 FGVP 数据补齐
 
+- **2026-09-21**: 三份 RMSE 骨架改版 + 文档按 `xmetai_evaluation/` 实况同步
+  - **骨架改版**（`weather_rmse_single.md` / `_ens.md` / `_wave.md`）：
+    编号契约第一次写明确——正文与必出附录 `图 N：`（`_single` 必出 1–4、
+    `_ens` 必出 1–6、`_wave` 必出 1–7，其余按数据可得性出、**出不了就保留节位
+    标「本批未出」，允许出现断号**），可选块另开 `图 L*` / `图 S*` 两个命名空间，
+    **整块删掉不用重排任何编号**
+  - 骨架新增三节：**变量 × 时效 RMSE 热力图**（各自除以本模型首时效的 RMSE
+    倍数，单位无关才能同色标横比）、**谱比随时效**、**单起报谱曲线**；
+    以及「附 L 分纬度带结果」「附 S 分季节结果」两个可选块
+  - 渲染器接纬度带：`det_report.region_table()` 成为 det/ens/wave 共用的汇总，
+    正文只留全球行、附 L 只留带行（**两类行混着 `pivot_table(mean)` 会静默
+    抹平带间差异**）；并列第一按显示精度判、逐个列出，不再拿 `idxmin` 挑一个
+    冒充当赢家
+  - 新增图品类 `multi_model_rmse_heatmap` / `ensemble_rmse_heatmap` /
+    `spectrum_curve_<变量>_<起报>`；**「谱比随时效」渲染器和骨架都留着但必然
+    是本批未出**——产物里没有任何逐 lead × 逐波数的谱（长表那条是标量、
+    `spectrum_by_init` 没有 lead 列）
+  - **文档按仓库实况重写**：`references/rmse-batch-evaluation.md` 的 §1 归档形状
+    与 §4 口径参数整节重写，SKILL.md 的归类判据 / RMSE 家族说明 / 已知缺口同步，
+    三个入口脚本的 docstring 同步。作废的东西统一登记在文首那条 ⚠️ 里
+  - **三处作废说法**（旧文档写于另一个仓库布局，本仓库里没有对应物）：
+    `vfc/regr_ens.py` / `vfc/regr_summary.py` / `vfc/regr_pair.py` 全不存在
+    （只有 `xmetai_evaluation/`）；`--summarize-det` / `--summarize-ens`
+    两个开关不存在；「批次归档 = `summary.csv` + `batch_meta.json` +
+    `<YYYYMMDD>/`、没有 `manifest.json`」不成立——产物就是标准评估产物目录
+    （`scores.csv` + `manifest.json` + `diagnostics/`），`pipeline` 也正是
+    `weather_field_scores`。RMSE 家族单开入口的原因是**多模型对比**，不是形状不同
+  - **实拍发现、写进文档让下次不用重新发现**：
+    (a) 长表契约 **24 列**（含 `group`），而现存归档的 `scores.csv` 只有 **23 列**、
+    没有 `group` —— 球谐带 5 个频带的行因此认不出来，`wave_report` §5.1–5.3
+    会标「本批未出」，**重跑评测即可**；
+    (b) `manifest.json` 的 `artifacts` 存的是**写盘时的绝对路径**，
+    产物目录拷走后即失效，别拿它定位文件；
+    (c) `--model NAME=目录` 的 `NAME` 与目录名、与 `manifest.run_id`
+    **三者可以全都不一样**（实测把 FuXi 的产物拷进 `..._fgvp` 目录，
+    `run_id` 照样是 `..._fuxi`）
+
 ---
 
 **维护者**: 沈哲文 (szw)
-**最后更新**: 2026-09-16
+**最后更新**: 2026-09-21

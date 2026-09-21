@@ -11,9 +11,14 @@
 | RMSE 批次家族（single / ens / wave）的口径与判读 | `rmse-batch-evaluation.md` |
 
 **冲突时以代码为准。** 本文件是代码的散文镜像：分类指标实现在
-`vfc/metrics/categorical.py`，报告侧汇总在 `visualization/ts_report.py`；
+`xmetai_evaluation/metrics/categorical.py`，报告侧汇总在 `visualization/ts_report.py`；
 连续场指标逐条对应 `visualization/field_report.py`（详见 `field-evaluation.md`）；
-概率指标在 `core/categorical_ref.py` 的 `ProbEventHistogram`。**改公式先改代码，再回来改这里。**
+谱族（纬向谱 / 球谐带）在 `metrics/specialized.py`。
+**改公式先改代码，再回来改这里。**
+
+> ⚠️ 本文件早期版本引用的 `vfc/...` 路径**在本仓库不存在**——那套布局已经
+> 换成了 `xmetai_evaluation/`。下文凡还留着 `vfc/` 的行都是没改完的，
+> 以 `xmetai_evaluation/` 下的同名模块为准。
 
 ---
 
@@ -160,9 +165,10 @@ AROC 范围 [0.5, 1]，0.5 = 无技巧（等于瞎猜），1 = 完美区分
 
 ## 3. 集合连续场指标
 
-对应 `weather_rmse_ens` 系列：逐日值由 `vfc/regr_ens.py` 写盘
-（`crps_<name>.csv` / `spread_<name>.csv` / `rmse_<name>_ensmean.csv`），
-跨日汇总在 `vfc/regr_summary.py`。归档形状与判读见 `rmse-batch-evaluation.md`。
+对应 `weather_rmse_ens_<模型>` 系列。这些量都以**评估产物目录**的形式落盘，
+数值在长表 `scores.csv` 里：`crps` / `spread` / `spread_error_ratio` 三行
+（`product_kind="ensemble"`），集合平均场的 `rmse` 则与确定性同名、
+靠 `product_kind` 区分。产物形状与判读见 `rmse-batch-evaluation.md`。
 
 ### 3.1 CRPS（连续排序概率评分）
 
@@ -224,7 +230,10 @@ CRPS = ∫ (F(x) − H(x − o))² dx       越低越好，单位同被评变量
 的功率谱，预报与实况各一条。**只保留功率、不含相位**——所以它能说明
 "能量在各尺度上分布得对不对"，**不能**说明"位置对不对"。
 
-实现：`vfc/metrics/spectrum.py` 的 `zonal_spectrum()`。
+实现：`xmetai_evaluation/metrics/specialized.py` 的 `zonal_spectrum()`
+（`:334`）与 `ZonalSpectrum`（`:400`，`max_wavenumber` 控制取到第几个波数）。
+逐波数曲线不在长表里，走 `spectrum` writer 落到
+`diagnostics/spectrum_<变量>.csv`（全体平均）与 `spectrum_by_init.csv`（逐起报）。
 
 ### 5.2 log-RMS 口径
 
@@ -235,19 +244,36 @@ CRPS = ∫ (F(x) − H(x − o))² dx       越低越好，单位同被评变量
 取对数是为了让**各个波数等权**——不取的话高波数的大功率会淹没低波数。
 ×100 是把它变成"百分数量级"便于读。
 
-> ⚠️ **底数在仓库里有两套说法**：实现（`visualization/det_report.py:551`）
-> 用的是 **log10**，而 `assets/templates/weather_rmse_wave.md` 的骨架文字写的是
-> **ln**。两者差一个 ×2.3026 的因子，**同一批数按两种底数算出来不一样**。
-> 以代码为准（log10）；骨架那处是照抄源报告的文字，**尚未与实现核对**。
+> ⚠️ **底数在三条支线之间不一致，这是现行代码的真实状态**：
+> `det_report.py`（`:810`）用 **log10**，`ens_report.py`（`:282`）与
+> `wave_report.py`（`:253`、`:389`）用 **ln**，两者差一个 ×2.3026 的因子。
+> 两个渲染器都**在正文里自己声明了底数并互相点名**，所以单看一份报告不会错；
+> **跨份报告比这个数之前必须先统一底数**。要不要把三条支线对齐是待定决策
+> （改了会让已有归档的数整体变样，所以没有擅自动）。
 
 ### 5.3 球谐带功率
 
 把场展开成球谐系数，按**总阶数**分带汇总功率。与纬向 FFT 的区别：
 球谐是**二维**展开，能同时刻画经向与纬向尺度；纬向 FFT 只沿经度做。
 
-**当前状态：球谐在代码里不存在。** `vfc/metrics/spectrum.py:2` 与
-`vfc/regr_pair.py:145` 都只留了一句「球谐升级备忘」，没有实现。
-`weather_rmse_wave.md` 骨架里的球谐带三节（5.1–5.3）目前**没有数据来源**。
+**实现：`metrics/specialized.py` 的 `spherical_band_power()`（`:656`）与
+`SphericalBands`（`:686`），频带定义在 `DEFAULT_SPHERICAL_BANDS`（`:498`）。**
+结果作为 `spherical_bands` 指标展开成三个量落在长表里：
+`spherical_band_power_forecast` / `_observation` / `_ratio`，
+靠 **`group` 列**区分频带（`1_4` / `5_20` …）。
+
+**球谐带恒全球，这是刻意的**——在掩掉一部分纬度的子区域上做二维球谐展开，
+得到的不是同一个物理量。**纬向谱同样恒全球**（实测 `spectrum_power_ratio`
+的行 `region` 全为空，与球谐带一样）。
+
+分带的只有**格点标量指标**：`rmse` / `acc` / `activity_*` / `crps` /
+`spread` / `spread_error_ratio`——每一个 (起报, 时效) 写一行全球加每个带一行。
+判据是「这个量能不能在子区域上重新定义」，谱类不能、标量能。
+
+> ⚠️ **现存归档认不出频带**：长表契约是 **24 列**（含 `group`，见
+> `output/table.py:37`），而修复前跑出来的产物只有 **23 列、没有 `group`**——
+> 5 个频带的行混在一起无法区分，`wave_report` 的 §5.1–5.3 会标「本批未出」。
+> **重跑评测即可**，不是报告端的问题。
 
 ---
 
