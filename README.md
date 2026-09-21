@@ -54,7 +54,6 @@ xmetai-evaluation/
 │   ├── pipeline/                   # runner(唯一编排) / spec / pipelines / protocols / matcher
 │   ├── output/                     # store / table（统一长表与落盘）
 │   └── visualization/              # precipitation_plots / ts_report
-├── tests/                          # unit + integration
 ├── ref/                            # 参考实现（只读档案，不入库、不参与运行）
 ├── evaluation_results/             # 评测产物（不入库）
 └── reports/                        # 报告图件（不入库）
@@ -72,6 +71,58 @@ cli → load_config(EvalConfig) → PipelineSpec(流程模板+数据)
 - **流程模板**（`pipeline/pipelines.py`）只声明「怎么算」：协议 + 变换链 + 指标 + 输出视图。
 - **配置**（`configs/*.py`）只声明「算什么」：数据在哪、评哪段时间。
 - **组件注册**（`components.py`）：新增数据源/指标只加注册项，不动 Runner。
+
+## 配置
+
+配置是一个 `EvalConfig` 实例（`configs/base.py`），核心字段：
+
+| 字段 | 含义 |
+|---|---|
+| `pipeline` | 走哪套流程模板（必填）；写成列表则按顺序各跑一段，结果合并落同一个 `output_dir` |
+| `forecast_reader` / `observation_reader` | 数据源：`{"type": <reader>, "root_dir": ..., "variable": ...}` |
+| `reference_reader` | 参考场：气候态（ACC/活跃度需要）或气候概率（BSS 需要）。配置里给了、但某段的指标用不上时不会构建 |
+| `start_date` / `end_date` | 评测时段（`YYYYMMDD` 或 `YYYYMMDDHH`） |
+| `output_dir` | 结果输出目录 |
+| `transform_options` / `metric_options` | 覆盖模板里的变换/指标参数 |
+| `writers` | 覆盖模板的输出视图（默认 `csv_long`） |
+
+最小示例：
+
+```python
+from xmetai_evaluation.configs.base import EvalConfig
+
+cfg = EvalConfig(
+    name="my_eval",
+    description="FuXi 集合降水分类检验",
+    pipeline="weather_ts_ens",
+    forecast_reader={"type": "fuxi_ens", "root_dir": "/data/fuxi_ens", "variable": "tp", "step_hours": 6.0},
+    observation_reader={"type": "station", "root_dir": "/data/station", "variable": "precipitation"},
+    start_date="20250101",
+    end_date="20251231",
+    output_dir="evaluation_results/my_eval",
+)
+```
+
+要注意 `transform_options` / `metric_options` / `options` 是**各段共用**的：配置里写 `{"time_window_accumulator": {"window_hours": 6}}` 会把每一段的窗口都改成 6。窗口属于"怎么算"，写在模板里（`pipeline/pipelines.py`）。多段的完整例子见 `configs/weather_ts_ens_fuxi.py`。
+
+内置配置用环境变量覆盖数据路径与时段：`START_DATE` / `END_DATE` / `EVAL_OUTPUT` 各配置通用；
+数据路径按配置各取所需——`FUXI_OUTPUT` / `FUXI_ENS_OUTPUT`（FuXi 确定性 / 集合）、`FENGQING_OUTPUT`、
+`FGVP_OUTPUT`、`STATION_OBS` / `STATION_LIST`（站点观测与白名单）、`BSS_REF`（气候概率参考）、
+`ERA5_CLIMO`（ERA5 气候态）、`FDP_CRA_ROOT` / `CRA_CLI_ROOT`（FDP 的要素场与气候态参考）。
+
+### 批量评测（一份文件评多个模型）
+
+配置模块也可以定义 `cfgs = [EvalConfig(...), ...]`（复数）而不是 `cfg`：
+
+```bash
+xmetai-eval --config weather_rmse_single_multi
+```
+
+框架按列表**顺序**逐个执行（不并行：每个 run 内部已经吃满 n_workers）。
+单个模型失败会记日志并继续跑后面的，结束时统一报成败、任一失败退出码为 1。
+观测/气候态/时段/指标等共用项写一份、预报源按模型换，见
+`configs/weather_rmse_single_multi.py` 的 `MODELS` 表；每个模型各落各的
+`output_dir`，产物与单模型配置完全同构，下游报告与对拍不用改。
 
 ## 执行策略（并发与数据加载）
 
@@ -121,6 +172,59 @@ execution = {
 }
 ```
 
+### 并发形态：serial / threads / processes
+
+| 形态 | 结构 | 数据驻留 | 适合 |
+|---|---|---|---|
+| `serial` | 单进程顺序跑块 | 每块现读现弃 | 冒烟、单块 |
+| `threads` | **1 个进程**内 N 线程并发块 | resident / window 全局只有 1 份（loader 有锁）；预报各块自读 | 轻指标（站点 TS 等），典型加速 2~3× |
+| `processes` | 进程池一次建好活到跑完；块按**时间连续分段**，一段固定一个子进程顺序处理 | fork 下 resident 由父进程预热、子进程 COW 共享 ≈ 1 份；spawn 下每个子进程各持一份副本 | 重指标（谱/CRPS/FSS），真并行 |
+
+- **threads 的原理与优势**：GIL 让纯 Python 逻辑串行，但 numpy 计算、
+  zarr/NetCDF 读盘都释放 GIL，轻指标能蹭到 IO+部分计算的并行。它独有的
+  姿势是把窗宽开大（如 `window:20`），5 个并发的相邻日块共用同一个观测
+  窗口块——数据全局只有一份，内存与并发数无关。
+- **processes 的内存账**：单进程 = 块工作集（预报窗口 + 观测切片 + 配对
+  批次，随 `chunk_days × lead_chunk_days` 涨）；总量 ≈ resident 驻留 ×1 +
+  工作集 × `n_workers`。**`n_workers` 由内存上限决定，不是核数**。单块内存的
+  主旋钮是 `lead_chunk_days`（时效跨度，集合预报上省得最多），`chunk_days`
+  管起报跨度。Linux fork 下 resident 只存 1 份（COW 共享）；spawn 平台每个
+  子进程各存一份，`n_workers` 要按这个算内存。
+- **auto**：单块 = serial、重指标 = processes、轻指标 = threads。
+
+要点：
+
+- **块是唯一并行单位**，块内数据用完即弃、块间零共享；进程模式下块按
+  **时间连续分段**，一段固定给一个子进程顺序处理——观测 `window` 缓存
+  只有在"同一进程先后处理相邻块"时才能命中，随机抢块会让它形同虚设。
+  fork 下由父进程预热 resident 缓存、子进程写时复制共享；spawn 平台没有
+  共享，但角色声明是可序列化的，子进程会反序列化一份 loader 副本自建
+  缓存（段内窗块照样复用，代价是内存 ×段数）。两条路都不改变结果。
+- **窗块预取**：非 threads 形态下，读满一个 `window` 块后，后台线程会把下一个
+  块提前读进来。完整口径（开关条件、预测依据、三道防白读的闸、值不值的判据）
+  见上面「[数据预取](#数据预取把下一个窗块提前读进来)」。
+- **块级进度看哪行**：进程模式下父进程要等**整段**返回才拿到结果（那条 tqdm
+  因此全程不动，`.states/` 也是段末才一次性落盘），所以块级进度由子进程自己报：
+  每 `PROGRESS_EVERY` 块（`execution/executor.py`，默认 50）打一行
+
+     段 2/5 进度 150/1114 块（已用 540s，3.60s/块，按此速率还需 3470s，最新块 20250312_L24-48）
+
+  5 段并行就是 5 条这样的流，段末那块必打。速率与剩余时间只看本段已跑部分的
+  均值，前慢后快时偏保守。
+- **日志量的口径**：逐块流水（`起报时间`、`预报/实况读取完成`、`配对完成`、
+  `同网格按索引对齐` 这些每块各一次的行）是 DEBUG；INFO 只留块级进度、段级
+  汇总与真正的告警。要看逐块细节用 `--log-file`（文件 handler 恒为 DEBUG，
+  内容一条不少）。每块都会重复的静态 WARNING（"这些变量在预报或观测中不存在，
+  已跳过"）按消息去重，每进程只打一次——缺哪些变量是配置与数据源决定的事实，
+  重复 5568 遍只会把真告警淹掉。
+- **切块不改变结果**：所有内置指标的状态都是和式（sum/count/moment），
+  归并可交换；grid 协议"同一 valid_time 只认最新起报"的口径由
+  `duplicate_key_policy="replace"` 在跨块归并时重现——比的是坐标里的
+  `init_time` 而不是块序，因为同一个有效时刻可以由 (早起报, 长时效) 和
+  (晚起报, 短时效) 两条路径够到，最新起报配的反而是最小 lead。
+- 逐段执行口径写进 `manifest.json` 的 `execution` 键（形态/块数/画像），
+  结果可比的前提是知道它是在什么策略下算的。
+
 ### 时效维：延伸期与集合预报的内存旋钮
 
 `chunk_days` 只切起报，**不切时效**——一个块仍要把整段时效跨度全物化。延伸期
@@ -140,7 +244,6 @@ execution = {
 
 集合成员**不**单独切：CRPS 这类指标需要同一 (起报, 时效) 的全部成员，时效窗
 一开，单块的成员场自然就小了。
-
 
 `loads` 里的 `window` 可以不带数字（`{"observation": "window"}`）：计划层自动定窗宽
 = **整段时效跨度**（`max(leads)/24` 天）+ 预热 + 块内起报跨度（`chunk_days` 天），
@@ -168,65 +271,6 @@ reader 自己决定读文件哪些部分（NetCDF/HDF5 支持索引级部分读�
 按 day-of-year 只挑请求日子 ± 平滑窗的几行，还分纬度带读）。大 NC 走
 window 从不需要整文件进内存；同一进程先后处理相邻块直接命中窗口缓存，
 全年顺序跑每段数据基本只从盘上读一次。
-
-### 数据预取：把下一个窗块提前读进来
-
-`window` 角色的读盘可以和块内计算叠起来：读完当前覆盖的块之后，后台线程把
-**按日期顺序的下一个块**预读进待用槽；下一个请求到了直接命中，省掉一次同步读。
-实现全在 `execution/loader.py` 的 `_schedule_next_block` / `_prefetch_loop`。
-
-**什么时候开。** `RunLoader(prefetch=...)` 由计划层按并发形态定：`processes` 与
-`serial` 开，`threads` 关。threads 下多个块并发读同一个 loader，各自排一个预取只会
-互相顶掉；而且它本来就有 N 路并发读，轮不到预取补空档。另外**只有 `window` 角色会排**
-——`slice` 没有"下一个块"的概念，`resident` 整 run 只读一次。
-
-**预取哪个块。** `max(本次请求覆盖的块号) + 1`。依据是请求跨度随时间**单调向后延伸**
-（时效窗推进抬 `lead_max`、起报组推进抬起报），下一次要读的块几乎总是当前最大块号 +1。
-块号不存在（已经是最后一块）就不排。
-
-**结构：一条队列 + 一个线程 + 每角色一个待用槽。**
-
-```
-_schedule_next_block()        在物化路径里同步调用
-    ├─ 过三道闸（见下）
-    ├─ 懒启后台线程（daemon，全 loader 只 1 个，名 runloader-prefetch）
-    └─ queue.put((role, spec, 块号, 块跨度))
-
-_prefetch_loop()              后台线程
-    while True:
-        role, spec, index, span = queue.get()
-        bundle = self._build(spec, span)      ← 同一个 builder
-        if 槽里没有更新的块: 槽 = (index, bundle)
-```
-
-预取走的是**同一个 builder**，所以它花的读盘时间同样计入 `builder_seconds`，读来的块
-也照样算进日志里那个「物化 N 次」——这是有意的，让"预取多读了几次、值不值"可测。
-
-**领取。** 请求进来先看待用槽：块号还在本次请求里、且窗块缓存中没有，就直接搬进窗块
-缓存（跳过同步读）；块号已经落到请求后面（`< min(wanted)`）就扔掉；其余留在槽里等下次。
-
-**三道防白读的闸。**
-
-1. 槽里已经是同一个块 → 不重排。
-2. 该块**已经在窗块缓存里**（±1 保留正好把它留着）→ 不重排。没有这道闸，预取会在
-   **每个请求**上重读一次"当前块的下一个块"——±1 保留恰好让目标块常驻。
-3. 后台线程读得慢、期间又排了更新的块 → 旧结果丢掉（槽只放一个）。
-
-**代价。** 内存每角色 +1 个窗块（稳态窗块缓存是当前块 ±1 共 3 块，加预取最多 4 块）。
-**正确性零代价**：预取不参与计算、不改变任何结果，猜错只是白读一次，真正的请求到了
-按正常路径物化；预取失败只记 DEBUG、不抛。
-
-**值不值。** 上限收益 ≈ `min(1, 读盘/计算)`——计算占九成时它只值一成。看日志那行
-
-    读盘占比：builder 累计 X.Xs / 容量 Y.Ys（… × N worker）= ZZ%；物化 N 次、缓存命中 N 次
-
-`ZZ%` 只有个位数就说明读盘本来不是瓶颈，预取白占内存；关掉的方式是把 `plan.py` 里的
-`prefetch=mode != "threads"` 改成 `False`。
-
-> **一条必须守住的不变量**：预取线程绝不能在 **fork 之前**启动过。`threading.Lock`
-> 不可重入、fork 又不复制持锁的线程，父进程若在 fork 前起过预取线程并恰好持锁，
-> 子进程里那把锁就是死的。现在靠"父进程只 `loader.warm()` 读 `resident`、从不读窗块"
-> 保证。spawn 平台无此问题（`__setstate__` 会把线程与队列重建）。
 
 ### 块大小什么时候调：`chunk_days` / `lead_chunk_days`
 
@@ -338,6 +382,65 @@ resident 预热和进程池都不建）。
 vs 再按时效切窗 vs 换并发形态，`scores.csv` 必须逐行一致，且 `manifest` 里不许有
 失败块。
 
+### 数据预取：把下一个窗块提前读进来
+
+`window` 角色的读盘可以和块内计算叠起来：读完当前覆盖的块之后，后台线程把
+**按日期顺序的下一个块**预读进待用槽；下一个请求到了直接命中，省掉一次同步读。
+实现全在 `execution/loader.py` 的 `_schedule_next_block` / `_prefetch_loop`。
+
+**什么时候开。** `RunLoader(prefetch=...)` 由计划层按并发形态定：`processes` 与
+`serial` 开，`threads` 关。threads 下多个块并发读同一个 loader，各自排一个预取只会
+互相顶掉；而且它本来就有 N 路并发读，轮不到预取补空档。另外**只有 `window` 角色会排**
+——`slice` 没有"下一个块"的概念，`resident` 整 run 只读一次。
+
+**预取哪个块。** `max(本次请求覆盖的块号) + 1`。依据是请求跨度随时间**单调向后延伸**
+（时效窗推进抬 `lead_max`、起报组推进抬起报），下一次要读的块几乎总是当前最大块号 +1。
+块号不存在（已经是最后一块）就不排。
+
+**结构：一条队列 + 一个线程 + 每角色一个待用槽。**
+
+```
+_schedule_next_block()        在物化路径里同步调用
+    ├─ 过三道闸（见下）
+    ├─ 懒启后台线程（daemon，全 loader 只 1 个，名 runloader-prefetch）
+    └─ queue.put((role, spec, 块号, 块跨度))
+
+_prefetch_loop()              后台线程
+    while True:
+        role, spec, index, span = queue.get()
+        bundle = self._build(spec, span)      ← 同一个 builder
+        if 槽里没有更新的块: 槽 = (index, bundle)
+```
+
+预取走的是**同一个 builder**，所以它花的读盘时间同样计入 `builder_seconds`，读来的块
+也照样算进日志里那个「物化 N 次」——这是有意的，让"预取多读了几次、值不值"可测。
+
+**领取。** 请求进来先看待用槽：块号还在本次请求里、且窗块缓存中没有，就直接搬进窗块
+缓存（跳过同步读）；块号已经落到请求后面（`< min(wanted)`）就扔掉；其余留在槽里等下次。
+
+**三道防白读的闸。**
+
+1. 槽里已经是同一个块 → 不重排。
+2. 该块**已经在窗块缓存里**（±1 保留正好把它留着）→ 不重排。没有这道闸，预取会在
+   **每个请求**上重读一次"当前块的下一个块"——±1 保留恰好让目标块常驻。
+3. 后台线程读得慢、期间又排了更新的块 → 旧结果丢掉（槽只放一个）。
+
+**代价。** 内存每角色 +1 个窗块（稳态窗块缓存是当前块 ±1 共 3 块，加预取最多 4 块）。
+**正确性零代价**：预取不参与计算、不改变任何结果，猜错只是白读一次，真正的请求到了
+按正常路径物化；预取失败只记 DEBUG、不抛。
+
+**值不值。** 上限收益 ≈ `min(1, 读盘/计算)`——计算占九成时它只值一成。看日志那行
+
+    读盘占比：builder 累计 X.Xs / 容量 Y.Ys（… × N worker）= ZZ%；物化 N 次、缓存命中 N 次
+
+`ZZ%` 只有个位数就说明读盘本来不是瓶颈，预取白占内存；关掉的方式是把 `plan.py` 里的
+`prefetch=mode != "threads"` 改成 `False`。
+
+> **一条必须守住的不变量**：预取线程绝不能在 **fork 之前**启动过。`threading.Lock`
+> 不可重入、fork 又不复制持锁的线程，父进程若在 fork 前起过预取线程并恰好持锁，
+> 子进程里那把锁就是死的。现在靠"父进程只 `loader.warm()` 读 `resident`、从不读窗块"
+> 保证。spawn 平台无此问题（`__setstate__` 会把线程与队列重建）。
+
 ### 跑之前怎么估
 
 正式跑一个全年段之前，要能先答出三个数：**切多少块、单块读多少时效、要吃多少内存**。
@@ -417,59 +520,6 @@ echo "已用: $(cat /sys/fs/cgroup/memory.current)"
 正式跑时原样命中（前提是 `resume: True`），不会白算——这就是配置里 `limit=None` 旁边那句
 注释的由来。反过来，**改 `chunk_days` / `lead_chunk_days` / `window_hours` 之后重跑不会复用**，
 `chunk_id` 变了就是另一批块。
-
-### 并发形态：serial / threads / processes
-
-| 形态 | 结构 | 数据驻留 | 适合 |
-|---|---|---|---|
-| `serial` | 单进程顺序跑块 | 每块现读现弃 | 冒烟、单块 |
-| `threads` | **1 个进程**内 N 线程并发块 | resident / window 全局只有 1 份（loader 有锁）；预报各块自读 | 轻指标（站点 TS 等），典型加速 2~3× |
-| `processes` | 进程池一次建好活到跑完；块按**时间连续分段**，一段固定一个子进程顺序处理 | fork 下 resident 由父进程预热、子进程 COW 共享 ≈ 1 份；spawn 下每个子进程各持一份副本 | 重指标（谱/CRPS/FSS），真并行 |
-
-- **threads 的原理与优势**：GIL 让纯 Python 逻辑串行，但 numpy 计算、
-  zarr/NetCDF 读盘都释放 GIL，轻指标能蹭到 IO+部分计算的并行。它独有的
-  姿势是把窗宽开大（如 `window:20`），5 个并发的相邻日块共用同一个观测
-  窗口块——数据全局只有一份，内存与并发数无关。
-- **processes 的内存账**：单进程 = 块工作集（预报窗口 + 观测切片 + 配对
-  批次，随 `chunk_days × lead_chunk_days` 涨）；总量 ≈ resident 驻留 ×1 +
-  工作集 × `n_workers`。**`n_workers` 由内存上限决定，不是核数**。单块内存的
-  主旋钮是 `lead_chunk_days`（时效跨度，集合预报上省得最多），`chunk_days`
-  管起报跨度。Linux fork 下 resident 只存 1 份（COW 共享）；spawn 平台每个
-  子进程各存一份，`n_workers` 要按这个算内存。
-- **auto**：单块 = serial、重指标 = processes、轻指标 = threads。
-
-要点：
-
-- **块是唯一并行单位**，块内数据用完即弃、块间零共享；进程模式下块按
-  **时间连续分段**，一段固定给一个子进程顺序处理——观测 `window` 缓存
-  只有在"同一进程先后处理相邻块"时才能命中，随机抢块会让它形同虚设。
-  fork 下由父进程预热 resident 缓存、子进程写时复制共享；spawn 平台没有
-  共享，但角色声明是可序列化的，子进程会反序列化一份 loader 副本自建
-  缓存（段内窗块照样复用，代价是内存 ×段数）。两条路都不改变结果。
-- **窗块预取**：非 threads 形态下，读满一个 `window` 块后，后台线程会把下一个
-  块提前读进来。完整口径（开关条件、预测依据、三道防白读的闸、值不值的判据）
-  见上面「[数据预取](#数据预取把下一个窗块提前读进来)」。
-- **块级进度看哪行**：进程模式下父进程要等**整段**返回才拿到结果（那条 tqdm
-  因此全程不动，`.states/` 也是段末才一次性落盘），所以块级进度由子进程自己报：
-  每 `PROGRESS_EVERY` 块（`execution/executor.py`，默认 50）打一行
-
-     段 2/5 进度 150/1114 块（已用 540s，3.60s/块，按此速率还需 3470s，最新块 20250312_L24-48）
-
-  5 段并行就是 5 条这样的流，段末那块必打。速率与剩余时间只看本段已跑部分的
-  均值，前慢后快时偏保守。
-- **日志量的口径**：逐块流水（`起报时间`、`预报/实况读取完成`、`配对完成`、
-  `同网格按索引对齐` 这些每块各一次的行）是 DEBUG；INFO 只留块级进度、段级
-  汇总与真正的告警。要看逐块细节用 `--log-file`（文件 handler 恒为 DEBUG，
-  内容一条不少）。每块都会重复的静态 WARNING（"这些变量在预报或观测中不存在，
-  已跳过"）按消息去重，每进程只打一次——缺哪些变量是配置与数据源决定的事实，
-  重复 5568 遍只会把真告警淹掉。
-- **切块不改变结果**：所有内置指标的状态都是和式（sum/count/moment），
-  归并可交换；grid 协议"同一 valid_time 只认最新起报"的口径由
-  `duplicate_key_policy="replace"` 在跨块归并时重现——比的是坐标里的
-  `init_time` 而不是块序，因为同一个有效时刻可以由 (早起报, 长时效) 和
-  (晚起报, 短时效) 两条路径够到，最新起报配的反而是最小 lead。
-- 逐段执行口径写进 `manifest.json` 的 `execution` 键（形态/块数/画像），
-  结果可比的前提是知道它是在什么策略下算的。
 
 ## 已注册组件
 
@@ -597,20 +647,6 @@ echo "已用: $(cat /sys/fs/cgroup/memory.current)"
 | `scores.json` | 评分 JSON 快照 |
 
 当前已接好的内置任务配置（`configs/`）：`weather_ts_single_fgvp`（FGVP 确定性降水）、`weather_ts_ens_fuxi`（FuXi 集合降水，24h TS + 6h 概率两段一趟跑完）、`weather_rmse_single_fuxi`（FuXi 确定性连续量）、`weather_rmse_single_fengqing`（风清单卡确定性连续量）、`weather_rmse_ens_fuxi`（FuXi 集合场，含 CRPS）、`fdp_rmse_single_fengqing`（FDP 要素检验）、`weather_rmse_single_multi`（批量，见下）。
-
-### 批量评测（一份文件评多个模型）
-
-配置模块也可以定义 `cfgs = [EvalConfig(...), ...]`（复数）而不是 `cfg`：
-
-```bash
-xmetai-eval --config weather_rmse_single_multi
-```
-
-框架按列表**顺序**逐个执行（不并行：每个 run 内部已经吃满 n_workers）。
-单个模型失败会记日志并继续跑后面的，结束时统一报成败、任一失败退出码为 1。
-观测/气候态/时段/指标等共用项写一份、预报源按模型换，见
-`configs/weather_rmse_single_multi.py` 的 `MODELS` 表；每个模型各落各的
-`output_dir`，产物与单模型配置完全同构，下游报告与对拍不用改。
 
 ## 评测数据与格式
 
@@ -817,44 +853,6 @@ observation_reader={
 
 `variable` 给单个变量名、`variables` 给列表，两者都认；不写则用流程模板声明的。
 
-## 配置
-
-配置是一个 `EvalConfig` 实例（`configs/base.py`），核心字段：
-
-| 字段 | 含义 |
-|---|---|
-| `pipeline` | 走哪套流程模板（必填）；写成列表则按顺序各跑一段，结果合并落同一个 `output_dir` |
-| `forecast_reader` / `observation_reader` | 数据源：`{"type": <reader>, "root_dir": ..., "variable": ...}` |
-| `reference_reader` | 参考场：气候态（ACC/活跃度需要）或气候概率（BSS 需要）。配置里给了、但某段的指标用不上时不会构建 |
-| `start_date` / `end_date` | 评测时段（`YYYYMMDD` 或 `YYYYMMDDHH`） |
-| `output_dir` | 结果输出目录 |
-| `transform_options` / `metric_options` | 覆盖模板里的变换/指标参数 |
-| `writers` | 覆盖模板的输出视图（默认 `csv_long`） |
-
-最小示例：
-
-```python
-from xmetai_evaluation.configs.base import EvalConfig
-
-cfg = EvalConfig(
-    name="my_eval",
-    description="FuXi 集合降水分类检验",
-    pipeline="weather_ts_ens",
-    forecast_reader={"type": "fuxi_ens", "root_dir": "/data/fuxi_ens", "variable": "tp", "step_hours": 6.0},
-    observation_reader={"type": "station", "root_dir": "/data/station", "variable": "precipitation"},
-    start_date="20250101",
-    end_date="20251231",
-    output_dir="evaluation_results/my_eval",
-)
-```
-
-要注意 `transform_options` / `metric_options` / `options` 是**各段共用**的：配置里写 `{"time_window_accumulator": {"window_hours": 6}}` 会把每一段的窗口都改成 6。窗口属于"怎么算"，写在模板里（`pipeline/pipelines.py`）。多段的完整例子见 `configs/weather_ts_ens_fuxi.py`。
-
-内置配置用环境变量覆盖数据路径与时段：`START_DATE` / `END_DATE` / `EVAL_OUTPUT` 各配置通用；
-数据路径按配置各取所需——`FUXI_OUTPUT` / `FUXI_ENS_OUTPUT`（FuXi 确定性 / 集合）、`FENGQING_OUTPUT`、
-`FGVP_OUTPUT`、`STATION_OBS` / `STATION_LIST`（站点观测与白名单）、`BSS_REF`（气候概率参考）、
-`ERA5_CLIMO`（ERA5 气候态）、`FDP_CRA_ROOT` / `CRA_CLI_ROOT`（FDP 的要素场与气候态参考）。
-
 ## 如何扩展
 
 - **新增模型 / 数据集**：已支持的文件布局 → 写一份数据源配置即可；全新格式 → 在 `io/` 实现 Reader，再到 `components.py` 注册。
@@ -862,8 +860,3 @@ cfg = EvalConfig(
 - **新增流程**：在 `pipeline/pipelines.py` 加一个 `PipelineTemplate`。
 - **新增数据源/算法** = 加注册项；**新增评测** = 加配置，代码不动。
 
-## 测试
-
-```bash
-pytest
-```
