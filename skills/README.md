@@ -16,9 +16,10 @@
 
 | 能力（流程名） | 覆盖 | 状态 |
 |---|---|---|
-| `weather_field_scores` | 确定性连续场：RMSE / ACC / 预报活跃度 / 纬向谱 | ✅ |
-| TS 系列（`weather_ts_det` / `weather_ts_ens` / `fdp_precip_ts` …） | 站点降水分类检验：TS / POD / FAR / 频率偏差 | ✅ |
-| 其余 8 条流程（CRPS、FSS、概率评分、Bias…） | — | ⛔ 报告模板还没做，调用时会明确报错 |
+| `weather_field_scores` | 确定性连续场：RMSE / ACC / 预报活跃度 / 纬向谱 | ⚠️ 能力与渲染器在，格式契约骨架已删 |
+| TS 系列（`weather_ts_det` / `weather_ts_ens` / `fdp_precip_ts` …） | 站点降水分类检验：TS / POD / FAR / 频率偏差 | ✅ 骨架分确定性 / 集合两份 |
+| RMSE 批次家族（`weather_rmse_<模型>_single` / `_ens` / `_wave`） | 格点 RMSE / ACC / FA / 纬向谱，多模型对比 | ⚠️ 只有 `_single` 的渲染器做了 |
+| 其余流程（CRPS、FSS、概率评分、台风…） | — | ⛔ 报告模板还没做，调用时会明确报错 |
 
 **能力身份自动识别**：给一个评测产物目录，skill 从 `manifest.json` 的
 `resolved_config.pipeline` 自己认这是哪条链路再派发，**用户不用记能力名，
@@ -26,7 +27,7 @@
 
 **使用方法**——说一句话就行，**命令由智能体执行，你不用自己跑 python**：
 
-> "帮我对 `evaluation_results/weather_ts_det_fgvp` 这个评测结果生成报告"
+> "帮我对 `evaluation_results/weather_ts_single_fgvp` 这个评测结果生成报告"
 
 智能体跑的就是这一条：
 
@@ -72,16 +73,26 @@ skills/
 └── xmetai-evaluation/           # 模型评估 skill
     ├── SKILL.md                 # Skill 主定义：什么时候用、怎么用、硬性规则
     ├── scripts/
-    │   └── generate_report.py   # skill 的唯一入口：产物目录 → 图表 + REPORT.md
+    │   ├── generate_report.py   # 产物目录 → 图表 + REPORT.md（认能力 + 派发）
+    │   ├── generate_det_report.py    # 批次归档（单成员）→ 多模型对比图 + REPORT.md
+    │   ├── generate_ens_report.py    # 批次归档（集合）→ 同上，另加 CRPS/Spread
+    │   └── generate_wave_report.py   # 批次归档（谱检验补充）→ 同上，另加球谐带
     ├── assets/
-    │   └── templates/           # 报告格式契约（按能力家族一份）
-    │       ├── README.md        # 模板目录说明 + 索引
-    │       └── ts.md            # TS 系列：三份填空骨架（单模型 / 单基准 / 多模型）
+    │   └── templates/           # 报告格式契约（按能力家族一份，名字按 config 命名）
+    │       ├── weather_ts_single.md    # 确定性降水检验：三份填空骨架（单模型 / 单基准 / 多模型）
+    │       ├── weather_ts_ens.md       # 集合降水检验：同上三份，另加一节概率评分（AROC/BSS）
+    │       ├── weather_rmse_single.md  # RMSE 批次家族（单成员）：一份骨架
+    │       ├── weather_rmse_ens.md     # RMSE 批次家族（集合）：CRPS / Spread / Spread÷RMSE
+    │       ├── weather_rmse_wave.md    # 纬向 FFT + 球谐带功率谱补充分析：一份骨架
+    │       ├── weather_typhoon_single.md  # 台风路径/强度（确定性）
+    │       └── weather_typhoon_ens.md     # 台风路径/强度（集合口径 + 离散度）
     ├── references/              # 参考文档（口径与判读规则）
-    │   ├── evaluation-metrics.md
-    │   ├── precipitation-evaluation.md
-    │   ├── diagnostic-rules.md  # TS 系列判读规则
-    │   └── field-evaluation.md  # 连续场判读规则
+    │   ├── evaluation-metrics.md        # 指标词典：是什么（不判好坏）
+    │   ├── precipitation-evaluation.md  # TS 系列：口径与产出契约
+    │   ├── diagnostic-rules.md          # TS 系列判读规则
+    │   ├── field-evaluation.md          # 连续场判读规则
+    │   ├── rmse-batch-evaluation.md     # RMSE 批次家族（single/ens/wave）
+    │   └── model-diff-analysis.md       # 模型差异归因：改动起没起作用
     └── agents/                  # 空。暂无子 agent
 ```
 
@@ -123,7 +134,13 @@ skills/
 放的是**一份完整的报告骨架**——章节、表头、分隔行、口径说明全是真的，
 只有数值位置用 `{…}` 空着。**不是说明文档，也不参与渲染**：
 报告由主仓库的渲染器逐行拼出，骨架是给人看、给测试对的真值来源。
-按**能力家族**分文件、不按流程分——三条 TS 流程共用一份 `ts.md`。
+按**能力家族**分文件、不按流程分——确定性两条 TS 流程共用一份 `weather_ts_single.md`。
+**文件名就是 config 名**（`weather_rmse_single_<模型>` 对 `weather_rmse_single.md`、
+`weather_rmse_ens_<模型>` 对 `weather_rmse_ens.md`、`weather_rmse_wave_<模型>` 对
+`weather_rmse_wave.md`、`weather_ts_det_*` / `fdp_precip_ts_*` 对 `weather_ts_single.md`、
+`weather_ts_ens_*` 对 `weather_ts_ens.md`），
+两字母缩写（`det` / `ts` / `field`）和家族简称（`precip_ts` / `rmse_single`）都不再用。
+**`weather_field_scores` 这一族现在没有骨架了**（`field_scores.md` 已删）。
 `tests/unit/visualization/test_ts_report.py` 会实跑一遍逐项比对：
 改了渲染器的章节结构就必须同步改骨架，否则测试红。
 逐字扫描只能钉住**不含占位符**的行，所以另有一组「编号与排版」用例
@@ -171,7 +188,7 @@ skills/
     `create_report`""只有长表就合成宽表"三处已失效的说法
 - **2026-09-11（深夜）**: 「对比其他模型」变成一句话
   - `evaluation_results/` 规整成**一个模型一个目录**（目录名 = config `name` = `run_id`，
-    形如 `weather_ts_det_fgvp`），宽表统一落在 `diagnostics/categorical_wide.csv`；
+    形如 `weather_ts_single_fgvp`），宽表统一落在 `diagnostics/categorical_wide.csv`；
     老式的 `ts_multi_*` 目录已迁移，被取代的挪进 `_archive/`（归档不删）
   - SKILL.md 工作流新增"第 4 步 · 用户要对比其他模型时"：**同级目录里有宽表的都是候选**，
     自己找齐、核对口径、**把清单报给用户确认**再跑——不加 `--compare-all` 之类的新开关，
@@ -197,7 +214,136 @@ skills/
     `metrics/categorical.py:103-118` 就被展平求和丢掉了**，长表也没有 lat/lon 列；
     要画地图得先加"保留逐点场的 metric + 写场的 writer"再重跑，写进文档留作待办
 
+- **2026-09-15**: 模板文件按 config 命名 + 新增集合预报骨架
+  - `assets/templates/` 改名：`det.md`→`rmse_single.md`、`ts.md`→`precip_ts.md`、
+    `field.md`→`field_scores.md`，新增 `rmse_ens.md`（集合口径：CRPS / Spread /
+    Spread÷RMSE，对应 `weather_rmse_<模型>_ens`）。全仓库引用同步
+    （本 README 目录结构、SKILL.md 路由表与参考文档、`ts_report.py` 的字节契约注释）
+  - 顺手修掉 `rmse_single.md` 里两处与事实不符的旧说法：章节号写的是
+    `一、二、…十一`（实际骨架是 `# 1.`…`# 11.`）、以及声称有
+    `test_det.py` 守着（`tests/` 是空的，README 的「怎么被保证」才是实况）
+  - `rmse_ens.md` **不含球谐带功率**：`vfc/metrics/spectrum.py` 只有纬向 FFT 谱，
+    球谐停在「升级备忘」，收进来就是一条永远渲染不出来的章节；谱只保留纬向谱
+  - 该骨架的渲染器（`visualization/ens_report.py` + `scripts/generate_ens_report.py`）
+    **还没做**，模板索引里如实标为「还没做，调用时明确报错」
+
+- **2026-09-15（下午）**: 模板全面改成 config 全名 + 新增谱检验骨架
+  - `assets/templates/` 弃用家族简称：`precip_ts.md`→`weather_ts_single.md`、
+    `rmse_single.md`→`weather_rmse_single.md`、`rmse_ens.md`→`weather_rmse_ens.md`；
+    新建 `weather_ts_ens.md`（当时是空文件，当天下午写完，见下一条）
+  - 新增 `weather_rmse_wave.md`——`weather_rmse_wave_<模型>` 批量归档的
+    **纬向 FFT + 球谐带功率谱补充分析**报告骨架。章节 `# 1.`…`# 7.` + 附录、
+    表不编号、图 `图 1：`…`图 7：` 连续；原件是语雀富文本导出，
+    落地时去掉 `<font>` 彩色标签、语雀 CDN 图链换成 `![名字](名字.png)`，
+    并按编号契约给每张图补了图注（原件一张图注都没有）。
+    **渲染器还没做**
+  - `field_scores.md` 与 `assets/templates/README.md` 同日删除；模板索引的职责
+    收归 `xmetai-evaluation/SKILL.md` 的「参考文档」一节
+  - 本文件的目录结构与「模板文件按 config 命名」一节、`SKILL.md` 的路由表与
+    参考文档、三份 RMSE 骨架头部的互相引用，全部按新名字同步
+
+- **2026-09-15（傍晚）**: `weather_ts_ens.md` 写完，TS 骨架正式分成两份
+  - 集合那份＝确定性那份的二～五节**逐字相同**，加两处：头部多一行「集合成员数」
+    与**集合口径声明**（TS/POD/FAR/漏报率/BIAS 都算在成员平均场上，不是逐成员
+    评分再平均）；并**新增第六节「概率评分（AROC / BSS）」**，后面章节号整体后移
+    一位（A 到八、B/C 到九）
+  - AROC/BSS 一节的口径按 `core/categorical_ref.py` 的实际实现写，不是照抄指标名：
+    `BS_ref` **只有给了外部气候概率参考的 6h 窗才有值**、BSS=1−BS/BS_ref、
+    AROC 是**逐成员插值后**按超越式阈值算、每个时效末尾还有一行 `grade="AVG"`
+    的**可算阈值等权平均**（不是按样本数加权）
+  - **这一节目前没有代码支撑，骨架头部如实标了两处**：`run_ts_ens` 把 `window_aroc`
+    置空（该能力不产 AROC/BSS 表）、`weather_ts_ens_prob` 不在 `report.py` 的
+    `IMPLEMENTED` 里且 `README.md` 标着 `[BLOCKED]`。数据表本身是有的
+    （`aroc_bss_<name>.csv`，11 列）
+  - `weather_ts_single.md` 头部从"覆盖三条流程、三条共用这一份"改成
+    **只管确定性两条**，并指向集合那份；`SKILL.md` 路由表拆成两行、
+    "三条 TS 流程共用一套模板"那句改写成"同一个渲染器、两份骨架"
+
+- **2026-09-15（晚）**: 清掉删除文件留下的失效引用
+  - `field_scores.md` 被删之后 `SKILL.md` 还有三处指着它：路由表那格改成
+    「能力与渲染器都在，但格式契约已删」；连续场那节「'结构固定'是被测试守着的」
+    改成**明说真值来源没了**（别再假装测试还钉得住）；参考文档节删掉那一行
+  - 顺带查出 `assets/templates/README.md` **也是同日被删的**、参考文档节还列着它，
+    一并删掉，换成一句「`assets/templates/` 现在只剩五份，连续场的骨架与
+    模板目录的 README 都已删」
+  - 两份 RMSE 骨架头部「与 `weather_ts_single.md` / `field_scores.md` 的差别」
+    去掉后半段；本文件设计原则 3 删掉 `weather_field_scores` 对
+    `weather_field_scores.md` 这个已失效的举例，`weather_ts_*` 那条例举按
+    single / ens 拆开
+  - `weather_rmse_ens.md` 里「本骨架不含球谐带功率」那段改成**指向
+    `weather_rmse_wave.md`**：球谐带那两节归谱检验骨架
+    （对应 5.1 分频 / 5.2 分变量 / 5.3 配对检验），不在这份重复
+  - 历史条目里出现的 `ts.md` / `det.md` / `field_scores.md` **不动**——
+    那是当时的实况记录，不是失效链接
+
+- **2026-09-15（深夜）**: 规整 `references/`——补上 RMSE 批次家族那篇
+  - 最大的洞是**三份 RMSE 骨架在 `references/` 里一个字都没有**：新增
+    `rmse-batch-evaluation.md`，把 `visualization/det_report.py` 的归档形状、
+    派生指标（相对 RMSE 的 `100` 是**几何均值基线**、FA 偏差取了绝对值方向就丢了、
+    频谱对数 RMS 的底数）、时效分段 `(0,120]/ (120,240]/ (240,360]`、
+    Wilcoxon + Holm，以及**跨批次比较必须一致的六个口径参数**写进去；
+    并如实标明 `_ens` / `_wave` 的渲染器都还没做、球谐带没有数据来源
+  - `evaluation-metrics.md` 从 788 行的杂糅改成**纯指标词典**：删掉「空间聚合与 FSS」
+    「业务指标组合」「Case 1-4」「时效典型模式」这些教科书内容和与
+    `diagnostic-rules.md` 重复的 BIAS 分级（**冲突一律以 `diagnostic-rules.md` 为准**），
+    补上 CRPS / Spread / Spread÷RMSE / AROC / BS / BSS / base_rate / `AVG` 汇总行的定义
+  - `diagnostic-rules.md` 新增 §6 概率评分（AROC / BSS），并**明说这节没有代码支撑**
+    （`run_ts_ens` 把 `window_aroc` 置空、`weather_ts_ens_prob` 未实现）；
+    后面两节顺延为 §7 / §8
+  - `precipitation-evaluation.md` 补概率评分表契约（`aroc_bss_<name>.csv`）、
+    「概率评分与 TS 口径完全不同」对照表、A/B/C 三支线的**图与表编号表**，
+    并把 `weather_ts_ens` 多一节导致整体后移一位这件事写清
+  - `field-evaluation.md` 加一句`field_scores.md` 已删、格式契约没有真值来源
+    （口径与判读规则不受影响——它们对的是代码，不是骨架）
+  - 顺带记下一处**代码与骨架对不上**：纬向谱 log-RMS 实现用 `log10`
+    （`det_report.py:551`），`weather_rmse_wave.md` 的骨架文字写的是 `ln`，
+    差 ×2.3026，**尚未与实现核对**，两处都标了「以代码为准」
+
+- **2026-09-15（凌晨）**: SKILL.md 按标准 skill 模板重排 + 新增归因框架
+  - **起因是核对真实结果目录时发现文档与实况对不上**：`outputs/results/` 下是
+    **扁平布局**（`ts_*.csv` + `*_meta.json`），而 SKILL.md 一直描述的是
+    `manifest.json` + `diagnostics/categorical_wide.csv`。`categorical_wide.csv`
+    **在本仓库里没有任何流程会写**（grep 只有读者没有写者）——今天那份
+    `report/weather_ts_single_fgvp_fuxi_aifs/` 是手工 staging 才跑通的
+  - SKILL.md 重排成标准形态并**只增不减**：`干什么/不干什么` → `触发场景` →
+    **`输入：结果目录`**（扁平布局 + `_meta.json` 逐键说明 + TS 主表契约）→
+    **`归类`**（四级判据 + 归类对照表 + 报清单）→ **`工作流`六步** →
+    `能力路由` → `输出契约` → `硬性规则`（新增 13/14/15 三条）→
+    `常见情形` → `参考文档` → `维护说明`
+  - 工作流从原来的"第 1 步跑命令"改成**归类 → 定主模型 → 核对口径 → 跑 →
+    转述 → 失败直说**六步：主模型可由用户点名（决定"本模型"的全部说法
+    与差值图纵轴方向），未点名则按「目录名标记 → `<capability>.json` → 反问」推断
+  - 新增 `references/model-diff-analysis.md`——**"改的这个模块起没起作用"**
+    的判断框架：先把改动翻译成预期特征（六类改动的指纹表）→ 在结果里找特征 →
+    做**波及面检查**（未改动变量/量级/时效有没有一起动）→ 四条判定规则
+    （方向对 / 不是噪声 / **有代价评估** / 跨时效一致）→ 症状词典
+    （八种数字形态反推成因，含"单位不匹配长得像技巧超好"那个真坑）
+  - 如实标注四处**已知缺口**（SKILL.md 维护说明节）：主模型入口认不得扁平布局、
+    `_ens`/`_wave` 渲染器没做、AROC/BSS 取数绘图没做、球谐带不存在
+  - 本 README 的能力状态表同步：`weather_field_scores` 从 ✅ 改 ⚠️（骨架已删）、
+    补 RMSE 批次家族一行
+
+- **2026-09-16**: 补上 `weather_rmse_ens` 的渲染器，RMSE 三条支线都能跑了
+  - 新增 `visualization/ens_report.py` + `scripts/generate_ens_report.py`，
+    照 `weather_rmse_wave` 的五段式结构写；`analyze_ens()` 第一句就是
+    `det_report.analyze()`，所以归档形状、相对 RMSE、FA 偏差、配对检验全部复用，
+    集合特有的只有 CRPS / Spread / Spread÷RMSE / ACC 四块
+  - `det_report._pick_metric_file` 的候选名**加一个** `f"{stem}_{date}_ensmean.csv"`
+    （排在最末，单成员行为不变），这一行让 `analyze()` 原样吃下集合归档，
+    且拿到的正是骨架要求的**集合平均场**口径
+  - **两条口径红线写进骨架引用注释**：集合对数用 **ln**、单成员用 **log10**（差 2.3026×）；
+    逐日表只读归档自带的 `<口径>_<日期>.csv`，**不用 glob 兜底**——
+    否则 `rmse_<日期>_member_000.csv`（单成员）会被当集合平均静默读进来
+  - 同步纠正三处**早已过时**的说法：`_wave` 的渲染器其实早就做好了
+    （`wave_report.py` + `generate_wave_report.py`），球谐带功率也早就有了
+    （`vfc/metrics/spectrum.py:210` 一直在写 `spherical_bands_*.csv`，实测 1308 份）。
+    `references/rmse-batch-evaluation.md` §0 的三行表格、SKILL.md 的已知缺口、
+    本文件的目录树一并改过来
+  - 实测数据现状：三份集合归档（FuXi 349 天 / AIFS 27 天 / FGVP 2 天）
+    **三方共同日期为 0**，所以本轮只用 FuXi↔AIFS 的 27 天验证渲染器，
+    正式三方报告等 FGVP 数据补齐
+
 ---
 
 **维护者**: 沈哲文 (szw)
-**最后更新**: 2026-09-11
+**最后更新**: 2026-09-16

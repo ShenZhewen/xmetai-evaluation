@@ -19,7 +19,7 @@ from xmetai_evaluation.core.contracts import (
     Provenance,
 )
 from xmetai_evaluation.core.variables import TemporalKind
-from xmetai_evaluation.results import SCORE_COLUMNS, ResultStore, RunContext
+from xmetai_evaluation.output import SCORE_COLUMNS, ResultStore, RunContext
 
 
 def _load_bundle(path, source_id):

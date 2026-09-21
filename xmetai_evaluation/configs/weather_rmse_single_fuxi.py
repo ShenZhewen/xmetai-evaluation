@@ -81,7 +81,7 @@ METRIC_OPTIONS["zonal_spectrum"] = {
 _ERA5_STORE_ROOT = "/workspace/data/liujunjie/era5_foundation_store2"
 
 cfg = EvalConfig(
-    name="weather_field_scores_era5_fuxi",
+    name="weather_rmse_single_fuxi",
     description="确定性连续量检验（FuXi × ERA5）：12 要素逐变量的 RMSE / 谱 / ACC / 活跃度",
     pipeline="weather_field_scores",
 
@@ -134,7 +134,7 @@ cfg = EvalConfig(
 
     output_dir=os.environ.get(
         "EVAL_OUTPUT",
-        "/workspace/szwCode/xmetai-evaluate/evaluation_results/weather_field_scores_era5_fuxi",
+        "/workspace/szwCode/xmetai-evaluate/evaluation_results/weather_rmse_single_fuxi",
     ),
     metric_options=METRIC_OPTIONS,
     log_level="INFO",

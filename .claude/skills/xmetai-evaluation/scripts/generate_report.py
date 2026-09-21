@@ -49,7 +49,7 @@ def main(argv=None) -> int:
     parser = argparse.ArgumentParser(
         description="按评测产物目录自动选模板，出图并写 Markdown 报告",
         epilog="示例: python skills/xmetai-evaluation/scripts/generate_report.py "
-        "evaluation_results/weather_ts_det_fgvp --out reports/weather_ts_det_fgvp",
+        "evaluation_results/weather_ts_single_fgvp --out reports/weather_ts_single_fgvp",
     )
     parser.add_argument("output_dir", type=Path, help="评测产物目录（含 manifest.json 与结果表）")
     parser.add_argument("--out", type=Path, default=None, help="报告输出目录（默认 reports/<run_id>）")

@@ -39,8 +39,9 @@ REPO_ROOT = Path(__file__).resolve().parents[3]
 
 
 def main(argv=None) -> int:
-    # Windows 控制台默认 GBK，渲染器收尾会打印 "✓" / "⚠"（GBK 里没有这两个字符），
-    # 会在最后一步抛 UnicodeEncodeError——报告其实已经写完了，但进程非 0 退出、
+    # Windows 控制台默认 GBK，报告的正文和日志里有大量中文。控制台代码页不是
+    # UTF-8 时（GBK 有中文，但 cp437 / cp1252 这类没有），print 会抛
+    # UnicodeEncodeError——报告和图其实都已经写完了，却在最后一步非 0 退出、
     # artifacts 也拿不到。在入口把标准输出切成 UTF-8，避免这种"功亏一篑"。
     for stream in (sys.stdout, sys.stderr):
         if hasattr(stream, "reconfigure"):
@@ -49,7 +50,7 @@ def main(argv=None) -> int:
     parser = argparse.ArgumentParser(
         description="按评测产物目录自动选模板，出图并写 Markdown 报告",
         epilog="示例: python skills/xmetai-evaluation/scripts/generate_report.py "
-        "evaluation_results/weather_ts_det_fgvp --out reports/weather_ts_det_fgvp",
+        "evaluation_results/weather_ts_single_fgvp --out reports/weather_ts_single_fgvp",
     )
     parser.add_argument("output_dir", type=Path, help="评测产物目录（含 manifest.json 与结果表）")
     parser.add_argument("--out", type=Path, default=None, help="报告输出目录（默认 reports/<run_id>）")
@@ -59,15 +60,26 @@ def main(argv=None) -> int:
         "--compare", action="append", default=None, metavar="名字=CSV路径",
         help="对比模型的宽表（可重复），只在 TS 系列上有意义",
     )
+    parser.add_argument(
+        "--spectrum-variable", default=None,
+        help="要看逐波数谱曲线的变量（会去读很大的 scores_detail.csv），"
+        "只在连续场链路上有意义；该变量得真算过纬向谱",
+    )
+    parser.add_argument(
+        "--spectrum-lead", type=float, default=None,
+        help="谱曲线的时效(h)，省略取该变量的最大时效",
+    )
     args = parser.parse_args(argv)
 
     sys.path.insert(0, str(REPO_ROOT))
-    from xmetai_evaluation.visualization.report import build_report
+    from visualization.report import build_report
 
     artifacts = build_report(
         args.output_dir,
         out_dir=args.out,
         model_name=args.model,
+        spectrum_variable=args.spectrum_variable,
+        spectrum_lead=args.spectrum_lead,
         change_description=args.change,
         compare=args.compare,
     )

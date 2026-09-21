@@ -6,8 +6,8 @@
     ResultStore(...).write(results, ...)         把长表与运行记录落盘
 """
 
-from xmetai_evaluation.results.store import ResultStore, RunContext
-from xmetai_evaluation.results.table import (
+from xmetai_evaluation.output.store import ResultStore, RunContext
+from xmetai_evaluation.output.table import (
     COVERAGE_COLUMNS,
     DETAIL_COLUMNS,
     SCORE_COLUMNS,

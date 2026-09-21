@@ -24,7 +24,7 @@ import numpy as np
 from tqdm import tqdm
 
 from xmetai_evaluation.io.base import Reader, DataCatalog
-from xmetai_evaluation.logging_util import peak_rss_text
+from xmetai_evaluation.core.logging import peak_rss_text
 from xmetai_evaluation.core.contracts import (
     DataRequest,
     DataIndex,

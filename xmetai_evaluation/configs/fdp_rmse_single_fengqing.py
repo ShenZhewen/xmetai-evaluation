@@ -20,7 +20,7 @@ import os
 from xmetai_evaluation.configs.base import EvalConfig
 
 cfg = EvalConfig(
-    name="fdp_field_scores_fengqing",
+    name="fdp_rmse_single_fengqing",
     description="FDP 要素检验：z500 的 RMSE / Bias / ACC",
     pipeline="fdp_field_scores",
 
@@ -62,7 +62,7 @@ cfg = EvalConfig(
 
     output_dir=os.environ.get(
         "EVAL_OUTPUT",
-        "/workspace/szwCode/xmetai-evaluate/evaluation_results/fdp_field_scores_fengqing",
+        "/workspace/szwCode/xmetai-evaluate/evaluation_results/fdp_rmse_single_fengqing",
     ),
     # json 是**在本模板默认的 ["csv_long"] 之上追加的**（配置级 writers 是替换，
     # 所以这里必须把模板那份也写全，漏了 csv_long 主表就没了）。

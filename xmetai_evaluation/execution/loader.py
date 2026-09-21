@@ -28,7 +28,7 @@ import xarray as xr
 
 from xmetai_evaluation.core.contracts import DataRequest
 from xmetai_evaluation.core.errors import ConfigError
-from xmetai_evaluation.logging_util import peak_rss_text
+from xmetai_evaluation.core.logging import peak_rss_text
 
 log = logging.getLogger(__name__)
 

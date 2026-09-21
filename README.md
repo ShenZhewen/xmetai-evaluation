@@ -37,22 +37,21 @@ xmetai-evaluation/
 ├── xmetai_evaluation/
 │   ├── cli.py                      # 统一入口：加载配置 → 交给 Runner
 │   ├── components.py               # 内置组件注册（按名字查表，不分类型分支）
-│   ├── logging_util.py
 │   ├── configs/                    # EvalConfig + 任务配置（部分用环境变量覆盖路径）
 │   │   ├── base.py                 # EvalConfig 定义 + load_config()
-│   │   ├── weather_ts_det_fgvp.py       # FuXi 确定性降水分类检验
+│   │   ├── weather_ts_single_fgvp.py       # FuXi 确定性降水分类检验
 │   │   ├── weather_ts_ens_fuxi.py       # FuXi 集合降水：24h TS + 6h 概率两段一趟跑完
-│   │   ├── weather_field_scores_era5_fuxi.py     # FuXi 确定性连续量（RMSE/谱/ACC/活跃度）
-│   │   ├── weather_field_scores_era5_fengqing.py # 风清单卡确定性连续量（同上，15 要素）
-│   │   ├── weather_ens_field_scores_era5_fuxi.py # FuXi 集合场（RMSE/CRPS/ACC/活跃度/谱）
-│   │   └── fdp_field_scores_fengqing.py          # FDP 要素检验（z500 的 RMSE/Bias/ACC）
-│   ├── core/                       # contracts / errors / registry / variables
+│   │   ├── weather_rmse_single_fuxi.py     # FuXi 确定性连续量（RMSE/谱/ACC/活跃度）
+│   │   ├── weather_rmse_single_fengqing.py # 风清单卡确定性连续量（同上，15 要素）
+│   │   ├── weather_rmse_ens_fuxi.py # FuXi 集合场（RMSE/CRPS/ACC/活跃度/谱）
+│   │   └── fdp_rmse_single_fengqing.py          # FDP 要素检验（z500 的 RMSE/Bias/ACC）
+│   ├── core/                       # contracts / errors / registry / variables / logging
 │   ├── execution/                  # 执行层：profiles / strategy / plan / loader / executor
 │   ├── io/                         # gridded / layouts / station_reader / climatology_reader / netcdf_reader / base
 │   ├── transforms/                 # interpolation / temporal / regrid
 │   ├── metrics/                    # rmse / bias / acc / categorical / probabilistic / ensemble / spatial / specialized
 │   ├── pipeline/                   # runner(唯一编排) / spec / pipelines / protocols / matcher
-│   ├── results/                    # store / table
+│   ├── output/                     # store / table（统一长表与落盘）
 │   └── visualization/              # precipitation_plots / ts_report
 ├── tests/                          # unit + integration
 ├── ref/                            # 参考实现（只读档案，不入库、不参与运行）
@@ -358,7 +357,7 @@ vs 再按时效切窗 vs 换并发形态，`scores.csv` 必须逐行一致，且
    在 grid 协议下会多算一组。
 4. **块数** = `ceil(起报日数 / chunk_days) × 时效窗数`；**段数** = `min(n_workers, 待跑块数)`。
 
-拿 `weather_field_scores_era5_fuxi` 那类配置（`step_hours=6`、lead 到 360h、grid 协议、
+拿 `weather_rmse_single_fuxi` 那类配置（`step_hours=6`、lead 到 360h、grid 协议、
 `chunk_days=1`、`lead_chunk_days=1`）走一遍：
 
 | 步 | 算式 | 数 |
@@ -400,7 +399,7 @@ echo "上限: $(cat /sys/fs/cgroup/memory.max)"
 echo "已用: $(cat /sys/fs/cgroup/memory.current)"
 ```
 
-`weather_field_scores_era5_fuxi` 全年的实测账（`resident` 气候态 + 5 worker）：
+`weather_rmse_single_fuxi` 全年的实测账（`resident` 气候态 + 5 worker）：
 
 | 项 | 实测 |
 |---|---|
@@ -513,11 +512,11 @@ echo "已用: $(cat /sys/fs/cgroup/memory.current)"
 | **降水空间检验**<br>`fdp_precip_fss` | 格点降水预报 + 格点降水实况（CRA / CMPAS） | `scores.csv` | `fss`（阈值 13 mm × 邻域窗口 1/3/5/15/31/63，每个组合一行）<br>明细 `window`/`n_points` | 重·整场 · processes |
 | **活跃度比 / 功率谱**<br>`fdp_activity_spectrum` | 格点场预报（z500）+ 格点实况 + 气候态（活跃度比必需） | `scores.csv`、`diagnostics/spectrum_{var}.csv`、`diagnostics/spectrum_by_init.csv` | `activity_ratio`、`activity_forecast`、`activity_observation`、`activity_bias`、`spectrum_power_ratio`（二维谱，不减纬向均值）<br>逐波数谱曲线另出宽表 | 重·参考·整场 · processes |
 
-内置配置里 `fdp_field_scores_fengqing` 另外声明了 `json` writer，会多写一份 `scores.json`；
-`weather_field_scores_era5_*` 与 `weather_ens_field_scores_era5_fuxi` 声明的是 `spectrum`。
+内置配置里 `fdp_rmse_single_fengqing` 另外声明了 `json` writer，会多写一份 `scores.json`；
+`weather_rmse_single_fuxi` / `weather_rmse_single_fengqing` 与 `weather_rmse_ens_fuxi` 声明的是 `spectrum`。
 那都是配置的选择，不属于流程模板的产出。
 注意配置里的 `writers` 是**替换**模板自带的那一份、不是追加，所以
-`weather_field_scores_era5_fuxi` 要把模板的 `details` 一并写上，谱曲线才有落盘的地方。
+`weather_rmse_single_fuxi` 要把模板的 `details` 一并写上，谱曲线才有落盘的地方。
 
 ### 评估指标说明
 
@@ -596,7 +595,7 @@ echo "已用: $(cat /sys/fs/cgroup/memory.current)"
 | `diagnostics/probability_wide.csv` | 概率评分宽表（阈值 × 时效：AROC/BS/BSS + `BS_ref`/`base_rate`/`n_points`） |
 | `scores.json` | 评分 JSON 快照 |
 
-当前已接好的内置任务配置（`configs/`）：`weather_ts_det_fgvp`（FGVP 确定性降水）、`weather_ts_ens_fuxi`（FuXi 集合降水，24h TS + 6h 概率两段一趟跑完）、`weather_field_scores_era5_fuxi`（FuXi 确定性连续量）、`weather_field_scores_era5_fengqing`（风清单卡确定性连续量）、`weather_ens_field_scores_era5_fuxi`（FuXi 集合场，含 CRPS）、`fdp_field_scores_fengqing`（FDP 要素检验）。
+当前已接好的内置任务配置（`configs/`）：`weather_ts_single_fgvp`（FGVP 确定性降水）、`weather_ts_ens_fuxi`（FuXi 集合降水，24h TS + 6h 概率两段一趟跑完）、`weather_rmse_single_fuxi`（FuXi 确定性连续量）、`weather_rmse_single_fengqing`（风清单卡确定性连续量）、`weather_rmse_ens_fuxi`（FuXi 集合场，含 CRPS）、`fdp_rmse_single_fengqing`（FDP 要素检验）。
 
 ## 评测数据与格式
 

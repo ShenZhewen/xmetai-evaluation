@@ -634,6 +634,18 @@ class GridValidTimeProtocol(Protocol):
             forecast_request, forecast.catalog.discover(forecast_request)
         )
         raw_bundle = bundle
+        # 派生风速（ws* = sqrt(u²+v²)）必须在 ensemble_mean **之前**、member 维还在时
+        # 合成：逐成员开方再平均才是集合平均风速 E[ws]（参考实现 regr_ens.py:698 的
+        # 口径）；平均之后再开方会把集合离散度折进风速（Jensen 间隙，长时效虚高
+        # 8%~13%）。确定性流程没有 member 维，这里不合成、留给 Matcher 兜底
+        # （matcher.py 的 add_derived_variables 对已合成的名字是空操作）。
+        if (
+            isinstance(bundle.payload, xr.Dataset)
+            and "member" in bundle.payload.dims
+        ):
+            bundle.payload = add_derived_variables(
+                bundle.payload, self.forecast_vars
+            )
         for item in self.spec.transforms:
             transform = context.transform(item.name)
             if transform is not None and hasattr(transform, "transform"):

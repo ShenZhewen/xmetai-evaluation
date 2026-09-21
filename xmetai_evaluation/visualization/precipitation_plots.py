@@ -30,7 +30,7 @@ import numpy as np
 import pandas as pd
 from matplotlib.patches import Patch
 
-from xmetai_evaluation.visualization.ts_report import (
+from visualization.ts_report import (
     box_stats,
     build_ts_report,
     collect_box_models,
@@ -539,9 +539,11 @@ class PrecipitationPlotter:
             box_models=box_models,
         )
         artifacts["report"] = report_path
-        print(f"✓ 报告完成：{report_path}（{len(artifacts) - 1} 张图 + 1 份报告）")
+        # 别在这两行用 ✓ / ⚠：Windows 控制台默认 GBK，编码不了这两个字符。报告和图
+        # 这时**已经写完了**，却会在最后一行抛 UnicodeEncodeError、进程非 0 退出。
+        print(f"报告完成：{report_path}（{len(artifacts) - 1} 张图 + 1 份报告）")
         if self.font is None:
-            print("⚠ 未找到中文字体，图中的中文可能显示为方块；请安装 Noto Sans CJK 或 SimHei")
+            print("未找到中文字体，图中的中文可能显示为方块；请安装 Noto Sans CJK 或 SimHei")
         return artifacts
 
     def plot_multi_model_vs_lead(

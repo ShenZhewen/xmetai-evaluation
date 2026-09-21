@@ -14,7 +14,7 @@ import xarray as xr
 
 from xmetai_evaluation.cli import run_evaluation
 from xmetai_evaluation.configs.base import EvalConfig
-from xmetai_evaluation.results import SCORE_COLUMNS
+from xmetai_evaluation.output import SCORE_COLUMNS
 
 GRID_LATS = np.array([-10.0, 0.0, 10.0])
 GRID_LONS = np.array([100.0, 105.0, 110.0])

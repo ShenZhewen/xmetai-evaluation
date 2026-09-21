@@ -376,7 +376,7 @@ def _writer_json(tables, context, output_dir: Path) -> Path:
 
 
 def _writer_categorical_wide(tables, context, output_dir: Path) -> Path:
-    from xmetai_evaluation.results.table import categorical_wide
+    from xmetai_evaluation.output.table import categorical_wide
 
     path = Path(output_dir) / "diagnostics" / "categorical_wide.csv"
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -385,7 +385,7 @@ def _writer_categorical_wide(tables, context, output_dir: Path) -> Path:
 
 
 def _writer_probability_wide(tables, context, output_dir: Path) -> Path:
-    from xmetai_evaluation.results.table import probability_wide
+    from xmetai_evaluation.output.table import probability_wide
 
     path = Path(output_dir) / "diagnostics" / "probability_wide.csv"
     path.parent.mkdir(parents=True, exist_ok=True)

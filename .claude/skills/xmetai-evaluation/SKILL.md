@@ -47,7 +47,7 @@ metadata:
 
 ## 能力路由（先认能力，再选模板）
 
-**不要靠目录名判断这是哪条链路。** 配置名（`weather_field_scores_era5_fuxi`）
+**不要靠目录名判断这是哪条链路。** 配置名（`weather_rmse_single_fuxi`）
 与流程名（`weather_field_scores`）本来就不绑定。
 
 权威判据是产物目录里 `manifest.json` 的 `resolved_config.pipeline`；
@@ -121,12 +121,12 @@ python skills/xmetai-evaluation/scripts/generate_report.py <产物目录> --out 
 ```bash
 # 一条命令：自动认能力 + 出图 + 写报告
 python -m xmetai_evaluation.visualization.report \
-  evaluation_results/weather_field_scores_era5_fuxi \
+  evaluation_results/weather_rmse_single_fuxi \
   --out reports/field_fuxi
 
 # 需要看谱曲线时再加两个参数（会读明细表，慢一些）
 python -m xmetai_evaluation.visualization.report \
-  evaluation_results/weather_field_scores_era5_fuxi \
+  evaluation_results/weather_rmse_single_fuxi \
   --out reports/field_fuxi --spectrum-variable z500 --spectrum-lead 24
 ```
 
@@ -142,7 +142,7 @@ python -m xmetai_evaluation.visualization.report \
 | `diagnostics/scores_detail.csv` | 连续场的逐波数谱明细，**默认不读**（很大） |
 
 **`evaluation_results/` 的布局**：一个模型一次运行一个目录，目录名 = config 的 `name` = `run_id`，
-形如 `weather_<流程>_<模型>`（`weather_ts_det_fgvp`、`weather_ts_ens_fuxi`）。
+形如 `weather_<流程>_<模型>`（`weather_ts_single_fgvp`、`weather_ts_ens_fuxi`）。
 **"对比其他模型"就是看这个目录的同级目录**——每个模型一个，一看就找齐了。
 
 > `manifest.json` 里 `artifacts` 的路径是**生产机的绝对路径**（`/workspace/...`），
@@ -190,7 +190,7 @@ python skills/xmetai-evaluation/scripts/generate_report.py <产物目录>
 
 ```bash
 python skills/xmetai-evaluation/scripts/generate_report.py \
-  evaluation_results/weather_ts_det_fgvp --out reports/ts_3models --model FGVP \
+  evaluation_results/weather_ts_single_fgvp --out reports/ts_3models --model FGVP \
   --compare "FuXi=evaluation_results/weather_ts_det_fuxi/diagnostics/categorical_wide.csv" \
   --compare "AIFS=evaluation_results/weather_ts_det_aifs/diagnostics/categorical_wide.csv"
 ```
@@ -198,7 +198,7 @@ python skills/xmetai-evaluation/scripts/generate_report.py \
 给了对比模型，报告会多出"与对比模型的比较"一节，并把它们一起放进**箱线图**与**差值图**。
 只对 TS 系列有意义——连续场产物上给 `--compare` 会明确报错。
 
-**用户多半不会给路径**（"我结果在 `evaluation_results/weather_ts_det_fgvp`，我要你对比其他模型的结果"）。
+**用户多半不会给路径**（"我结果在 `evaluation_results/weather_ts_single_fgvp`，我要你对比其他模型的结果"）。
 那就**自己去 `evaluation_results/` 找，别反问**，但**先把清单报给用户确认**再跑。五步：
 
 1. **看主模型产物目录的同级目录**：凡是有 `diagnostics/categorical_wide.csv` 的，都是可对比的模型。
@@ -207,7 +207,7 @@ python skills/xmetai-evaluation/scripts/generate_report.py \
    `weather_ts_ens_fuxi` → **FuXi-ENS**）；没有 manifest 的按目录名同样处理。
    名字取**模型简称**，别把 `run_id` 原样搬进报告。
    **不要用 manifest 的 `forecast_source` / `model_id`**——那是 reader 类型
-   （`weather_ts_det_fgvp` 的 `model_id` 写的居然是 `"fuxi"`，但模型是 FGVP）。
+   （`weather_ts_single_fgvp` 的 `model_id` 写的居然是 `"fuxi"`，但模型是 FGVP）。
 3. **跑之前先核对口径**：各目录的 `window_h`、`lead_h` 集合、`grade` 集合要对得上。
    量级少一两档没关系（`weather_ts_ens_fuxi` 就没有 `≥250`），
    但**窗口或时效范围对不上就不能画在一张图里**——那要在报告里点明，或者干脆不比。

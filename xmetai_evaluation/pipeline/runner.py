@@ -35,7 +35,7 @@ from xmetai_evaluation.execution import (
 )
 from xmetai_evaluation.execution.executor import MetricRun
 from xmetai_evaluation.pipeline.spec import PipelineSpec
-from xmetai_evaluation.results import ResultStore, RunContext
+from xmetai_evaluation.output import ResultStore, RunContext
 
 log = logging.getLogger(__name__)
 

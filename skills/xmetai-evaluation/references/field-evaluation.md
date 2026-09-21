@@ -8,6 +8,13 @@
 覆盖流程：`weather_field_scores`。**能力身份认的是产物目录里 `manifest.json` 的
 `resolved_config.pipeline`，不是目录名**（配置名与流程名本来就不绑定）。
 
+> **现状：这一族的格式契约（`assets/templates/field_scores.md`）已删。**
+> 能力本身、渲染器（`visualization/field_report.py`）和本文件都还在，
+> `generate_report.py` 照跑不误；但报告"结构固定"这句话**没有真值来源了**——
+> `tests/unit/visualization/test_field.py` 原先是对着那份骨架逐字比对的，
+> 骨架一删，它再红也说不清是渲染器变了还是骨架没了。
+> 本文件描述的口径与判读规则**不受影响**（它们对的是代码，不是骨架）。
+
 ---
 
 ## 0. 三条原则
@@ -95,13 +102,9 @@
   只在内存和 `diagnostics/scores_detail.csv` 里有。
 - **首/末时效不是稳定的统计量**：起报数与时段决定曲线形态，
   "涨到几倍"只在当前这套输入下成立；跨批次比较要用同样的起报集合。
-- **逐波数谱曲线已不在 `scores_detail.csv` 里**，改由 `spectrum` writer 出成
-  `diagnostics/spectrum_{var}.csv`（全体样本均值）与 `diagnostics/spectrum_by_init.csv`
-  （逐起报一条曲线，在其时效上平均）。前者列是
-  `wavenumber,wavelength_km,pred_mean,obs_mean`，后者是
-  `variable,init_time,wavenumber,wavelength_km,pred,obs`；波长 = `40075 / k`，
-  只出 k=1..720。塞进 `scores_detail.csv` 曾按「一波数 × 三字段」展开成
-  2165 行/样本，全年段逐日起报是四千多万行，所以改走 `MetricResult.curve`。
+- **逐波数谱曲线在 `diagnostics/scores_detail.csv`**，`group=k=<波数>` 行里
+  有 `wavenumber` / `power_forecast` / `power_observation` 三个字段，
+  另有 `group=summary` 行给总功率。文件很大（实测 90 万行），**默认不读**。
 
 ---
 

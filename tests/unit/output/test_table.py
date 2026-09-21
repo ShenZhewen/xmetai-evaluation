@@ -6,14 +6,14 @@ import json
 
 from xmetai_evaluation.core.contracts import MetricResult, ResultStatus
 from xmetai_evaluation.core.errors import OutputError
-from xmetai_evaluation.results import (
+from xmetai_evaluation.output import (
     COVERAGE_COLUMNS,
     DETAIL_COLUMNS,
     SCORE_COLUMNS,
     build_tables,
     categorical_wide,
 )
-from xmetai_evaluation.results.store import ResultStore, RunContext
+from xmetai_evaluation.output.store import ResultStore, RunContext
 
 
 def _ts_result() -> MetricResult:

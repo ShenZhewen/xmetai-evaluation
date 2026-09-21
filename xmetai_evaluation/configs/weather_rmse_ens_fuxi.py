@@ -54,7 +54,7 @@ METRIC_OPTIONS["zonal_spectrum"] = {
 _ERA5_STORE_ROOT = "/workspace/data/liujunjie/era5_foundation_store2"
 
 cfg = EvalConfig(
-    name="weather_ens_field_scores_era5_fuxi",
+    name="weather_rmse_ens_fuxi",
     description="集合场检验（FuXi 集合 × ERA5）：z500/msl/u200/v200/ws200 的 RMSE / CRPS / ACC / 活跃度 / 谱",
     pipeline="weather_ens_field_scores",
 
@@ -105,7 +105,7 @@ cfg = EvalConfig(
 
     output_dir=os.environ.get(
         "EVAL_OUTPUT",
-        "/workspace/szwCode/xmetai-evaluate/evaluation_results/weather_ens_field_scores_era5_fuxi",
+        "/workspace/szwCode/xmetai-evaluate/evaluation_results/weather_rmse_ens_fuxi",
     ),
     metric_options=METRIC_OPTIONS,
     log_level="INFO",
@@ -138,7 +138,7 @@ cfg = EvalConfig(
     # 348 个起报 × 16 窗 = 5568 块，24 段各 232 块（段数 = min(n_workers, 待跑块数)）。
     #
     # 内存账：日序气候态 resident 预热实测 5.60G —— 这是 **z500 单要素**的量。
-    # det 那份（weather_field_scores_era5_fuxi）评 5 个要素才是 67G，别把那个数
+    # det 那份（weather_rmse_single_fuxi）评 5 个要素才是 67G，别把那个数
     # 搬过来。单 worker 工作集估算 ~1.7G（1 要素 × 4 时效 × 51 成员 = 204 个场，
     # _combine 拼接时分量与结果并存，峰值翻倍），没实测过，按估的数留余量。
     # 总量 ≈ 5.6 + 1.7 × n_workers —— n_workers=24 时约 47G。卡口是核数不是内存。

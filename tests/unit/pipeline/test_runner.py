@@ -309,9 +309,9 @@ def test_multivariable_batch_fails_loudly_instead_of_scoring_the_first_one():
 # --------------------------------------------------------------------------
 
 XU_CONFIGS = [
-    "weather_field_scores_era5_fuxi",
-    "weather_field_scores_era5_fengqing",
-    "weather_ens_field_scores_era5_fuxi",
+    "weather_rmse_single_fuxi",
+    "weather_rmse_single_fengqing",
+    "weather_rmse_ens_fuxi",
 ]
 
 
@@ -360,7 +360,7 @@ def test_ensemble_config_needs_the_combined_template():
     from xmetai_evaluation.configs.base import load_config
 
     spec = PipelineSpec.from_config(
-        load_config("weather_ens_field_scores_era5_fuxi")
+        load_config("weather_rmse_ens_fuxi")
     )
     names = [item.name for item in spec.metrics]
 

@@ -13,7 +13,7 @@ import sys
 from pathlib import Path
 
 from xmetai_evaluation.configs.base import load_config
-from xmetai_evaluation.logging_util import configure_logging
+from xmetai_evaluation.core.logging import configure_logging
 from xmetai_evaluation.pipeline.pipelines import list_pipelines
 from xmetai_evaluation.pipeline.runner import Runner
 from xmetai_evaluation.pipeline.spec import specs_from_config

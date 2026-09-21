@@ -28,7 +28,7 @@ from typing import Dict, List, Optional, Sequence
 import numpy as np
 import pandas as pd
 
-#: 第五节（跨时效分布）里逐字固定的三行。``assets/templates/ts.md`` 的骨架要抄同一份字节，
+#: 第五节（跨时效分布）里逐字固定的三行。``assets/templates/weather_ts_single.md`` 的骨架要抄同一份字节，
 #: 两边差一个全角/半角字符测试就会红——所以只在**这里**定义一次。
 _BOX_HEADER = "| 模型 | 降水等级 | 中位数 | IQR | Q1–Q3 | 须线范围 | 离群时效 | 时效数 |"
 _BOX_SEP = "|---|---|---|---|---|---|---|---|"
@@ -1286,7 +1286,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser.add_argument("--dpi", type=int, default=150)
     args = parser.parse_args(argv)
 
-    from xmetai_evaluation.visualization.precipitation_plots import PrecipitationPlotter
+    from visualization.precipitation_plots import PrecipitationPlotter
 
     plt_dpi = args.dpi
     import matplotlib.pyplot as plt

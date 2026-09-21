@@ -22,7 +22,7 @@ from typing import Any, Dict, List, Optional, Sequence
 from xmetai_evaluation.core.contracts import MetricResult
 from xmetai_evaluation.core.errors import OutputError
 from xmetai_evaluation.core.registry import ComponentType, get_registry
-from xmetai_evaluation.results.table import (
+from xmetai_evaluation.output.table import (
     COVERAGE_COLUMNS,
     DETAIL_COLUMNS,
     SCORE_COLUMNS,

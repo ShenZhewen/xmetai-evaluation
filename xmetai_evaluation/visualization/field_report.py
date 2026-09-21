@@ -11,13 +11,17 @@
 指标语义集中在本模块的 ``METRIC_SEMANTICS``，出图和报告都从这里取。
 
 报告内容都是算出来的，不是套话：执行摘要（规则化诊断，逐条带数值）、逐变量总览、
-RMSE 随时效表、活跃度与谱表、图表索引、口径说明。
+RMSE 随时效表、活跃度表、**分波段功率比表**、图表索引、口径说明。
 
-两条刻意的克制：
+三条刻意的克制：
 
 * **只用数据内证据**。不引入没有来源的绝对合格线，所以报告里不会出现
   "ACC ≥ 0.6 算合格"这类判决，只在数据内部比大小、看形态。
-* **不重算指标**。只消费已经落盘的长表，缺行缺列如实写出来，不猜也不补。
+* **不重算指标**。只消费已经落盘的表，缺行缺列如实写出来，不猜也不补。
+  ``scores.csv`` 是数值主来源；逐波数谱只存在于 ``summary.csv`` 的
+  ``scope=wavenumber`` 档，所以那一节从 ``summary.csv`` 取（见 :func:`spectrum_bands`）。
+* **比值要连着分母一起看**。分波段那节同时给「实况占比」，因为一个占比 0.01%
+  的波段有着 5 倍的功率比，也不说明模式在那一档失真。
 """
 
 from __future__ import annotations
@@ -34,37 +38,37 @@ import pandas as pd
 #: 指标语义表 —— **唯一**放指标语义的地方（出图、报告、诊断都从这里取）。
 #:
 #: * ``label``     中文名，表格与图例用；
-#: * ``ref``       参考线的位置（``None`` 表示"没有理想值"，不画线）；
+#: * ``ref_result``       参考线的位置（``None`` 表示"没有理想值"，不画线）；
 #: * ``direction`` ``lower`` 越小越好 / ``higher`` 越大越好 / ``target`` 越接近
-#:                 ``ref`` 越好（两侧都坏）/ ``None`` 非技巧分，不做方向判断。
+#:                 ``ref_result`` 越好（两侧都坏）/ ``None`` 非技巧分，不做方向判断。
 METRIC_SEMANTICS: Dict[str, Dict[str, object]] = {
-    "rmse": {"label": "RMSE", "ref": None, "direction": "lower"},
-    "acc": {"label": "ACC（距平相关）", "ref": 1.0, "direction": "higher"},
+    "rmse": {"label": "RMSE", "ref_result": None, "direction": "lower"},
+    "acc": {"label": "ACC（距平相关）", "ref_result": 1.0, "direction": "higher"},
     "activity_ratio": {
         "label": "活跃度比（预报/实况）",
-        "ref": 1.0,
+        "ref_result": 1.0,
         "direction": "target",
     },
     "activity_bias": {
         "label": "活跃度偏差（预报−实况）",
-        "ref": 0.0,
+        "ref_result": 0.0,
         "direction": "target",
     },
     "spectrum_power_ratio": {
         "label": "纬向谱功率比",
-        "ref": 1.0,
+        "ref_result": 1.0,
         "direction": "target",
     },
     # 下面两个是活跃度的**原始量**（距平标准差），不是技巧分：没有理想值，
     # 也就不画参考线，只作为 activity_ratio 的分子/分母摆在表里。
     "activity_forecast": {
         "label": "预报活跃度（距平标准差）",
-        "ref": None,
+        "ref_result": None,
         "direction": None,
     },
     "activity_observation": {
         "label": "实况活跃度（距平标准差）",
-        "ref": None,
+        "ref_result": None,
         "direction": None,
     },
 }
@@ -73,7 +77,39 @@ METRIC_SEMANTICS: Dict[str, Dict[str, object]] = {
 #: 只进表格不进图。
 SKILL_METRICS = ("rmse", "acc", "activity_ratio", "spectrum_power_ratio")
 
+#: **配置里的原始指标名** → 它在长表里展开成的指标名。
+#:
+#: 长表一行一个**展开后**的指标：``activity`` 拆成 ratio / bias / forecast /
+#: observation 四行，``zonal_spectrum`` 只留 ``spectrum_power_ratio``（``summary``
+#: 里的总量字段进了评分表，波数明细进了 ``scores_detail.csv``）。而 ``manifest``
+#: 的 ``metric_options`` 记的是**原始**指标名——两边不同名。
+#:
+#: 缺项检查要把它们对齐，否则 ``curves.get("zonal_spectrum")`` 永远是空，**每个谱
+#: 变量都会被误报成"该算没算"**。这不是假想：``weather_rmse_single_fuxi``
+#: 那份产物里 22 条缺项有 13 条是这么来的（7 个谱变量 + 6 个活跃度变量其实都算出来了）。
+#: 没登记的名字按原样查（``rmse`` / ``acc`` 这类不展开的指标就该如此）。
+METRIC_EXPANSIONS: Dict[str, tuple] = {
+    "activity": (
+        "activity_ratio",
+        "activity_bias",
+        "activity_forecast",
+        "activity_observation",
+    ),
+    "zonal_spectrum": ("spectrum_power_ratio",),
+}
+
 _CN_NUMBERS = ("一", "二", "三", "四", "五", "六", "七", "八", "九", "十")
+
+#: 赤道周长（km）。波数 k 的波长按 ``40075 / k`` 换算，与参考实现
+#: ``mean_spectrum_<var>.csv`` 的 ``wavelength_km`` 列同口径。
+EQUATOR_CIRCUMFERENCE_KM = 40075.0
+
+#: 分波段功率比的波数分界（闭区间，含两端）。
+#:
+#: 为什么要分段：长表里的 ``spectrum_power_ratio`` 是**全波数求和后**再相除，
+#: 一个 0.99 的总量完全可能同时是"大尺度偏弱、小尺度偏强"互相抵消的结果。
+#: 分段之后才看得出失真是**尺度选择性**的。分界想改直接改这个元组。
+SPECTRUM_BANDS = ((1, 5), (6, 20), (21, 60), (61, 180), (181, 720))
 
 
 # --------------------------------------------------------------------------- #
@@ -125,7 +161,7 @@ def metric_ref(metric: str) -> Optional[float]:
     entry = METRIC_SEMANTICS.get(str(metric))
     if not entry:
         return None
-    ref = entry.get("ref")
+    ref = entry.get("ref_result")
     return None if ref is None else float(ref)  # type: ignore[arg-type]
 
 
@@ -137,7 +173,12 @@ def _metric_order(metrics: Sequence[str]) -> List[str]:
 
 
 def _series_stats(values: Sequence[float], leads: Sequence[float], unit: str) -> Dict[str, object]:
-    """一条 ``变量 × 时效`` 曲线的报告用统计量。"""
+    """一条 ``变量 × 时效`` 曲线的报告用统计量。
+
+    ``mean`` 是**逐时效值的算术平均**（每个时效本身已经是跨起报均值），
+    口径就是 ``summary.csv`` 里 ``scope=overall`` 那一档——参考实现的
+    ``det_summary_overall.csv`` 用的也是它，两边可以直接对。
+    """
     numbers = [float(value) for value in values]
     rises = sum(1 for left, right in zip(numbers, numbers[1:]) if right > left)
     falls = sum(1 for left, right in zip(numbers, numbers[1:]) if right < left)
@@ -146,6 +187,7 @@ def _series_stats(values: Sequence[float], leads: Sequence[float], unit: str) ->
         "first": first,
         "mid": numbers[len(numbers) // 2],
         "last": last,
+        "mean": float(np.mean(numbers)),
         "first_lead": float(leads[0]),
         "mid_lead": float(leads[len(leads) // 2]),
         "last_lead": float(leads[-1]),
@@ -199,6 +241,26 @@ def summarize(
     }
     n_failed = int(sum(failed_statuses.values()))
 
+    # 失败行落在哪儿，决定了它是"数据没覆盖到"还是"算错了"：集中在少数变量的
+    # 尾段时效上，前者；散在所有变量所有时效上，后者。
+    failed_groups: List[Dict[str, object]] = []
+    failed_rows = data[statuses != "success"]
+    if not failed_rows.empty and {"metric", "variable"}.issubset(failed_rows.columns):
+        for (metric, variable), subset in failed_rows.groupby(
+            ["metric", "variable"], observed=True
+        ):
+            leads = pd.to_numeric(subset["lead_h"], errors="coerce").dropna()
+            failed_groups.append(
+                {
+                    "metric": str(metric),
+                    "variable": str(variable),
+                    "n": int(len(subset)),
+                    "lead_min": float(leads.min()) if len(leads) else None,
+                    "lead_max": float(leads.max()) if len(leads) else None,
+                }
+            )
+        failed_groups.sort(key=lambda item: (-int(item["n"]), str(item["variable"])))
+
     usable = data[statuses == "success"]
     if "value" in usable.columns:
         usable = usable.dropna(subset=["value"])
@@ -250,8 +312,12 @@ def summarize(
     missing: List[Dict[str, str]] = []
     for metric, names in (requested or {}).items():
         metric = str(metric)
+        # 配置用的是原始指标名，长表用的是展开后的名字，先把两边对齐（见 METRIC_EXPANSIONS）
+        present: set = set()
+        for expanded in METRIC_EXPANSIONS.get(metric, (metric,)):
+            present |= set(curves.get(expanded, {}))
         for name in names or []:
-            if str(name) not in curves.get(metric, {}):
+            if str(name) not in present:
                 missing.append({"metric": metric, "variable": str(name)})
 
     return {
@@ -268,6 +334,7 @@ def summarize(
         "n_success": int(len(usable)),
         "n_failed": n_failed,
         "failed_statuses": failed_statuses,
+        "failed_by_group": failed_groups,
     }
 
 
@@ -277,8 +344,76 @@ def _series_of(summary: Dict[str, object], metric: str) -> List[tuple]:
     return sorted(curves.items())
 
 
-def diagnose(summary: Dict[str, object]) -> List[str]:
-    """规则化诊断：每条结论都带具体数值，只用数据内部的证据。"""
+def spectrum_bands(spectra: Optional[pd.DataFrame]) -> List[Dict[str, object]]:
+    """逐变量 × 逐波段的功率比。纯计算，不做 I/O。
+
+    这是对长表里 ``spectrum_power_ratio`` 的**必要补充**：那一列是全波数求和后的
+    比值，尺度之间会互相抵消；这里按 :data:`SPECTRUM_BANDS` 分段，能看出失真是
+    尺度选择性的。
+
+    Args:
+        spectra: 逐波数长表（``variable / wavenumber / field / value``），来自
+            ``summary.csv`` 的 ``scope=wavenumber`` 档。``None`` / 空表返回 ``[]``。
+
+    Returns:
+        ``[{variable, band, wavelength_min_km, wavelength_max_km, forecast,
+        observation, ratio, observation_share, total_ratio}, ...]``，
+        按变量名、波数升序。``observation_share`` 是该波段实况功率占实况总功率的
+        比例——比值再离谱，占比很小也说明不了什么。
+    """
+    if spectra is None or spectra.empty:
+        return []
+    frame = spectra.copy()
+    for column in ("wavenumber", "value"):
+        frame[column] = pd.to_numeric(frame[column], errors="coerce")
+    frame["field"] = frame["field"].astype(str)
+    frame["variable"] = frame["variable"].astype(str)
+    frame = frame.dropna(subset=["wavenumber", "value"])
+
+    rows: List[Dict[str, object]] = []
+    for variable, subset in frame.groupby("variable", observed=True):
+        wide = subset.pivot_table(
+            index="wavenumber", columns="field", values="value", aggfunc="mean"
+        ).sort_index()
+        if "power_forecast" not in wide.columns or "power_observation" not in wide.columns:
+            continue  # 只有一条谱线，比不出比值；不编一个数出来
+        positive = wide[wide.index > 0]  # k=0 的功率恒为 0，也不属于任何波段
+        total_forecast = float(positive["power_forecast"].sum())
+        total_observation = float(positive["power_observation"].sum())
+        for k_min, k_max in SPECTRUM_BANDS:
+            band = positive[(positive.index >= k_min) & (positive.index <= k_max)]
+            if band.empty:
+                continue
+            forecast = float(band["power_forecast"].sum())
+            observation = float(band["power_observation"].sum())
+            rows.append(
+                {
+                    "variable": str(variable),
+                    "band": f"k={k_min}–{k_max}",
+                    "wavelength_min_km": EQUATOR_CIRCUMFERENCE_KM / k_max,
+                    "wavelength_max_km": EQUATOR_CIRCUMFERENCE_KM / k_min,
+                    "forecast": forecast,
+                    "observation": observation,
+                    "ratio": forecast / observation if observation else float("nan"),
+                    "observation_share": (
+                        observation / total_observation if total_observation else float("nan")
+                    ),
+                    "total_ratio": (
+                        total_forecast / total_observation if total_observation else float("nan")
+                    ),
+                }
+            )
+    return rows
+
+
+def diagnose(
+    summary: Dict[str, object], bands: Optional[Sequence[Dict[str, object]]] = None
+) -> List[str]:
+    """规则化诊断：每条结论都带具体数值，只用数据内部的证据。
+
+    Args:
+        bands: :func:`spectrum_bands` 的结果；给了才会出「分波段」那条结论。
+    """
     findings: List[str] = []
     variables = summary["variables"]
     leads = summary["leads"]
@@ -303,10 +438,34 @@ def diagnose(summary: Dict[str, object]) -> List[str]:
         detail = "、".join(
             f"{name}={count}" for name, count in summary["failed_statuses"].items()
         )
-        findings.append(
+        text = (
             f"有 {summary['n_failed']} 行不是 `success`（{detail}），"
             f"这些行的 `value` 不能直接当结论用，处置方式见 `status` 列。"
         )
+        groups = summary.get("failed_by_group") or []
+        if groups:
+            shown = "；".join(
+                f"{item['metric']}·{item['variable']} {item['n']} 行"
+                + (
+                    f"（时效 {item['lead_min']:g}–{item['lead_max']:g}h）"
+                    if item["lead_min"] is not None
+                    else ""
+                )
+                for item in groups[:5]
+            )
+            if len(groups) > 5:
+                shown += f"；另有 {len(groups) - 5} 组"
+            if len(groups) == 1:
+                text += (
+                    f"它们的分布是：{shown}——其它「指标 × 变量」组合一行不缺。"
+                    f"缺口集中在单个变量上，是那一份观测没覆盖到那几段，不是算错了。"
+                )
+            else:
+                text += (
+                    f"它们的分布是：{shown}。缺口集中在少数变量上多半是观测没覆盖到；"
+                    f"散在所有变量所有时效上才该回头查流程。"
+                )
+        findings.append(text)
 
     missing = summary["missing"]
     if missing:
@@ -367,7 +526,8 @@ def diagnose(summary: Dict[str, object]) -> List[str]:
             findings.append(
                 f"ACC（{name}）{stats['first_lead']:g}h 的 {_fmt(stats['first'])}"
                 f" → {stats['last_lead']:g}h 的 {_fmt(stats['last'])}"
-                f"（绝对 −{_fmt(drop)}，相对 −{_pct(relative)}），{shape}。"
+                f"（绝对 −{_fmt(drop)}，相对 −{_pct(relative)}），全时效均值 "
+                f"{_fmt(stats['mean'])}，{shape}。"
                 f"距平相关没有普适合格线，这里只报形态与幅度。"
             )
 
@@ -389,11 +549,51 @@ def diagnose(summary: Dict[str, object]) -> List[str]:
                 f"{name} {_fmt(stats['last'])}" for name, stats in ranked[:3]
             ) + "。"
         if metric == "spectrum_power_ratio":
-            head += (
-                "这个比值是**全波数求和后**再相除，总量正常也可能掩盖分布失真——"
-                "要看是哪个波段出的问题，用 `--spectrum-variable` / `--spectrum-lead` 出谱曲线。"
-            )
+            # 指向哪儿得看那一节在不在：说了"看下一节的表"而下一节根本没出现，
+            # 比不提还糟。
+            head += "这个比值是**全波数求和后**再相除，总量正常也可能掩盖分布失真——"
+            if bands:
+                head += "是哪个尺度出的问题，看下一节的「分波段功率比」表。"
+            else:
+                head += (
+                    "本报告没拿到 `summary.csv`，出不了分波段表；"
+                    "要看是哪个波段的问题，用 `--spectrum-variable` / `--spectrum-lead` "
+                    "读 `scores_detail.csv` 出谱曲线。"
+                )
         findings.append(head)
+
+    if bands:
+        # 排序用**绝对功率差**而不是 |比值−1|：一个只占总能量 0.001% 的波段可以把
+        # 比值拉到 3 倍，却对总能量毫无影响，按比值排会把它顶到头条上——报告自己
+        # 的注解又说"占比小的波段说明不了什么"，自相矛盾。
+        ranked = sorted(
+            bands, key=lambda item: abs(float(item["forecast"]) - float(item["observation"])),
+            reverse=True,
+        )
+        worst = ranked[0]
+        low = sum(1 for item in bands if float(item["ratio"]) < 1.0)
+        text = (
+            f"**分波段**看（{len({str(item['variable']) for item in bands})} 个变量 × "
+            f"{len(SPECTRUM_BANDS)} 个波段共 {len(bands)} 段）：对总能量偏差贡献最大的是 "
+            f"**{worst['variable']} 的 {worst['band']}**"
+            f"（波长约 {_fmt(worst['wavelength_min_km'], 0)}–{_fmt(worst['wavelength_max_km'], 0)} km，"
+            f"占实况总功率 {_pct(worst['observation_share'])}）："
+            f"预报/实况 {_fmt(worst['ratio'], 3)}，比同变量**全波数总比** "
+            f"{_fmt(worst['total_ratio'], 3)} 偏得更远。{len(bands)} 段里 {low} 段 <1、"
+            f"{len(bands) - low} 段 >1。总比接近 1 不代表每个尺度都对——"
+            f"方向相反的波段会互相抵消。"
+        )
+        # 再点名一个"比值最离谱、但占比不至于可忽略"的，尺度选择性通常在这里露头
+        material = [item for item in bands if float(item["observation_share"]) >= 0.01]
+        if material:
+            sharp = max(material, key=lambda item: abs(float(item["ratio"]) - 1.0))
+            if sharp is not worst:
+                text += (
+                    f"占比 ≥1% 的波段里，偏得最狠的是 {sharp['variable']} 的 "
+                    f"{sharp['band']}（{_fmt(sharp['ratio'], 3)}，占 "
+                    f"{_pct(sharp['observation_share'])}）。"
+                )
+        findings.append(text)
 
     # 逐指标的时效覆盖是否齐整
     for metric in metrics:
@@ -508,15 +708,32 @@ def _overview_table(summary: Dict[str, object], columns: Sequence[str]) -> str:
 
 def _rmse_table(summary: Dict[str, object]) -> str:
     lines = [
-        "| 变量 | 单位 | 首时效 | 中位时效 | 末时效 | 末/首 | 单调上升 |",
-        "|---|---|---|---|---|---|---|",
+        "| 变量 | 单位 | 首时效 | 中位时效 | 末时效 | 全时效均值 | 末/首 | 单调上升 |",
+        "|---|---|---|---|---|---|---|---|",
     ]
     for name, stats in _series_of(summary, "rmse"):
         monotone = "是" if stats["n_rise"] == stats["n_leads"] - 1 else "否"
         lines.append(
             f"| {name} | {stats['unit'] or '—'} "
             f"| {_fmt_auto(stats['first'])} | {_fmt_auto(stats['mid'])} "
-            f"| {_fmt_auto(stats['last'])} | {_fmt(stats['ratio'], 2)} | {monotone} |"
+            f"| {_fmt_auto(stats['last'])} | {_fmt_auto(stats['mean'])} "
+            f"| {_fmt(stats['ratio'], 2)} | {monotone} |"
+        )
+    return "\n".join(lines)
+
+
+def _band_table(bands: Sequence[Dict[str, object]]) -> str:
+    lines = [
+        "| 变量 | 波段 | 波长 (km) | 预报功率 | 实况功率 | 预报/实况 | 实况占比 | 全波数总比 |",
+        "|---|---|---|---|---|---|---|---|",
+    ]
+    for item in bands:
+        lines.append(
+            f"| {item['variable']} | {item['band']} "
+            f"| {_fmt(item['wavelength_min_km'], 0)}–{_fmt(item['wavelength_max_km'], 0)} "
+            f"| {_fmt_auto(item['forecast'])} | {_fmt_auto(item['observation'])} "
+            f"| {_fmt(item['ratio'], 3)} | {_pct(item['observation_share'])} "
+            f"| {_fmt(item['total_ratio'], 3)} |"
         )
     return "\n".join(lines)
 
@@ -574,6 +791,7 @@ def build_field_report(
     change_description: Optional[str] = None,
     artifacts: Optional[Dict[str, Path]] = None,
     spectrum_note: Optional[str] = None,
+    spectra: Optional[pd.DataFrame] = None,
 ) -> Path:
     """写一份连续场评测的 Markdown 报告。
 
@@ -586,11 +804,15 @@ def build_field_report(
             只写能从头几个参数拿到的内容。
         artifacts: ``{名称: 路径}``，图片会被写成 Markdown 图片。
         spectrum_note: 谱曲线的说明（按需出图时由调用方给出）。
+        spectra: 逐波数长表（``summary.csv`` 的 ``scope=wavenumber`` 档）；
+            给了才会出分波段功率比表。谱曲线在 ``scores.csv`` 里根本没有，
+            所以这节只能从 ``summary.csv`` 来。
     """
     output_path = Path(output_path)
     info = dict(manifest_info or {})
     summary = summarize(scores, requested=requested)
-    findings = diagnose(summary)
+    bands = spectrum_bands(spectra)
+    findings = diagnose(summary, bands=bands)
     variables = summary["variables"]
     leads = summary["leads"]
     metrics = summary["metrics"]
@@ -650,9 +872,15 @@ def build_field_report(
     ]
 
     # ---- 四、RMSE 随时效 --------------------------------------------------- #
+    mean_note = (
+        "> 「全时效均值」是各时效值的算术平均（每个时效本身已是跨起报均值），"
+        "口径同 `summary.csv` 的 `scope=overall`，也对得上参考实现的 "
+        "`det_summary_overall.csv`。"
+    )
     rmse = [
         _rmse_table(summary),
         "",
+        mean_note,
         "> 「末/首」是末时效与首时效的倍数，单位无关，可跨变量比较；"
         "「单调上升」要求相邻时效两两递增。",
     ]
@@ -664,6 +892,23 @@ def build_field_report(
         "**>1 偏噪、<1 偏平滑**；偏差 = 预报−实况，与比同号但量纲随变量走。"
         "谱功率比是**全波数求和后**的比值，总量对了也可能分布失真。"
     )
+    if bands:
+        activity += [
+            "",
+            # 数的是**真出了数的**波段，不是 SPECTRUM_BANDS 的长度：谱线短的时候
+            # 高波数那几段是空的（比如 max_wavenumber 只算到 30），标题写 5 个波段
+            # 而表里只有 3 行，就成了报告自己打自己的脸。
+            f"### 分波段功率比（{len({str(item['band']) for item in bands})} 个波段）",
+            "",
+            _band_table(bands),
+            "",
+            "> 波长按赤道周长 40075 km 换算（k=1 → 40075 km），与 `mean_spectrum_<var>.csv` "
+            "的 `wavelength_km` 同口径；波段分界见 `field_report.SPECTRUM_BANDS`。"
+            "**「实况占比」小的波段，比值再离谱也说明不了什么**——先看它占多少能量。"
+            "「全波数总比」一行内是常数，重复写出来是为了和分波段比值并排比；"
+            "注意它和上面那张表的「谱功率比」列**不是同一口径**：上面那列逐时效，"
+            "末时效会明显小于这里——这里是跨起报、跨时效平均后的全天候值。",
+        ]
     if spectrum_note:
         activity += ["", spectrum_note]
 
@@ -686,12 +931,14 @@ def build_field_report(
         "- **首/末时效不是稳定的统计量**：起报数与样本区间决定了这条曲线的形态，"
         "本报告里「涨到几倍」这类说法只在当前这套输入下成立，"
         "跨批次比较要用同样的起报集合与时段。",
-        "- **逐波数谱曲线不在 `scores.csv` 里**，在 `spectrum` writer 出的"
-        "`diagnostics/spectrum_{var}.csv`（全体均值）与 `spectrum_by_init.csv`（逐起报）；"
-        "本报告默认不读它（单变量就有 721 个波数 × 几百个起报）。"
-        "早先的归档才在 `diagnostics/scores_detail.csv` 的 `group=k=<波数>` 行里，"
-        "那种格式下可用 `--spectrum-variable` / `--spectrum-lead` 按需出图。",
-        "- 本报告**不重算任何指标**，只消费已落盘的长表；`scores.csv` 是唯一数值来源。",
+        "- **逐波数谱曲线不在 `scores.csv` 里**，在 `summary.csv` 的 `scope=wavenumber` 档"
+        "（跨起报、跨时效平均后的逐波数功率）。报告的分波段表与谱面板都从这里取；"
+        "`summary.csv` 不存在时这两块直接不出现，不从别处凑。要**指定时效**的谱，"
+        "得读 `diagnostics/scores_detail.csv` 的 `group=k=<波数>` 行"
+        "（单变量单时效就有 721 个波数，本仓库那份 492MB），用 "
+        "`--spectrum-variable` / `--spectrum-lead` 按需出图。",
+        "- 本报告**不重算任何指标**，只消费已落盘的表：数值主来源是 `scores.csv`，"
+        "逐波数谱那两块来自 `summary.csv`。缺表缺行如实写出，不猜也不补。",
     ]
 
     sections: List[tuple] = [
@@ -735,7 +982,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser.add_argument("--dpi", type=int, default=150)
     args = parser.parse_args(argv)
 
-    from xmetai_evaluation.visualization.field_plots import FieldScorePlotter
+    from visualization.field_plots import FieldScorePlotter
 
     scores = pd.read_csv(args.scores)
     manifest = (
@@ -744,10 +991,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     info = manifest_info_from(manifest)
     model = args.model or str(info.get("model_id") or args.scores.stem)
 
+    # summary.csv 是 scores.csv 的同级产物（field_summary writer 落的），有就用它出
+    # 纬向谱面板与分波段功率比；没有就照常出图，不额外要一个开关。
+    summary_path = args.scores.with_name("summary.csv")
     plotter = FieldScorePlotter()
     artifacts = plotter.create_report(
         scores,
         output_dir=args.out,
+        summary_path=summary_path if summary_path.is_file() else None,
         model_name=model,
         manifest_info=info,
         sources={"scores": str(args.scores)},

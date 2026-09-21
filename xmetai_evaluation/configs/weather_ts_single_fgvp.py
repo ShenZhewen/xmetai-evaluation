@@ -26,7 +26,7 @@ from xmetai_evaluation.configs.base import EvalConfig
 TS_THRESHOLDS = [0.1, 10.0, 25.0, 50.0, 100.0, 250.0]
 
 cfg = EvalConfig(
-    name="weather_ts_det_fgvp",
+    name="weather_ts_single_fgvp",
     description="FGVP 确定性降水 TS 评估（与站点观测对比）",
     pipeline="weather_ts_det",
 
@@ -89,7 +89,7 @@ cfg = EvalConfig(
 
     output_dir=os.environ.get(
         "EVAL_OUTPUT",
-        "/workspace/szwCode/xmetai-evaluate/evaluation_results/weather_ts_det_fgvp",
+        "/workspace/szwCode/xmetai-evaluate/evaluation_results/weather_ts_single_fgvp",
     ),
     log_level="INFO",
 
@@ -98,7 +98,7 @@ cfg = EvalConfig(
     # 写错键名会直接报配置错。全部字面量，不写的键用推导值。
     #
     # 本流程是**轻指标**（逐站列联表，无 FFT、无成员维、无邻域），推导缺省就是
-    # threads。**不要照抄 weather_field_scores_era5_fuxi 的 processes + 24 进程**
+    # threads。**不要照抄 weather_rmse_single_fuxi 的 processes + 24 进程**
     # ——那份是谱/活跃度的重指标，靠多进程绕 GIL；这里换多进程只会多出"每个子
     # 进程一份站点观测"的开销，而 threads 下 resident 全局只有 1 份（loader 有锁）。
     execution={

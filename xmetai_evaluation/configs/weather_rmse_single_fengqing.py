@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """确定性连续量检验（风清单卡 × ERA5）：对标 xu ``scripts/single_fengqing.sh``。
 
-与 ``weather_field_scores_era5_fuxi.py`` 同流程、同单位口径，差别只有两处数据事实：
+与 ``weather_rmse_single_fuxi.py`` 同流程、同单位口径，差别只有两处数据事实：
 风清单卡输出里没有 q2m，且地面风变量名是 ``U10``/``V10``（由布局翻译成
 标准的 ``u10m``/``v10m``，与 ERA5 zarr 对齐）。
 
@@ -58,7 +58,7 @@ METRIC_OPTIONS["zonal_spectrum"] = {
 _ERA5_STORE_ROOT = "/workspace/data/liujunjie/era5_foundation_store2"
 
 cfg = EvalConfig(
-    name="weather_field_scores_era5_fengqing",
+    name="weather_rmse_single_fengqing",
     description="确定性连续量检验（风清单卡 × ERA5）：15 要素逐变量的 RMSE / 谱 / ACC / 活跃度",
     pipeline="weather_field_scores",
 
@@ -107,7 +107,7 @@ cfg = EvalConfig(
 
     output_dir=os.environ.get(
         "EVAL_OUTPUT",
-        "/workspace/szwCode/xmetai-evaluate/evaluation_results/weather_field_scores_era5_fengqing",
+        "/workspace/szwCode/xmetai-evaluate/evaluation_results/weather_rmse_single_fengqing",
     ),
     metric_options=METRIC_OPTIONS,
     log_level="INFO",
@@ -118,7 +118,7 @@ cfg = EvalConfig(
     # 与模板自带的 writers 一致，写出来是为了好改。
     writers=["csv_long", "spectrum"],
 
-    # ⚠ 采样口径尚未与 weather_field_scores_era5_fuxi 对齐，正式跑前请定夺。
+    # ⚠ 采样口径尚未与 weather_rmse_single_fuxi 对齐，正式跑前请定夺。
     # 本配置没写 options，走协议缺省 valid_time——「一个有效时刻一个样本、最新
     # 起报获胜」。逐日起报配 15 天时效时，后一个起报的短时效会把前一个起报的
     # 长时效覆盖掉，每个起报只落得下头 4 个时效，后面 56 个 step 在归并时全被
@@ -165,7 +165,7 @@ cfg = EvalConfig(
     # 规模：lead 到 360h、6h 步长 → 按 lead_chunk_days=1 切出 16 个时效窗；
     # 起报数 × 16 窗 = 总块数（段数 = min(n_workers, 待跑块数)）。
     #
-    # 内存账（**未实测，按 weather_field_scores_era5_fuxi 的量级外推**）：
+    # 内存账（**未实测，按 weather_rmse_single_fuxi 的量级外推**）：
     # 日序气候态 resident 随要素数线性涨——fuxi 那份 12 要素实测 67.25G / 991.7s，
     # 本配置 15 要素更多，**正式跑前务必先小样本量一次**（日志里 loader 会打
     # 「角色 reference 预热完成：耗时 X.Xs，驻留 X.XX GB」）。单块工作集同理，

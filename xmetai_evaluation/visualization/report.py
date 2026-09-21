@@ -8,7 +8,7 @@
 
 **能力身份从产物自己认，不靠目录名**：``manifest.json`` 里的
 ``resolved_config.pipeline`` 是权威判据（``runner`` 无条件写它）。目录名与
-``run_id`` 都不可靠——配置名（``weather_field_scores_era5_fuxi``）与流程名
+``run_id`` 都不可靠——配置名（``weather_rmse_single_fuxi``）与流程名
 （``weather_field_scores``）本来就不绑定。
 
 没有 ``resolved_config`` 的老产物走退路判据：``protocol_id`` + ``manifest["metrics"]``
@@ -31,7 +31,7 @@ import json
 from pathlib import Path
 from typing import Dict, Optional, Sequence
 
-from xmetai_evaluation.visualization.field_report import manifest_info_from
+from visualization.field_report import manifest_info_from
 
 #: 已经有报告模板的能力：流程名 -> 所属**报告家族**。
 #: 同一家族的流程共用一套模板与图表，因为它们写出的产物表结构相同
@@ -65,6 +65,9 @@ _FALLBACK_RULES = (
 
 DETAILS_RELATIVE_PATH = Path("diagnostics") / "scores_detail.csv"
 CATEGORICAL_WIDE_RELATIVE_PATH = Path("diagnostics") / "categorical_wide.csv"
+#: 连续场的聚合视图，跟 scores.csv 平级（``field_summary`` writer 落的）。有它才能
+#: 画纬向谱面板、算分波段功率比——谱曲线在 scores.csv 里根本没有。
+SUMMARY_RELATIVE_PATH = Path("summary.csv")
 
 
 def parse_compare_specs(specs: Optional[Sequence[str]]) -> Dict[str, Path]:
@@ -229,7 +232,7 @@ def _render_ts(
     try:
         import pandas as pd
 
-        from xmetai_evaluation.visualization.precipitation_plots import PrecipitationPlotter
+        from visualization.precipitation_plots import PrecipitationPlotter
     except ImportError as error:  # pragma: no cover - 取决于环境
         raise ImportError(
             "出图需要 matplotlib（可选依赖），先装：pip install -e .[viz]。"
@@ -266,7 +269,7 @@ def _render_field(
     try:
         import pandas as pd
 
-        from xmetai_evaluation.visualization.field_plots import FieldScorePlotter
+        from visualization.field_plots import FieldScorePlotter
     except ImportError as error:  # pragma: no cover - 取决于环境
         raise ImportError(
             "出图需要 matplotlib（可选依赖），先装：pip install -e .[viz]。"
@@ -274,9 +277,11 @@ def _render_field(
         ) from error
 
     details_path = output_dir / DETAILS_RELATIVE_PATH
+    summary_path = output_dir / SUMMARY_RELATIVE_PATH
     return FieldScorePlotter().create_report(
         pd.read_csv(scores_path),
         output_dir=target,
+        summary_path=summary_path if summary_path.is_file() else None,
         details_path=details_path if details_path.is_file() else None,
         spectrum_variable=spectrum_variable,
         spectrum_lead=spectrum_lead,
@@ -291,7 +296,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser = argparse.ArgumentParser(
         description="按评测产物目录自动选模板，出图并写 Markdown 报告",
         epilog="示例: python -m xmetai_evaluation.visualization.report "
-        "evaluation_results/weather_ts_det_fgvp --out reports/weather_ts_det_fgvp",
+        "evaluation_results/weather_ts_single_fgvp --out reports/weather_ts_single_fgvp",
     )
     parser.add_argument("output_dir", type=Path, help="评测产物目录（含 scores.csv 与 manifest.json）")
     parser.add_argument("--out", type=Path, default=None, help="报告输出目录（默认 reports/<run_id>）")

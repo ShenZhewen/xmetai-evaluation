@@ -11,20 +11,24 @@
 ``build_ts_report`` / ``build_field_report`` 是两条链路各自的报告正文。
 """
 
-from xmetai_evaluation.visualization.field_plots import (
+from visualization.field_plots import (
     FieldScorePlotter,
+    load_wavenumber_spectra,
     prepare_field_dataframe,
+    spectrum_series,
 )
-from xmetai_evaluation.visualization.field_report import (
+from visualization.field_report import (
     METRIC_SEMANTICS,
+    SPECTRUM_BANDS,
     build_field_report,
+    spectrum_bands,
 )
-from xmetai_evaluation.visualization.precipitation_plots import (
+from visualization.precipitation_plots import (
     PrecipitationPlotter,
     prepare_ts_dataframe,
 )
-from xmetai_evaluation.visualization.report import build_report, detect_capability
-from xmetai_evaluation.visualization.ts_report import build_ts_report, diagnose, summarize
+from visualization.report import build_report, detect_capability
+from visualization.ts_report import build_ts_report, diagnose, summarize
 
 __all__ = [
     "PrecipitationPlotter",
@@ -32,8 +36,12 @@ __all__ = [
     "build_ts_report",
     "FieldScorePlotter",
     "prepare_field_dataframe",
+    "load_wavenumber_spectra",
+    "spectrum_series",
     "build_field_report",
     "METRIC_SEMANTICS",
+    "SPECTRUM_BANDS",
+    "spectrum_bands",
     "build_report",
     "detect_capability",
     "summarize",
