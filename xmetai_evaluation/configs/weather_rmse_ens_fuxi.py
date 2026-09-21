@@ -1,83 +1,111 @@
 # -*- coding: utf-8 -*-
 """集合场检验（FuXi 集合 × ERA5）：对标 xu ``scripts/ensemble_fuxi.sh``。
 
-流程：``weather_ens_field_scores``（确定性误差 + 集合分布质量同跑）。
-xu 这条脚本的五种指标横跨"确定性"与"概率"两类，所以既不能套
-``weather_field_scores``（无 crps），也不能套 ``weather_ens_crps``（无谱/ACC）。
+流程 ``weather_ens_field_scores``：格点预报插值到 ERA5 网格、按 (起报, 时效)
+配对，同一批集合样本上既看确定性误差（集合均值 vs 实况），也看集合分布
+本身的质量（CRPS 直接吃原始成员，不走均值）。
 
-    xu --metrics rmse crps acc fa spectrum  ->  rmse / crps / acc / activity / zonal_spectrum
-    xu --vars z500 msl u200 v200 ws200      ->  VARS
-    xu --var-metrics z500:rmse,crps,acc,fa,spectrum ...  ->  VAR_METRICS
-
-注意 crps 只路由给 z500（xu 也只对它算）：CRPS 直接吃原始成员，不走集合均值。
-
-单位口径（与 xu 报告层一致，便于逐格对拍）：
-    z500 报 m²/s²（不除 g）、msl 报 Pa、风报 m/s。
-``ws200`` 由 ``sqrt(u200²+v200²)`` 现合成（预报、实况、气候态三侧都合成）。
-
-内存：``grid_valid_time`` 会一次读入评测时段内全部有效时刻；集合还多一份成员场。
-默认给的是冒烟级小区间，正式跑直接改下面的 ``start_date`` / ``end_date`` / ``limit``。
+z500 报 m²/s²（不除 g）、msl 报 Pa、风报 m/s。
+``ws200`` 任何文件里都没有，三侧（预报/实况/气候态）都由 sqrt(u²+v²)
+现合成。
 """
 import os
 
 from xmetai_evaluation.configs.base import EvalConfig, metric_options_from_var_metrics
 
-# # xu: --vars z500 msl u200 v200 ws200
-# VARS = ["z500", "msl", "u200", "v200", "ws200"]
-#
-# # xu: --var-metrics（逐条转写；fa -> activity、spectrum -> zonal_spectrum）
-# VAR_METRICS = {
-#     "z500": ["rmse", "crps", "acc", "activity", "zonal_spectrum"],
-#     "msl": ["rmse", "acc"],
-#     "u200": ["rmse", "activity", "zonal_spectrum"],
-#     "v200": ["rmse", "activity", "zonal_spectrum"],
-#     "ws200": ["rmse", "activity", "zonal_spectrum"],
-# }
-
+# ── 要素表 ────────────────────────────────────────────────────────────────
+# 逐个变量配对出分。可选值 = 两边 reader 布局里都有的名字（预报侧见
+# io/layouts.py 的 FUXI_ENS_PHYS_LAYOUT，观测侧见 ERA5_ZARR_LAYOUT）。
 VARS = ["z500"]
 
-# xu: --var-metrics（逐条转写；fa -> activity、spectrum -> zonal_spectrum）。
-# spherical_bands 是 v2 补的球谐带功率（老仓 spherical_bands_<date>_<var>.csv
-# 契约），只对全球网格有定义，配了 regions 分带时它恒全球。
+# 全量表（正式跑用，替换上面一行）。ws200 现合成，见 docstring：
+# VARS = ["z500", "msl", "u200", "v200", "ws200"]
+
+# ── 逐变量指标表 ──────────────────────────────────────────────────────────
+# 每个变量点名的指标各出一行分。可用指标（components.py 注册表，完整说明
+# 见 README「评估指标说明」）：
+#   rmse / bias             误差族，只要预报+观测
+#   acc / acc_uncentered    距平族，还要气候态参考（acc 的 centered 参数见下）
+#   activity                活跃度比，也要气候态
+#   zonal_spectrum          纬向谱（去纬向均值 rfft，cos 纬度加权），重指标
+#   spherical_bands         球谐带功率（总波数分带，老仓 spherical_bands_*.csv
+#                           同口径），重指标；只对全球含极网格有定义——配了
+#                           下方 regions 分带时它恒全球，不逐带出分
+#   crps / spread_error     集合族：crps 吃原始成员；spread_error 另带 Spread /
+#                           离散度-误差比（本配置没点名，要加就写进某组
+#                           variables 下）
+#   ts_score / fss / ensemble_probability  分类/空间/概率族（本流程不用）
+# ⚠ 每个用到的指标都必须点到某组 variables 下（漏点名的会拿到整批多变量
+#   数据，single_variable 直接报错——这是框架故意的，防静默出假数）。
+# ⚠ crps 只路由给 z500（xu 也只对它算）。
 VAR_METRICS = {
-    "z500": ["rmse", "crps", "acc", "activity", "zonal_spectrum", "spherical_bands"]
+    "z500": ["rmse", "crps", "acc", "activity", "zonal_spectrum", "spherical_bands"],
 }
 
+# 全量表（正式跑用，替换上面一块）：
+# VAR_METRICS = {
+#     "z500": ["rmse", "crps", "acc", "activity", "zonal_spectrum", "spherical_bands"],
+#     "msl": ["rmse", "acc"],
+#     "u200": ["rmse", "activity", "zonal_spectrum", "spherical_bands"],
+#     "v200": ["rmse", "activity", "zonal_spectrum", "spherical_bands"],
+#     "ws200": ["rmse", "activity", "zonal_spectrum", "spherical_bands"],
+# }
 
 METRIC_OPTIONS = metric_options_from_var_metrics(VAR_METRICS)
-# xu 的 ACC 是 uncentered（FDP / WeatherBench2 口径），不是经典皮尔逊
+# acc 用哪种口径：True = 经典皮尔逊（距平去均值再相关）；False = uncentered
+# （FDP / WeatherBench2 口径，分子分母都带均值项）。xu 对标的是 False。
 METRIC_OPTIONS["acc"] = {**METRIC_OPTIONS["acc"], "centered": False}
-# xu 的谱取到 720 波（全球 0.25° 的 Nyquist）
+# zonal_spectrum 取到多少个波数。720 = 全球 0.25° 的 Nyquist；写小了只截
+# 曲线前段（大尺度），写超过 Nyquist 没有意义。
 METRIC_OPTIONS["zonal_spectrum"] = {
     **METRIC_OPTIONS["zonal_spectrum"],
     "max_wavenumber": 720,
 }
+# spherical_bands 的分带边界（总波数闭区间列表）。默认沿用老仓分段
+# (1,4)/(5,20)/(21,40)/(41,64)/(65,128)，与老档案对拍就别动；要改就整表
+# 覆盖，如 ((1, 10), (11, 40))。带边界上限受网格约束：
+# 2*max_hi < nlat-1 且 max_hi < nlon//2（ERA5 721×1440 到 128 没问题）。
+# METRIC_OPTIONS["spherical_bands"] = {
+#     **METRIC_OPTIONS["spherical_bands"],
+#     "bands": ((1, 4), (5, 20), (21, 40), (41, 64), (65, 128)),
+# }
 
 _ERA5_STORE_ROOT = "/workspace/data/liujunjie/era5_foundation_store2"
 
 cfg = EvalConfig(
     name="weather_rmse_ens_fuxi",
-    description="集合场检验（FuXi 集合 × ERA5）：z500/msl/u200/v200/ws200 的 RMSE / CRPS / ACC / 活跃度 / 谱",
+    description="集合场检验（FuXi 集合 × ERA5）：z500/msl/u200/v200/ws200 的 RMSE / CRPS / ACC / 活跃度 / 谱 / 球谐带功率",
+    # 走哪套流程模板。模板 = 协议 + 变换 + 指标的预设组合（全部可选值
+    # `xmetai-eval --list-pipelines`）。本流程 = grid_valid_time 协议 +
+    # ensemble_mean 变换（确定性指标吃集合均值，crps 例外——协议内部
+    # 另给原始成员）。
     pipeline="weather_ens_field_scores",
 
+    # ── 数据源三件套：type 决定布局与单位换算 ──────────────────────────
+    # 预报侧 type 可选（components.py 注册）：fuxi_ens / fuxi_ens_phys /
+    # fuxi / fuxi_phys / fengqing / fengqing_phys / cra。带 _phys 后缀 =
+    # xu 复刻口径（z500 报 m²/s² 不除 g、要素表全），不带 = 旧口径
+    # （z500 除 g 报位势米、只有 5 个要素）。fuxi_ens 与 fuxi_ens_phys
+    # 的时效都按文件序号推（lead_from="index"，001.nc → +6h，步长写
+    # step_hours）；fengqing 按文件名时效位推。
     forecast_reader={
         "type": "fuxi_ens_phys",
         "root_dir": os.environ.get(
             "FUXI_ENS_OUTPUT", "/workspace/data/shenzw/fuxi_ens_output"
         ),
         "variables": VARS,
-        "step_hours": 6.0,      # 布局步长：lead_from="index"，001.nc → +6h
-        # 时效列表（小时）。**不写 = 从目录索引推**：取目录里的最大时效 lead_max，
-        # 按 step_hours 从 0 铺起（0, 6, 12, …, lead_max）。要"不限制"写 None 或
-        # 整个键不写，两者等价。
-        #
-        # 与降水流程（weather_ts_det / weather_ts_ens）不同，本流程**没有累积窗**
-        # ——weather_ens_field_scores 的变换只有 ensemble_mean，每个读到的时效都是
-        # 独立样本，所以这里可以自由写稀疏集，不会出现"凑不齐窗、一个样本都没有"：
-        #     "lead_times": [24, 48, 72, 96, 120],   # 只评前 5 天，省读盘省内存
-        # 写出来就是**覆盖**：框架不再从目录推，块也只按列表里的时效读。
+        "step_hours": 6.0,
+        # 时效列表（小时），三选一：
+        #   不写这个键     从目录索引推：0, 6, 12, …, 目录里的最大时效
+        #   写列表         覆盖：块只按列表里的时效读，可写稀疏集
+        #                 （如 [24, 48, 72, 96, 120] 只评前 5 天，省读盘省
+        #                  内存）——本流程无累积窗，每个时效都是独立样本，
+        #                  稀疏集不会"凑不齐窗"
+        #   显式写 None    与不写等价（不限制）
         "lead_times": None,
     },
+    # 观测侧 type 可选：era5_zarr（格点 ERA5，pl/sfc 两个 zarr，变量自动
+    # 路由到所在 store）/ station（站点降水）/ cra / ref_probability。
     observation_reader={
         "type": "era5_zarr",
         "stores": {
@@ -92,81 +120,113 @@ cfg = EvalConfig(
         },
         "variables": VARS,
     },
+    # 参考场，只有 acc / activity 用得上（配置里给了、指标用不上时不会构建，
+    # 所以不相关的配置可以照抄）。type 可选：daily_climatology（逐日气候态
+    # 文件，smooth_days 控制取场前的环形平滑天数）/ climatology / ref_probability
+    # （气候概率，BSS 用）。smooth_days 是气象参数（= xu 的 --climo-window），
+    # 与 execution.loads 的 window:W（IO 缓存）没有关系。
     reference_reader={
         "type": "daily_climatology",
         "root_dir": os.environ.get("ERA5_CLIMO", "/workspace/data/worm/era5_clim_phys_14.nc"),
-        # 15 天环形平滑（±7.5 天，跨年首尾相接）：取场前对年内日序做中心对齐的
-        # 滑动平均，抹平单日气候态的天气尺度噪声。与 xu 的 --climo-window 同口径，
-        # 是**气象参数**，跟 execution.loads 的 window:W（IO 窗块缓存）没有关系。
-        "smooth_days": 15,
+        "smooth_days": 15,  # ±7.5 天中心滑动、跨年首尾相接，抹平单日气候态噪声
     },
 
+    # 评测时段（YYYYMMDD 或 YYYYMMDDHH），只管起报日的范围；观测/参考读
+    # 多少由框架按时效跨度自己算。当前是冒烟小区间，正式跑改这两行。
     start_date=os.environ.get("START_DATE", "20250102"),
     end_date=os.environ.get("END_DATE", "20250104"),
-    limit=None,  # 限起报数，直接改这里；None = 不限
+    limit=None,  # 限起报数：冒烟改 2；None = 不限。改回 None 重跑时 resume
+                 # 会复用冒烟算过的块，不白算
 
     output_dir=os.environ.get(
         "EVAL_OUTPUT",
         "/workspace/szwCode/xmetai-evaluate/evaluation_results/weather_rmse_ens_fuxi",
     ),
     metric_options=METRIC_OPTIONS,
-    log_level="INFO",
+    log_level="INFO",  # DEBUG / INFO / WARNING / ERROR
 
-    # 逐波数谱曲线（720 个点）不走 value——value 里每个分组键都会展开成明细行，
-    # 2165 行/样本 × 20880 样本 ≈ 四千五百万行。改用 spectrum writer：出
-    # diagnostics/spectrum_{var}.csv（全体均值）与 spectrum_by_init.csv（逐起报），
-    # 对标参考实现的 det_summary_spectrum_{var}.csv / spectrum_{init}_{var}.csv。
+    # ── 输出视图（可多选）──────────────────────────────────────────────
+    #   csv_long          统一长表 scores.csv（主表，任何评测都该带上）
+    #   spectrum          逐波数谱曲线 diagnostics/spectrum_*.csv（zonal_spectrum
+    #                     必加：720 个点的曲线走长表会爆行数）
+    #   categorical_wide  分类检验宽表（ts_score 配套）
+    #   probability_wide  集合概率宽表 AROC/BS/BSS
+    #   coverage / details / json  覆盖率、诊断明细、JSON 快照
+    # 注：spherical_bands 不需要 spectrum writer——每带只有 3 行标量，
+    # 直接进长表（带名在 group 列）。
     writers=["csv_long", "spectrum"],
 
-    # 采样口径：每个起报各报满 15 天（60 个 step），逐个 step 出分。
-    # 缺省是 valid_time——「一个有效时刻一个样本、最新起报获胜」的连续场口径；
-    # 逐日起报配 15 天时效时，后一个起报的短时效会把前一个起报的长时效覆盖掉，
-    # 每个起报只落得下头 4 个时效（348×4 + 末个起报 60 = 1448 行），
-    # 后面 56 个 step 全在归并时被扔掉。init_lead 给每个 (起报, 时效) 一个样本。
-    options={"sample_by": "init_lead"},
+    # ── 协议参数 ────────────────────────────────────────────────────────
+    options={
+        # 采样口径，二选一：
+        #   "init_lead"   每 (起报, 时效) 一个样本，逐起报报满整段时效。
+        #                 逐日起报配 15 天时效必须用它——"valid_time" 口径下
+        #                 同一有效时刻只认最新起报，每起报只剩头 4 个时效
+        #   "valid_time"  每个有效时刻一个样本、最新起报获胜（缺省）
+        "sample_by": "init_lead",
+        # 分纬度带评估：{带名: {"lat_min": 南界, "lat_max": 北界}}，边界闭
+        # 区间。每个样本除全球行外逐带再出一行，长表 region 列区分（全球行
+        # 为空）；标量指标（RMSE/ACC/活跃度/CRPS 等）逐带出分，
+        # zonal_spectrum / spherical_bands / FSS 恒全球（球谐与纬向谱要
+        # 完整球面场，掩掉的子区域上算出来的不是同一个物理量）。
+        # 不分区就删掉这个键，输出回到只有全球行。
 
-    # 并发与数据加载覆盖项（不写的键用推导值）：
-    #   mode:       serial / threads / processes / auto（auto：单块=串行、
-    #               重指标=进程、轻指标=线程；本流程含 crps+谱 → 重 → processes）
-    #   n_workers:  并发数；不写时 processes=用满 CPU、threads=4
-    #   chunk_days: 几天起报一块；不写 = 1（一天一块）
-    #   lead_chunk_days: 一个块装几天时效；不写 = 1（一天，通常 4 个 6h 时效）。
-    #               单位是天、只收整数，1 已是地板；0 = 不切（整段时效一块，最费内存）
-    #   loads:      角色驻留覆盖；本流程推导值 observation=slice（era5_zarr）、
-    #               reference=resident（日序气候态整 run 驻留）
-    #   resume:     True 时已完成块落 output_dir/.states/，重跑跳过
+        # 下面是经典三分带（热带 ±20° + 两半球中高纬，拼满全球不重叠），
+        # 改边界直接改数字。
+        "regions": {
+            "tropics": {"lat_min": -20, "lat_max": 20},
+            "nh_extratropics": {"lat_min": 20, "lat_max": 90},
+            "sh_extratropics": {"lat_min": -90, "lat_max": -20},
+        },
+    },
+
+    # ── 并发与数据加载 ──────────────────────────────────────────────────
+    # 可用键就这 6 个，全部字面量；只覆盖写到的键（不写 = 按指标族与数据源
+    # 形态推导），写错键名直接报配置错、不会静默忽略。
     #
-    # 规模：lead 到 360h、6h 步长 → 按 lead_chunk_days=1 切出 16 个时效窗；
-    # 348 个起报 × 16 窗 = 5568 块，24 段各 232 块（段数 = min(n_workers, 待跑块数)）。
+    # mode             并发形态，四选一：
+    #                    serial     单进程逐块（冒烟、单块用）
+    #                    threads    1 进程 N 线程，共享同一份驻留（轻指标用）
+    #                    processes  进程池；块按时间连续分段、一段固定一个
+    #                               子进程顺序跑完（段内相邻块命中窗块缓存）
+    #                    auto       推导：单块→serial；重指标→processes；
+    #                               轻指标→threads。本流程含 crps+谱 → 即
+    #                               processes
+    # n_workers        进程/线程数。processes 缺省 = CPU 核数。上限往往是
+    #                  内存不是核数（见下方内存备注）
+    # chunk_days       一个块装几个起报日（缺省 1）——管起报跨度
+    # lead_chunk_days  一个块装几天时效（缺省 1）——管时效跨度，是单块内存
+    #                  的主旋钮；0 = 不切（整段时效一块，与切块功能加入前
+    #                  逐位一致，逃生口）
+    # loads            角色驻留 {角色: 策略}。角色只有 observation / reference
+    #                  （预报恒为 slice、不在表里，写了报错）：
+    #                    slice     每块现读现弃（缺省）
+    #                    resident  整 run 读一次驻留（气候态用；fork 前预热、
+    #                              子进程 COW 共享，全程只有 1 份）
+    #                    window    自动定窗 = 一个起报日组的观测日跨度
+    #                    window:W  滚动缓存上限 W 天；实际取 min(W, 自动值)，
+    #                              写大了不更省、只多占内存。窗块每进程各一份
+    #                              （不像 resident 那样共享）
+    # resume           True = 已完成块的状态落 output_dir/.states/，重跑跳过
     #
-    # 内存账：日序气候态 resident 预热实测 5.60G —— 这是 **z500 单要素**的量。
-    # det 那份（weather_rmse_single_fuxi）评 5 个要素才是 67G，别把那个数
-    # 搬过来。单 worker 工作集估算 ~1.7G（1 要素 × 4 时效 × 51 成员 = 204 个场，
-    # _combine 拼接时分量与结果并存，峰值翻倍），没实测过，按估的数留余量。
-    # 总量 ≈ 5.6 + 1.7 × n_workers —— n_workers=24 时约 47G。卡口是核数不是内存。
-    # 驻留那 5.6G 是 fork 前预热、子进程 COW 共享的**固定份额**，与 worker 数无关，
-    # 所以加 worker 只在工作集上线性花钱。
-    #
-    # ⚠ 观测的 window 是**另一笔账**（2026-09 从 slice 改过来）：era5_zarr 是立即读进
-    # numpy 的，窗块真占内存、而且每进程一份（不像 resident 那样 fork 共享）。稳态留
-    # 3 个块（当前块 ±1，回跳要用），单通道一个 16 天块 ≈ 0.27G，3 块 ≈ 0.8G/进程
-    # × 24 ≈ 19G —— 本配置只有 z500，加得起。
-    # ⚠ 若把 VARS 放回上面注释里那 5 个要素：气候态 resident 涨到 ~67G、工作集 ×5、
-    #   窗缓存 ×5（~95G），n_workers=24 就是 400G 量级 —— 那种配法必须把 n_workers
-    #   降到 8~12，或者把 observation 退回 slice。
+    # 本配置规模（z500 冒烟态）：lead 到 360h、按 lead_chunk_days=1 切 16 个
+    # 时效窗 × 起报数 = 16×N 块。observation 用 window:16（= 整段时效 15 天
+    # + 起报 1 天，即自动定窗值）：块序是起报日外层、时效窗内层，相邻起报组
+    # 的观测日大面积重叠，滚动窗让一个观测日整 run 只读一次。
+
+    # 内存备注（实测口径，z500 单要素）：气候态 resident 预热 ~5.6G（共享
+    # 1 份，与 worker 数无关）+ 每 worker ~1.7G 工作集（集合还多一份成员场：
+    # 1 要素 × 4 时效 × 51 成员 = 204 个场，_combine 拼接时峰值翻倍）+ 观测
+    # 窗块单通道 ~0.8G/进程。
+    # ⚠ 换回全量表（5 要素）：气候态 resident 涨到 ~67G、工作集 ×5、窗缓存
+    #   ×5（~95G），n_workers=24 就是 400G 量级——必须把 n_workers 降到
+    #   8~12，或把 observation 退回 slice。
+
     execution={
         "mode": "processes",
         "n_workers": 24,       # 24 核 → 24 进程：np.fft 单线程，1 worker≈1 核不超订
         "chunk_days": 1,        # 一个块装 1 个起报日
         "lead_chunk_days": 1,   # 一个块装 1 天时效（= 4 个 6h 时效）
-        # observation 从推导缺省的 slice 改成 window：块序是「起报日外层、时效窗
-        # 内层」，相邻起报组的观测日大面积重叠（扫完 16 天再回跳 14 天），滚动窗块
-        # 让一个观测日整 run 只读一次，而不是每个块都重读。16 = 整段时效跨度 15 天
-        # + 1 天起报跨度，即自动定窗的值（见 execution/plan.py 的 _auto_window_days）；
-        # 写更大不会更省，只会多占内存，所以写 16 与裸写 "window" 等价。
-        # **预报不在这里**：预报恒为 slice，且根本不在 loads 的角色表里
-        # （strategy.LOAD_ROLES 只有 observation / reference），写它直接报配置错。
-        # 窗缓存的内存账见上面那段——本配置只有 z500，约 19G，可接受。
         "loads": {
             "observation": "window:16",
             "reference": "resident",     # 日序气候态整 run 驻留（z500 实测 5.6G，fork 共享 1 份）
