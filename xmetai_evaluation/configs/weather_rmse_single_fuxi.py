@@ -33,24 +33,27 @@ VARS = ["z500"]
 #   acc / acc_uncentered    距平族，还要气候态参考（acc 的 centered 参数见下）
 #   activity                活跃度比，也要气候态
 #   zonal_spectrum / spectrum  谱族，拿完整场，重指标
+#   spherical_bands         球谐带功率（总波数分带，老仓对每个带 spectrum 的
+#                           变量都出 spherical_bands_<var>.csv，这里同口径；
+#                           配了 regions 时恒全球）
 #   crps / spread_error     集合族（确定性流程不用）
 #   ts_score / fss / ensemble_probability  分类/空间/概率族（本流程不用）
 # ⚠ 每个用到的指标都必须点到某组 variables 下（漏点名的会拿到整批多变量
 #   数据，single_variable 直接报错——这是框架故意的，防静默出假数）。
 VAR_METRICS = {
-    "z500": ["rmse", "zonal_spectrum", "acc", "activity"],
+    "z500": ["rmse", "zonal_spectrum", "spherical_bands", "acc", "activity"],
 }
 
 # 全量表（正式跑用，替换上面一块）：
 # VAR_METRICS = {
-#     "z500": ["rmse", "zonal_spectrum", "acc", "activity"],
+#     "z500": ["rmse", "zonal_spectrum", "spherical_bands", "acc", "activity"],
 #     "q700": ["rmse"],
-#     "t700": ["rmse", "zonal_spectrum"],
-#     "t2m": ["rmse", "zonal_spectrum"],
+#     "t700": ["rmse", "zonal_spectrum", "spherical_bands"],
+#     "t2m": ["rmse", "zonal_spectrum", "spherical_bands"],
 #     "t850": ["rmse"],
-#     "msl": ["rmse", "zonal_spectrum"],
-#     "u850": ["rmse", "activity", "zonal_spectrum"],
-#     "v850": ["rmse", "activity", "zonal_spectrum"],
+#     "msl": ["rmse", "zonal_spectrum", "spherical_bands"],
+#     "u850": ["rmse", "activity", "zonal_spectrum", "spherical_bands"],
+#     "v850": ["rmse", "activity", "zonal_spectrum", "spherical_bands"],
 #     "u10m": ["rmse", "activity"],
 #     "v10m": ["rmse", "activity"],
 # }
