@@ -44,6 +44,7 @@ xmetai-evaluation/
 │   │   ├── weather_rmse_single_fuxi.py     # FuXi 确定性连续量（RMSE/谱/ACC/活跃度）
 │   │   ├── weather_rmse_single_fengqing.py # 风清单卡确定性连续量（同上，15 要素）
 │   │   ├── weather_rmse_ens_fuxi.py # FuXi 集合场（RMSE/CRPS/ACC/活跃度/谱）
+│   │   ├── weather_rmse_single_multi.py         # 批量：一份文件顺序评多个模型
 │   │   └── fdp_rmse_single_fengqing.py          # FDP 要素检验（z500 的 RMSE/Bias/ACC）
 │   ├── core/                       # contracts / errors / registry / variables / logging
 │   ├── execution/                  # 执行层：profiles / strategy / plan / loader / executor
@@ -595,7 +596,21 @@ echo "已用: $(cat /sys/fs/cgroup/memory.current)"
 | `diagnostics/probability_wide.csv` | 概率评分宽表（阈值 × 时效：AROC/BS/BSS + `BS_ref`/`base_rate`/`n_points`） |
 | `scores.json` | 评分 JSON 快照 |
 
-当前已接好的内置任务配置（`configs/`）：`weather_ts_single_fgvp`（FGVP 确定性降水）、`weather_ts_ens_fuxi`（FuXi 集合降水，24h TS + 6h 概率两段一趟跑完）、`weather_rmse_single_fuxi`（FuXi 确定性连续量）、`weather_rmse_single_fengqing`（风清单卡确定性连续量）、`weather_rmse_ens_fuxi`（FuXi 集合场，含 CRPS）、`fdp_rmse_single_fengqing`（FDP 要素检验）。
+当前已接好的内置任务配置（`configs/`）：`weather_ts_single_fgvp`（FGVP 确定性降水）、`weather_ts_ens_fuxi`（FuXi 集合降水，24h TS + 6h 概率两段一趟跑完）、`weather_rmse_single_fuxi`（FuXi 确定性连续量）、`weather_rmse_single_fengqing`（风清单卡确定性连续量）、`weather_rmse_ens_fuxi`（FuXi 集合场，含 CRPS）、`fdp_rmse_single_fengqing`（FDP 要素检验）、`weather_rmse_single_multi`（批量，见下）。
+
+### 批量评测（一份文件评多个模型）
+
+配置模块也可以定义 `cfgs = [EvalConfig(...), ...]`（复数）而不是 `cfg`：
+
+```bash
+xmetai-eval --config weather_rmse_single_multi
+```
+
+框架按列表**顺序**逐个执行（不并行：每个 run 内部已经吃满 n_workers）。
+单个模型失败会记日志并继续跑后面的，结束时统一报成败、任一失败退出码为 1。
+观测/气候态/时段/指标等共用项写一份、预报源按模型换，见
+`configs/weather_rmse_single_multi.py` 的 `MODELS` 表；每个模型各落各的
+`output_dir`，产物与单模型配置完全同构，下游报告与对拍不用改。
 
 ## 评测数据与格式
 

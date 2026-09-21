@@ -126,8 +126,14 @@ def _resolve_config_path(value: str) -> Path:
     raise FileNotFoundError(f"配置文件不存在: {value}")
 
 
-def load_config(path: str) -> EvalConfig:
-    """加载外部配置文件或包内配置名，返回其中的 EvalConfig"""
+def load_config(path: str) -> Union[EvalConfig, List[EvalConfig]]:
+    """加载外部配置文件或包内配置名。
+
+    模块里定义 ``cfg = EvalConfig(...)`` 返回单个；定义
+    ``cfgs = [EvalConfig(...), ...]``（复数，非空列表）返回列表，
+    由 cli 顺序逐个执行——一份文件批量评多个模型用这种。
+    两个都定义是配置错误，二选一。
+    """
     config_path = _resolve_config_path(path)
 
     config_dir = str(config_path.parent)
@@ -144,8 +150,30 @@ def load_config(path: str) -> EvalConfig:
     spec.loader.exec_module(module)
 
     cfg = getattr(module, "cfg", None)
+    cfgs = getattr(module, "cfgs", None)
+    if cfg is not None and cfgs is not None:
+        raise ValueError(f"配置文件 {config_path} 同时定义了 `cfg` 和 `cfgs`，二选一")
+
+    if cfgs is not None:
+        if not isinstance(cfgs, (list, tuple)) or not cfgs:
+            raise ValueError(
+                f"配置文件 {config_path} 的 `cfgs` 应是非空的 EvalConfig 列表"
+            )
+        for item in cfgs:
+            if not isinstance(item, EvalConfig):
+                raise TypeError(
+                    f"配置文件 {config_path} 的 cfgs 里混有 "
+                    f"{type(item).__name__}，应为 EvalConfig"
+                )
+        for item in cfgs:
+            item._source_path = str(config_path)
+        return list(cfgs)
+
     if cfg is None:
-        raise ValueError(f"配置文件 {config_path} 没有定义 `cfg`（应写 cfg = EvalConfig(...)）")
+        raise ValueError(
+            f"配置文件 {config_path} 没有定义 `cfg` 或 `cfgs`"
+            "（应写 cfg = EvalConfig(...) 或 cfgs = [EvalConfig(...), ...]）"
+        )
 
     if not isinstance(cfg, EvalConfig):
         raise TypeError(

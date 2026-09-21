@@ -369,6 +369,36 @@ def test_ensemble_config_needs_the_combined_template():
     assert spec.metric_options["crps"]["variables"] == ["z500"]
 
 
+def test_multi_config_expands_to_one_cfg_per_model():
+    """批量配置：cfgs 列表逐模型展开，共用项一致、只有预报源和 output_dir 不同。"""
+    from xmetai_evaluation.configs.base import load_config
+
+    loaded = load_config("weather_rmse_single_multi")
+
+    assert isinstance(loaded, list)
+    assert [cfg.name for cfg in loaded] == [
+        f"weather_rmse_single_{model}" for model in ("fuxi", "fengqing")
+    ]
+    # 共用项真的共用：观测/参考/时段逐字段一致
+    assert loaded[0].observation_reader == loaded[1].observation_reader
+    assert loaded[0].reference_reader == loaded[1].reference_reader
+    assert (loaded[0].start_date, loaded[0].end_date) == (
+        loaded[1].start_date, loaded[1].end_date
+    )
+    # 只有预报源和 output_dir 按模型走
+    assert [cfg.forecast_reader["type"] for cfg in loaded] == [
+        "fuxi_phys", "fengqing_phys"
+    ]
+    assert len({cfg.output_dir for cfg in loaded}) == len(loaded)
+    # 每个 cfg 都能独立完成 spec 装配（指标路由自洽，同上面 xu 用例的口径）
+    for cfg in loaded:
+        spec = PipelineSpec.from_config(cfg)
+        routed = {
+            item.name for item in spec.metrics if item.params.get("variables")
+        }
+        assert routed == {item.name for item in spec.metrics}
+
+
 def test_xu_layouts_keep_the_report_units():
     """z500 报 m²/s²（不除 g）、q 报 g/kg——这是能和 xu 逐格对拍的前提。"""
     from xmetai_evaluation.io.layouts import (

@@ -36,6 +36,33 @@ def run_evaluation(cfg) -> int:
     return 0
 
 
+def run_evaluations(configs) -> int:
+    """顺序执行一批评测（批量配置 ``cfgs`` 展开来的）。
+
+    严格串行：每个 run 内部已经吃满 n_workers，两个模型并行只会超订。
+    单个模型失败记日志、继续跑后面的——批量跑最怕一个挂了全白跑；
+    结束时统一报成败，有失败则返回 1（CI 可感知）。KeyboardInterrupt
+    不在本函数拦（不是 Exception），冒出去由 main 统一处理。
+    """
+    logger = logging.getLogger(__name__)
+    failed = []
+    for index, cfg in enumerate(configs, start=1):
+        logger.info("批量评测 %d/%d：%s", index, len(configs), cfg.name)
+        try:
+            run_evaluation(cfg)
+        except Exception:
+            logger.exception("评测 %s 失败，继续下一个", cfg.name)
+            failed.append(cfg.name)
+    if failed:
+        logger.error(
+            "批量评测结束：%d/%d 失败（%s）",
+            len(failed), len(configs), ", ".join(failed),
+        )
+        return 1
+    logger.info("批量评测结束：%d 个全部成功", len(configs))
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="xmetai-evaluation 气象模型评估框架")
     parser.add_argument("--config", default=None, help="配置名称或 Python 配置路径")
@@ -58,12 +85,13 @@ def main(argv=None) -> int:
         parser.error("必须提供 --config（流程、数据与时段都在配置里指定）")
 
     try:
-        cfg = load_config(args.config)
+        loaded = load_config(args.config)
+        configs = loaded if isinstance(loaded, list) else [loaded]
         configure_logging(
-            args.log_level or cfg.log_level,
+            args.log_level or configs[0].log_level,
             Path(args.log_file) if args.log_file else None,
         )
-        return run_evaluation(cfg)
+        return run_evaluations(configs)
     except KeyboardInterrupt:
         logging.getLogger(__name__).warning("用户中断")
         return 130
