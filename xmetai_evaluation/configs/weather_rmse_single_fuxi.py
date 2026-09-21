@@ -2,25 +2,14 @@
 """确定性连续量检验（FuXi × ERA5）：对标 xu ``scripts/single_fuxi.sh``。
 
 流程 ``weather_field_scores``：格点预报插值到 ERA5 网格、按 (起报, 时效)
-配对，逐变量出 RMSE / 纬向谱 / ACC / 活跃度。xu 命令行到本配置的映射：
+配对，逐变量出 RMSE / 纬向谱 / ACC / 活跃度。
 
-    xu --metrics rmse spectrum acc fa   ->  VAR_METRICS（fa -> activity）
-    xu --vars ...                       ->  VARS
-    xu --var-metrics z500:rmse,acc,fa   ->  VAR_METRICS（再由
-                                            metric_options_from_var_metrics 反转）
-
-单位口径对齐 xu 的报告层，结果 CSV 能逐格对拍：z500 报 m²/s²（不除 g）、
-q 报 g/kg、tp 报 mm。``ws850`` 任何文件里都没有，三侧（预报/实况/气候态）
-都由 sqrt(u²+v²) 现合成；``ws10m`` 例外——ERA5 store 自带 10m 风速通道，
+z500 报 m²/s²（不除 g）、
+q 报 g/kg、tp 报 mm。
+``ws850`` 任何文件里都没有，三侧（预报/实况/气候态）
+都由 sqrt(u²+v²) 现合成；
+``ws10m`` 例外——ERA5 store 自带 10m 风速通道，
 实况侧直接取用。
-
-**与 xu 的偏差**：xu 的 ``--vars`` 16 个，这里只放得下 12 个——q2m / u200 /
-v200 / ws200 两侧数据凑不齐，留着只会每块刷 WARNING、指标也出不全，对拍
-时这 4 个变量对不上属预期。xu 默认把 tp 排除在格点指标外（走站点 TS），
-要复刻 ``--tp-grid`` 就把 "tp" 加进 VARS / VAR_METRICS。
-
-当前是**单要素冒烟态**（VARS 只有 z500）；正式跑把 VARS / VAR_METRICS
-换成下方注释里的全量表，并回看 execution 里的内存备注。
 """
 import os
 
@@ -69,7 +58,7 @@ VAR_METRICS = {
 METRIC_OPTIONS = metric_options_from_var_metrics(VAR_METRICS)
 # acc 用哪种口径：True = 经典皮尔逊（距平去均值再相关）；False = uncentered
 # （FDP / WeatherBench2 口径，分子分母都带均值项）。xu 对标的是 False，
-# 差一点就对不上数。
+
 METRIC_OPTIONS["acc"] = {**METRIC_OPTIONS["acc"], "centered": False}
 # zonal_spectrum 取到多少个波数。720 = 全球 0.25° 的 Nyquist；写小了只截
 # 曲线前段（大尺度），写超过 Nyquist 没有意义。
@@ -173,8 +162,8 @@ cfg = EvalConfig(
         # 区间。每个样本除全球行外逐带再出一行，长表 region 列区分（全球行
         # 为空）；标量指标逐带出分，谱/FSS 恒全球（掩掉的子区域上算出来的
         # 不是同一个物理量）。不分区就删掉这个键，输出回到只有全球行。
-        # ⚠ 开带前清 output_dir/.states/ 或换 output_dir——resume 会复用
-        #   没算过带的旧块状态，带行会缺。
+
+
         # 下面是经典三分带（热带 ±20° + 两半球中高纬，拼满全球不重叠），
         # 改边界直接改数字。
         "regions": {
@@ -216,11 +205,10 @@ cfg = EvalConfig(
     # 起报 = 5568 块。observation 用 window:16（= 整段时效 15 天 + 起报 1 天，
     # 即自动定窗值）：块序是起报日外层、时效窗内层，相邻起报组的观测日大
     # 面积重叠，滚动窗让一个观测日整 run 只读一次。
-    #
+
     # 内存备注（实测口径）：气候态 resident 预热 ~67G（共享 1 份，与 worker
     # 数无关）+ 每 worker ~2G 工作集；观测窗块单通道 ~0.8G/进程。
-    # ⚠ VARS 放回 12 个要素时观测窗块 ~10G/进程、24 进程 ~250G——那时必须
-    #   把 n_workers 压到 6~8，或退回 slice。
+
     execution={
         "mode": "processes",
         "n_workers": 24,       # 24 核 → 24 进程：np.fft 单线程，1 worker≈1 核不超订

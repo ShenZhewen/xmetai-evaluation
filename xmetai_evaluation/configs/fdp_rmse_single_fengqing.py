@@ -62,7 +62,7 @@ cfg = EvalConfig(
 
     output_dir=os.environ.get(
         "EVAL_OUTPUT",
-        "/workspace/szwCode/xmetai-evaluate/evaluation_results/fdp_rmse_single_fengqing",
+        "/mnt/d/fdp_rmse_single_fengqing",
     ),
     # json 是**在本模板默认的 ["csv_long"] 之上追加的**（配置级 writers 是替换，
     # 所以这里必须把模板那份也写全，漏了 csv_long 主表就没了）。

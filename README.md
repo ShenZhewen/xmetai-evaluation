@@ -42,9 +42,7 @@ xmetai-evaluation/
 │   │   ├── weather_ts_single_fgvp.py       # FuXi 确定性降水分类检验
 │   │   ├── weather_ts_ens_fuxi.py       # FuXi 集合降水：24h TS + 6h 概率两段一趟跑完
 │   │   ├── weather_rmse_single_fuxi.py     # FuXi 确定性连续量（RMSE/谱/ACC/活跃度）
-│   │   ├── weather_rmse_single_fengqing.py # 风清单卡确定性连续量（同上，15 要素）
-│   │   ├── weather_rmse_ens_fuxi.py # FuXi 集合场（RMSE/CRPS/ACC/活跃度/谱）
-│   │   ├── weather_rmse_single_multi.py         # 批量：一份文件顺序评多个模型
+│   │   ├── weather_rmse_ens_fuxi.py # FuXi 集合场（RMSE/CRPS/Spread/ACC/活跃度/谱/球谐带）
 │   │   └── fdp_rmse_single_fengqing.py          # FDP 要素检验（z500 的 RMSE/Bias/ACC）
 │   ├── core/                       # contracts / errors / registry / variables / logging
 │   ├── execution/                  # 执行层：profiles / strategy / plan / loader / executor
@@ -115,14 +113,14 @@ cfg = EvalConfig(
 配置模块也可以定义 `cfgs = [EvalConfig(...), ...]`（复数）而不是 `cfg`：
 
 ```bash
-xmetai-eval --config weather_rmse_single_multi
+xmetai-eval --config my_multi_config
 ```
 
 框架按列表**顺序**逐个执行（不并行：每个 run 内部已经吃满 n_workers）。
 单个模型失败会记日志并继续跑后面的，结束时统一报成败、任一失败退出码为 1。
-观测/气候态/时段/指标等共用项写一份、预报源按模型换，见
-`configs/weather_rmse_single_multi.py` 的 `MODELS` 表；每个模型各落各的
-`output_dir`，产物与单模型配置完全同构，下游报告与对拍不用改。
+观测/气候态/时段/指标等共用项写一份、预报源按模型换（用一个 `MODELS`
+表循环生成 `cfgs` 最顺手）；每个模型各落各的 `output_dir`，产物与单模型
+配置完全同构，下游报告与对拍不用改。
 
 ### 分纬度带评估（regions）
 
@@ -586,7 +584,7 @@ echo "已用: $(cat /sys/fs/cgroup/memory.current)"
 | **活跃度比 / 功率谱**<br>`fdp_activity_spectrum` | 格点场预报（z500）+ 格点实况 + 气候态（活跃度比必需） | `scores.csv`、`diagnostics/spectrum_{var}.csv`、`diagnostics/spectrum_by_init.csv` | `activity_ratio`、`activity_forecast`、`activity_observation`、`activity_bias`、`spectrum_power_ratio`（二维谱，不减纬向均值）<br>逐波数谱曲线另出宽表 | 重·参考·整场 · processes |
 
 内置配置里 `fdp_rmse_single_fengqing` 另外声明了 `json` writer，会多写一份 `scores.json`；
-`weather_rmse_single_fuxi` / `weather_rmse_single_fengqing` 与 `weather_rmse_ens_fuxi` 声明的是 `spectrum`。
+`weather_rmse_single_fuxi` 与 `weather_rmse_ens_fuxi` 声明的是 `spectrum`。
 那都是配置的选择，不属于流程模板的产出。
 注意配置里的 `writers` 是**替换**模板自带的那一份、不是追加，所以
 `weather_rmse_single_fuxi` 要把模板的 `details` 一并写上，谱曲线才有落盘的地方。
@@ -676,7 +674,7 @@ echo "已用: $(cat /sys/fs/cgroup/memory.current)"
 | `diagnostics/probability_wide.csv` | 概率评分宽表（阈值 × 时效：AROC/BS/BSS + `BS_ref`/`base_rate`/`n_points`） |
 | `scores.json` | 评分 JSON 快照 |
 
-当前已接好的内置任务配置（`configs/`）：`weather_ts_single_fgvp`（FGVP 确定性降水）、`weather_ts_ens_fuxi`（FuXi 集合降水，24h TS + 6h 概率两段一趟跑完）、`weather_rmse_single_fuxi`（FuXi 确定性连续量）、`weather_rmse_single_fengqing`（风清单卡确定性连续量）、`weather_rmse_ens_fuxi`（FuXi 集合场，含 CRPS）、`fdp_rmse_single_fengqing`（FDP 要素检验）、`weather_rmse_single_multi`（批量，见下）。
+当前已接好的内置任务配置（`configs/`）：`weather_ts_single_fgvp`（FGVP 确定性降水）、`weather_ts_ens_fuxi`（FuXi 集合降水，24h TS + 6h 概率两段一趟跑完）、`weather_rmse_single_fuxi`（FuXi 确定性连续量）、`weather_rmse_ens_fuxi`（FuXi 集合场，含 CRPS/Spread）、`fdp_rmse_single_fengqing`（FDP 要素检验）。批量多模型见上「批量评测」——写一份 `cfgs` 列表即可，无内置示例。
 
 ## 评测数据与格式
 
