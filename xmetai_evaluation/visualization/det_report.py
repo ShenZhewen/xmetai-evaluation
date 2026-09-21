@@ -1,24 +1,42 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""确定性多模型评估报告：加载批次归档 → 统一口径统计 → 渲染 Markdown。
+"""确定性多模型评估报告：加载评估产物 → 统一口径统计 → 渲染 Markdown。
 
-**输入是「批次归档目录」**，一个模型一个，目录形状由
-``vfc/regr_ens.py`` / ``vfc/regr_summary.py`` 的写入代码决定::
+**输入是「评估产物目录」**，一个模型一个，形状由 ``output/store.py`` 的写入契约
+决定（见 ``skills/xmetai-evaluation/SKILL.md`` 的「输出契约」）::
 
     <model_root>/
-      summary.csv                  # 每起报日一行：init_date, n_members, n_leads,
-                                   #   variables, rmse_<v>_{24h,last,mean}
-      batch_meta.json              # pred_root / target_zarr / n_dates / dates /
-                                   #   n_ok / failures / outdir_root / options
-      <YYYYMMDD>/
-        rmse_<date>_det.csv        # index=lead_h, columns=<变量>
-        acc_<date>_det.csv         # index=lead_h, columns=<变量>
-        fa_<date>_det.csv          # index=lead_h, columns=<变量>_{pred,obs,bias,ratio}
-        spectrum_<date>_<变量>.csv # index=波数 k, columns={det_pred, det_obs}
+      scores.csv                   # 长表，列见 output/table.py 的 SCORE_COLUMNS
+      manifest.json                # 运行记录：statuses / valid_times / regions /
+                                   #   resolved_config.pipeline / execution
+      diagnostics/
+        spectrum_<变量>.csv        # 全体样本加权平均谱：wavenumber, pred_mean, obs_mean
+        spectrum_by_init.csv       # 逐起报谱：variable, init_time, wavenumber, pred, obs
 
-**统一口径**：正文与附录图都用 N 个模型共同的日期（原报告的正文 169 天 /
-附录 349 天双口径不保留），所以**不读** ``det_summary_*.csv``——那批表是全日期口径，
-混进来会让表与图各说各话。
+**长表怎么变回报告要的表**：``analyze()`` 以上全部沿用旧口径，只把取数换成从
+``scores.csv`` 透视，所以下面这些等价关系要记住：
+
+    老批次归档                          新产物
+    summary.csv 的 rmse_<v>_mean        metric=rmse 的行按起报日对全时效平均
+    <date>/rmse_<date>_det.csv          metric=rmse 的行（index=lead_h, columns=变量）
+    <date>/acc_<date>_det.csv           metric=acc 的行
+    <date>/fa_<date>_det.csv 的 ratio   metric=activity_ratio 的行
+    <date>/spectrum_<date>_<变量>.csv   diagnostics/spectrum_by_init.csv
+    batch_meta.json                     manifest.json（见 :func:`_meta_from_scores`）
+
+「逐日文件」没有了，等价物是 ``init_date`` 这一列——由 ``init_time`` 前 10 位得来
+（``2025-01-02T00:00:00.000000`` → ``20250102``）。
+
+**全球口径**：同一 (起报, 时效, 指标) 下产物会同时写全球行和三块区域行
+（``config_options.regions``），只有 ``region`` 为空的那行是全球。报告正文用全球行，
+所有取数一律先过 :func:`_global`。
+
+**确定性口径**：长表里 ``metric="rmse"`` 有两套——确定性 RMSE
+（``product_kind=deterministic``）和集合 ``spread_error`` 展开出来的那个 rmse
+（``product_kind=ensemble``）。名字一样，取数一律先过 :func:`_deterministic`。
+
+**统一口径**：正文与附录图都用 N 个模型共同的起报日（原报告的正文 169 天 /
+附录 349 天双口径不保留）。
 
 **派生指标口径**（原报告没有生成脚本，这几个定义是反推的，写在这里备查）::
 
@@ -39,12 +57,12 @@ import json
 import math
 import re
 from pathlib import Path
-from typing import Dict, Iterable, List, Mapping, NamedTuple, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Mapping, NamedTuple, Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
 
-from visualization.det_plots import DetPlotter
+from xmetai_evaluation.visualization.det_plots import DetPlotter
 
 try:
     from scipy.stats import wilcoxon as _scipy_wilcoxon
@@ -70,59 +88,287 @@ LEAD_BANDS: Tuple[Tuple[float, float], ...] = (
 
 _CN_NUM = {1: "一", 2: "二", 3: "三", 4: "四", 5: "五", 6: "六", 7: "七", 8: "八", 9: "九", 10: "十"}
 
-_FA_SUFFIXES = ("_pred", "_obs", "_bias", "_ratio")
-_SPECTRUM_PRED = ("det_pred", "pred", "ensmean_pred")
-_SPECTRUM_OBS = ("det_obs", "obs", "ensmean_obs")
-
 
 # ====================================================================== 加载
 
 
+#: 评估产物的固定文件名。新契约下**只认这一种**形状，不再有
+#: ``summary.csv`` / ``batch_meta.json`` / ``<YYYYMMDD>/`` 那套批次归档。
+SCORES_NAME = "scores.csv"
+MANIFEST_NAME = "manifest.json"
+DIAGNOSTICS_DIR = "diagnostics"
+
+#: 逐起报谱表。``spectrum_<变量>.csv`` 是全体样本平均，只有这一张能给出
+#: **每次起报各自**的谱，报告里按日期画/检验的谱曲线都取自它。
+_SPECTRUM_BY_INIT_STEM = "spectrum_by_init"
+SPECTRUM_BY_INIT_NAME = f"{_SPECTRUM_BY_INIT_STEM}.csv"
+
+#: ``init_time`` 是 ISO 串（``2025-01-02T00:00:00.000000``），前 10 位即起报日。
+_INIT_DATE_LEN = 10
+
+#: 同一个产物目录在一个进程里可能被反复取数，长表又不小，所以缓存住。
+_SCORES_CACHE: Dict[str, pd.DataFrame] = {}
+_MANIFEST_CACHE: Dict[str, Dict[str, object]] = {}
+
+
 class Archive(NamedTuple):
-    """一个模型的批次归档。"""
+    """一个模型的评估产物。
+
+    ``summary`` 与 ``meta`` 是为兼容渲染层保留的两个**派生视图**，新产物不落盘：
+
+    ``summary``
+        老 ``summary.csv`` 的形状——``init_date`` 一列，加每变量一列
+        ``rmse_<v>_mean``，另带 ``variables`` / ``n_leads``。由 ``scores.csv``
+        里 ``metric=rmse`` 的行按起报日、对全部时效平均现算。
+    ``meta``
+        老 ``batch_meta.json`` 的形状——``n_dates`` / ``n_ok`` / ``failures``。
+        新产物没有「请求过的起报日数」这个概念，所以 ``n_dates`` 取**实际出了数的
+        起报日数**，``n_ok`` 是其中全部行都 ``status == "success"`` 的那些。
+    """
 
     name: str
     root: Path
     summary: pd.DataFrame
     meta: Dict[str, object]
-    dates: List[str]  # 磁盘上真实存在的 YYYYMMDD 子目录
+    dates: List[str]  # scores.csv 里出现过的起报日（升序）
+
+
+def _to_init_date(series: pd.Series) -> pd.Series:
+    """``init_time`` / ``valid_time`` 的 ISO 串 → ``YYYYMMDD``。"""
+    return series.astype(str).str.slice(0, _INIT_DATE_LEN).str.replace("-", "", regex=False)
+
+
+def load_scores(root: Path) -> pd.DataFrame:
+    """读 ``scores.csv`` 长表，附一列 ``init_date``。同一个目录只读一次。
+
+    Raises:
+        FileNotFoundError: 没有 ``scores.csv``——那不是一份评估产物目录。
+        ValueError: 缺报告要用的列。
+    """
+    root = Path(root)
+    key = str(root)
+    cached = _SCORES_CACHE.get(key)
+    if cached is not None:
+        return cached
+    path = root / SCORES_NAME
+    if not path.is_file():
+        raise FileNotFoundError(f"缺 {SCORES_NAME}（{path}）：这不是一份评估产物目录")
+    # low_memory=False：``unit`` / ``level`` / ``region`` 这些列是「字符串或空」，
+    # 分块推断会在不同块里得出不同的 dtype（一串 DtypeWarning），读全再推断才一致。
+    frame = pd.read_csv(path, low_memory=False)
+    missing = [
+        column for column in ("variable", "metric", "product_kind", "lead_h", "init_time", "value")
+        if column not in frame.columns
+    ]
+    if missing:
+        raise ValueError(f"{path} 缺列 {missing}；现有列: {list(frame.columns)}")
+    frame["lead_h"] = pd.to_numeric(frame["lead_h"], errors="coerce")
+    frame["value"] = pd.to_numeric(frame["value"], errors="coerce")
+    frame["init_date"] = _to_init_date(frame["init_time"])
+    _SCORES_CACHE[key] = frame
+    return frame
+
+
+def load_manifest(root: Path) -> Dict[str, object]:
+    """读 ``manifest.json``（运行记录），同一个目录只读一次。"""
+    root = Path(root)
+    key = str(root)
+    cached = _MANIFEST_CACHE.get(key)
+    if cached is not None:
+        return cached
+    path = root / MANIFEST_NAME
+    if not path.is_file():
+        raise FileNotFoundError(f"缺 {MANIFEST_NAME}（{path}）")
+    with open(path, "r", encoding="utf-8") as handle:
+        meta = json.load(handle)
+    _MANIFEST_CACHE[key] = meta
+    return meta
+
+
+def _region_rows(scores: pd.DataFrame, region: Optional[str]) -> pd.DataFrame:
+    """按纬度带取行：``region=None`` 只要全球行，给了带名只要**那一个带**的行。
+
+    产物对同一 (起报, 时效, 指标) 会同时写全球行和 ``config_options.regions``
+    里的区域行（``tropics`` 等），全球行的 ``region`` 是空串，读进来是 NaN。
+
+    **两种口径不能混着平均**：全球平均和纬度带平均是两个量，把带行和全球行一起
+    丢进 ``pivot_table`` 会让 ``aggfunc="mean"`` 悄悄把带间差异抹平，出来的数既不是
+    全球的也不是任何一个带的，且没人看得出来。所以取数一律显式二选一。
+
+    长表没有 ``region`` 列（这份产物不分区）时：要全球行就是全部行，
+    要某个带就是空——**不静默退化成全球**。
+    """
+    if "region" not in scores.columns:
+        return scores if region is None else scores.iloc[0:0]
+    values = scores["region"]
+    empty = values.isna() | (values.astype(str).str.strip() == "")
+    if region is None:
+        return scores[empty]
+    return scores[~empty & (values.astype(str).str.strip() == str(region))]
+
+
+def _global(scores: pd.DataFrame) -> pd.DataFrame:
+    """只留全球口径的行（``region`` 为空）。见 :func:`_region_rows`。"""
+    return _region_rows(scores, None)
+
+
+#: ``manifest["regions"]`` 的条目形状：``"tropics[-20, 20]"``。
+_REGION_ENTRY = re.compile(r"^(?P<name>.+?)\s*\[(?P<bounds>.+)\]$")
+
+
+def region_names(root: Path) -> List[str]:
+    """这份产物**真的落了数**的纬度带名（升序），取自 ``scores.csv`` 的 ``region`` 列。
+
+    以数据为准而不是 manifest：manifest 里写着一堆 ``regions``、长表里却没有对应行
+    （配置改了没重跑、或老产物）时，按数据来才不会端出一张空表。
+    """
+    scores = load_scores(root)
+    if "region" not in scores.columns:
+        return []
+    values = scores["region"]
+    filled = values[values.notna() & (values.astype(str).str.strip() != "")]
+    return sorted({str(v).strip() for v in filled})
+
+
+def region_labels(root: Path) -> Dict[str, str]:
+    """``{带名: 边界串}``，边界取自 ``manifest["regions"]``（形如 ``tropics[-20, 20]``）。
+
+    带名和边界都**照搬配置**——报告不翻译、也不写死任何带名。配置里叫
+    ``mid_latitudes`` 就显示 ``mid_latitudes``；要换成「热带/中纬/高纬」那套切法，
+    改配置的 ``options["regions"]`` 重跑即可，报告这边一个字都不用动。
+    """
+    labels: Dict[str, str] = {}
+    for entry in load_manifest(root).get("regions") or []:
+        match = _REGION_ENTRY.match(str(entry).strip())
+        if match:
+            labels[match.group("name").strip()] = match.group("bounds").strip()
+    return labels
+
+
+def region_display(name: str, labels: Mapping[str, str]) -> str:
+    """带名的展示写法：``tropics [-20, 20]``；没有边界信息就只写带名。"""
+    bounds = labels.get(name)
+    return f"{name} [{bounds}]" if bounds else str(name)
+
+
+def _deterministic(scores: pd.DataFrame) -> pd.DataFrame:
+    """只留确定性指标的行。
+
+    ``spread_error`` 展开出来的 ``rmse`` 与确定性 ``rmse`` **在长表里同名**，
+    只能靠 ``product_kind``（``ensemble`` / ``deterministic``）区分。
+    """
+    if "product_kind" not in scores.columns:
+        return scores
+    return scores[scores["product_kind"].astype(str) == "deterministic"]
+
+
+def metric_rows(
+    root: Path,
+    metric: str,
+    *,
+    product_kind: Optional[str] = None,
+    region: Optional[str] = None,
+) -> pd.DataFrame:
+    """长表里某个指标的行；``product_kind`` 给了就再按它过滤。
+
+    三个报告模块都从这里取数：确定性指标传 ``product_kind="deterministic"``，
+    集合特有的（``crps`` / ``spread`` / ``spread_error_ratio``）传 ``"ensemble"``，
+    ``activity`` 的四个展开量是 ``"specialized"``（不传就是不过滤）。
+
+    ``region`` 省略即**全球口径**（只要 ``region`` 为空的行）；给了带名就只要那个带。
+    两者互斥，没有「都要」的选项——见 :func:`_region_rows`。
+    """
+    rows = _region_rows(load_scores(root), region)
+    rows = rows[rows["metric"] == str(metric)]
+    if product_kind is not None and "product_kind" in rows.columns:
+        rows = rows[rows["product_kind"].astype(str) == str(product_kind)]
+    return rows
+
+
+def by_date_frames(rows: pd.DataFrame, dates: Sequence[str], label: str = "") -> Dict[str, pd.DataFrame]:
+    """长表行 → ``{起报日: lead × 变量 表}``。
+
+    配对检验要**逐日起报**的样本（先按日平均再检验等于把样本量从 N 天压成 1 个点），
+    所以这里保留逐日，不像 :func:`load_by_lead` 那样直接跨日平均。
+
+    Raises:
+        FileNotFoundError: 任何一个请求的起报日没有结果——按 SKILL.md 的硬性规则
+            不静默跳过。
+    """
+    wanted = [str(date) for date in dates]
+    have = set(rows["init_date"].astype(str))
+    missing = [date for date in wanted if date not in have]
+    if missing:
+        raise FileNotFoundError(
+            f"{label or '产物'}: {len(missing)} 个起报日没有结果（如 {missing[0]}）"
+        )
+    subset = rows[rows["init_date"].astype(str).isin(set(wanted))]
+    frames: Dict[str, pd.DataFrame] = {}
+    for date in wanted:
+        own = subset[subset["init_date"].astype(str) == date]
+        frames[date] = own.pivot_table(
+            index="lead_h", columns="variable", values="value", aggfunc="mean"
+        ).sort_index()
+    return frames
+
+
+def _summary_from_scores(scores: pd.DataFrame) -> pd.DataFrame:
+    """把长表透视成老 ``summary.csv`` 的形状。
+
+    Raises:
+        ValueError: 长表里没有 ``metric=rmse`` 的确定性行，分变量结果无从谈起。
+    """
+    rows = _deterministic(_global(scores))
+    rows = rows[rows["metric"] == "rmse"]
+    if rows.empty:
+        raise ValueError("scores.csv 里没有确定性 rmse 的行，算不出分变量 RMSE")
+    table = rows.pivot_table(index="init_date", columns="variable", values="value", aggfunc="mean")
+    table = table.sort_index()
+    table.columns = [f"rmse_{v}_mean" for v in table.columns]
+    table = table.reset_index()
+    # 老 summary 的 variables 列是「该模型算过的变量清单」，第 6.2 节拿它跟
+    # --declared 对照。这里取长表里出现过的全部变量，不只 rmse 覆盖的那些。
+    table["variables"] = ",".join(sorted({str(v) for v in scores["variable"].dropna().unique()}))
+    table["n_leads"] = int(scores["lead_h"].dropna().nunique())
+    return table
+
+
+def _meta_from_scores(scores: pd.DataFrame) -> Dict[str, object]:
+    """老 ``batch_meta.json`` 的等价物，喂给第 2 节的完整性检查。"""
+    dates = sorted({str(d) for d in scores["init_date"].dropna().unique()})
+    if "status" in scores.columns:
+        ok = scores["status"].astype(str) == "success"
+    else:
+        ok = pd.Series(True, index=scores.index)
+    failed = sorted({str(d) for d in scores.loc[~ok, "init_date"].dropna().unique()})
+    return {
+        "n_dates": len(dates),
+        "n_ok": len(dates) - len(failed),
+        "failures": failed,
+        # 新产物没有「请求过的日期」这一说，留空让渲染层显式判空
+        "dates": [],
+    }
 
 
 def load_archive(name: str, root: Path) -> Archive:
-    """读一个批次归档目录。
+    """读一份评估产物目录。
 
     Raises:
-        FileNotFoundError: 目录、``summary.csv`` 或 ``batch_meta.json`` 不存在。
-        ValueError: ``summary.csv`` 缺 ``init_date`` 列或没有数据行。
+        FileNotFoundError: 目录、``scores.csv`` 或 ``manifest.json`` 不存在。
+        ValueError: ``scores.csv`` 没有数据行或缺列。
     """
     root = Path(root)
     if not root.is_dir():
-        raise FileNotFoundError(f"归档目录不存在: {root}")
-
-    summary_path = root / "summary.csv"
-    if not summary_path.is_file():
-        raise FileNotFoundError(f"{name}: 缺 summary.csv（{summary_path}）")
-    summary = pd.read_csv(summary_path)
-    if "init_date" not in summary.columns:
-        raise ValueError(f"{name}: summary.csv 缺 init_date 列；现有列: {list(summary.columns)}")
-    if summary.empty:
-        raise ValueError(f"{name}: summary.csv 没有数据行")
-    summary["init_date"] = summary["init_date"].astype(str).str.strip()
-    for column in summary.columns:
-        if column.startswith("rmse_"):
-            summary[column] = pd.to_numeric(summary[column], errors="coerce")
-
-    meta_path = root / "batch_meta.json"
-    if not meta_path.is_file():
-        raise FileNotFoundError(f"{name}: 缺 batch_meta.json（{meta_path}）")
-    with open(meta_path, "r", encoding="utf-8") as handle:
-        meta = json.load(handle)
-
-    dates = sorted(
-        entry.name for entry in root.iterdir()
-        if entry.is_dir() and re.fullmatch(r"\d{8}", entry.name)
+        raise FileNotFoundError(f"产物目录不存在: {root}")
+    scores = load_scores(root)
+    if scores.empty:
+        raise ValueError(f"{name}: {SCORES_NAME} 没有数据行")
+    load_manifest(root)  # 缺 manifest 提前报，别拖到渲染层才炸
+    dates = sorted({str(d) for d in scores["init_date"].dropna().unique()})
+    return Archive(
+        name=str(name), root=root, summary=_summary_from_scores(scores),
+        meta=_meta_from_scores(scores), dates=dates,
     )
-    return Archive(name=str(name), root=root, summary=summary, meta=meta, dates=dates)
 
 
 def common_dates(archives: Sequence[Archive]) -> List[str]:
@@ -160,132 +406,125 @@ def rmse_mean_columns(summary: pd.DataFrame) -> List[str]:
     return sorted(found)
 
 
-def _pick_metric_file(directory: Path, stem: str, date: str) -> Optional[Path]:
-    """照 ``vfc/regr_summary.py:227`` 的容错顺序找一个逐日指标文件。
+def _metric_by_lead(
+    root: Path,
+    metric: str,
+    dates: Sequence[str],
+    name: str = "",
+    *,
+    deterministic: bool = True,
+    region: Optional[str] = None,
+) -> pd.DataFrame:
+    """长表里 ``metric`` 的行 → lead × 变量 表（跨起报日平均）。``region`` 给了就只算那个带。
 
-    三个候选名对应三种归档口径：``_det.csv`` 是单成员、裸名是集合特有的指标
-    （``crps`` / ``spread`` / ``spread_rmse_ratio``，集合与单成员同名）、
-    ``_ensmean.csv`` 是集合平均场。集合归档的 ``rmse/acc/fa`` 都落在第三个上，
-    于是集合报告读到的正是骨架要求的**集合平均场**口径。
-
-    ``_det`` 排在 ``_ensmean`` 前面是刻意的：单成员归档的行为因此一点没变。
-    glob 兜底里的 ``_ensmean.csv`` / ``_ens.csv`` 跳过**也保留**——它防的是
-    裸名指标（如 ``spread_<日期>.csv``）被误当成 ``spread_<日期>_ensmean.csv``；
-    集合的 ``rmse/acc/fa`` 已由第三个候选接住，用不着兜底。
+    Raises:
+        FileNotFoundError: 任何一个请求的起报日没有这个指标的结果——按 SKILL.md
+            的硬性规则不静默跳过（跳过会让表和图的样本量对不上，且没人会发现）。
     """
-    for candidate in (
-        f"{stem}_{date}_det.csv",
-        f"{stem}_{date}.csv",
-        f"{stem}_{date}_ensmean.csv",
-    ):
-        path = directory / candidate
-        if path.is_file():
-            return path
-    for path in sorted(directory.glob(f"{stem}_*")):
-        if path.name.endswith(("_ensmean.csv", "_ens.csv")):
-            continue
-        return path
-    return None
-
-
-def _read_lead_frame(path: Path) -> pd.DataFrame:
-    frame = pd.read_csv(path, index_col=0)
-    frame.index = pd.to_numeric(frame.index, errors="coerce")
-    frame = frame[frame.index.notna()]
-    frame.index.name = "lead_h"
-    return frame.sort_index()
+    rows = metric_rows(
+        root, metric, product_kind="deterministic" if deterministic else None, region=region,
+    )
+    frames = by_date_frames(rows, dates, f"{name or root}: {metric}")
+    if not frames:
+        raise ValueError(f"{name or root}: 没有可读的 {metric} 结果")
+    stacked = pd.concat(frames.values(), axis=0)
+    return stacked.groupby(level=0).mean().sort_index()
 
 
 def probe_dates(root: Path, dates: Iterable[str], stem: str) -> List[str]:
-    """这些日期里，**缺** ``stem`` 逐日文件的（升序）。用于第 2 节完整性检查。"""
-    missing = []
-    for date in dates:
-        directory = Path(root) / date
-        if not directory.is_dir() or _pick_metric_file(directory, stem, date) is None:
-            missing.append(date)
-    return sorted(missing)
+    """这些起报日里，**没有** ``stem`` 结果的（升序）。用于第 2 节完整性检查。"""
+    scores = _deterministic(_global(load_scores(root)))
+    have = set(scores.loc[scores["metric"] == str(stem), "init_date"].astype(str))
+    return sorted(str(date) for date in dates if str(date) not in have)
 
 
-def load_by_lead(root: Path, stem: str, dates: Sequence[str], name: str = "") -> pd.DataFrame:
-    """逐日 ``<stem>_<date>_det.csv`` 按 lead 平均成一张 lead × 变量表。
+def load_by_lead(
+    root: Path, stem: str, dates: Sequence[str], name: str = "", *, region: Optional[str] = None,
+) -> pd.DataFrame:
+    """``stem`` 指标按 lead 平均成一张 lead × 变量表；``region`` 给了就只算那个带。"""
+    return _metric_by_lead(root, stem, dates, name, region=region)
 
-    Raises:
-        FileNotFoundError: 任何一个日期缺这个文件——按 SKILL.md 的硬性规则
-            不静默跳过（跳过会让表和图的样本量对不上，且没人会发现）。
+
+def region_rmse_by_date(root: Path, region: str, dates: Sequence[str]) -> pd.DataFrame:
+    """某个纬度带上 ``metric=rmse`` 的 **日期 × 变量** 表（对该带的全部 lead 平均）。
+
+    全球口径的同名物是 :func:`_summary_from_scores` 里那张透视表；这里只是多一个
+    ``region`` 过滤，口径与它完全一致（同样只取确定性 rmse、同样跨 lead 平均）。
+
+    该带在这份产物里没有 rmse 行时返回**空表**而不是报错——分带块整体可以「本批未出」，
+    但一台模型缺一个带不该把整份报告打掉，缺哪个带由调用方按空表判。
     """
-    frames = []
-    for date in dates:
-        path = _pick_metric_file(Path(root) / date, stem, date)
-        if path is None:
-            raise FileNotFoundError(
-                f"{name or root}: {date} 目录下没有 {stem}_*.csv；"
-                f"该模型归档可能被裁剪过（只有 summary.csv 是算不出 ACC/FA/谱的）"
-            )
-        frames.append(_read_lead_frame(path))
-    if not frames:
-        raise ValueError(f"{name or root}: 没有可读的 {stem} 逐日文件")
-    stacked = pd.concat(frames, axis=0)
-    return stacked.groupby(level=0).mean().sort_index()
+    rows = metric_rows(root, "rmse", product_kind="deterministic", region=region)
+    if rows.empty:
+        return pd.DataFrame(index=[str(d) for d in dates], dtype=float)
+    table = rows.pivot_table(index="init_date", columns="variable", values="value", aggfunc="mean")
+    return table.reindex(index=[str(d) for d in dates])
 
 
 def load_fa_ratio(root: Path, dates: Sequence[str], name: str = "") -> pd.DataFrame:
-    """逐日 ``fa_<date>_det.csv`` → lead × 变量 的 ratio 表。
+    """``activity_ratio`` → lead × 变量 的 FA 比值表。
 
-    ``ratio`` 列缺失时由 ``pred / obs`` 现算（``vfc/regr_summary.py:297`` 同款兜底）。
+    ``activity`` 指标在长表里展开成 ``activity_ratio`` / ``_bias`` /
+    ``_forecast`` / ``_observation`` 四行，报告要的 ratio 只是其中一行。
     """
-    frames = []
-    for date in dates:
-        path = _pick_metric_file(Path(root) / date, "fa", date)
-        if path is None:
-            raise FileNotFoundError(f"{name or root}: {date} 目录下没有 fa_*.csv")
-        raw = _read_lead_frame(path)
-        kinds: Dict[str, set] = {}
-        for column in raw.columns:
-            for suffix in _FA_SUFFIXES:
-                if str(column).endswith(suffix):
-                    # 存的是去掉下划线的种类名（pred/obs/bias/ratio），后面按它判断
-                    kinds.setdefault(str(column)[: -len(suffix)], set()).add(suffix.lstrip("_"))
-                    break
-        columns: Dict[str, pd.Series] = {}
-        for variable, suffixes in kinds.items():
-            if "ratio" in suffixes:
-                columns[variable] = raw[f"{variable}_ratio"]
-            elif {"pred", "obs"} <= suffixes:
-                columns[variable] = raw[f"{variable}_pred"] / raw[f"{variable}_obs"].replace(0.0, np.nan)
-        if columns:
-            frames.append(pd.DataFrame(columns))
-    if not frames:
-        raise ValueError(f"{name or root}: fa 逐日文件里没有任何 <变量>_ratio 列")
-    stacked = pd.concat(frames, axis=0)
-    return stacked.groupby(level=0).mean().sort_index()
+    return _metric_by_lead(root, "activity_ratio", dates, name, deterministic=False)
 
 
-def load_spectrum(root: Path, dates: Sequence[str], variable: str, name: str = "") -> Tuple[pd.DataFrame, pd.DataFrame]:
-    """逐日 ``spectrum_<date>_<变量>.csv`` → ``(pred, obs)`` 两张 波数 × 日期 表。
+def spectrum_variables(root: Path) -> List[str]:
+    """产物里出了纬向谱的变量（字典序）。
+
+    以 ``diagnostics/spectrum_by_init.csv`` 的 ``variable`` 列为准——它有全部逐起报
+    曲线；没有这张表就退回 ``diagnostics/spectrum_<变量>.csv`` 的文件名。
+    """
+    directory = Path(root) / DIAGNOSTICS_DIR
+    by_init = directory / SPECTRUM_BY_INIT_NAME
+    if by_init.is_file():
+        raw = pd.read_csv(by_init, usecols=["variable"])
+        return sorted({str(v) for v in raw["variable"].dropna().unique()})
+    return sorted({
+        path.stem[len("spectrum_"):]
+        for path in directory.glob("spectrum_*.csv")
+        if path.stem != _SPECTRUM_BY_INIT_STEM
+    })
+
+
+def load_spectrum(
+    root: Path, dates: Sequence[str], variable: str, name: str = "",
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """``diagnostics/spectrum_by_init.csv`` → ``(pred, obs)`` 两张 波数 × 起报日 表。
+
+    这张表是**逐起报**的：每个 ``(变量, 起报时刻)`` 一条曲线，是该起报各时效曲线的
+    按样本数加权平均——正是老归档 ``spectrum_<date>_<变量>.csv`` 的口径。
 
     Raises:
-        FileNotFoundError: 某个日期没有该变量的谱文件。
+        FileNotFoundError: 产物没有 ``spectrum_by_init.csv``（配置里没挂 spectrum writer）。
+        ValueError: 表里没有该变量，或请求的日期区间内没有它的谱。
     """
-    preds: Dict[str, pd.Series] = {}
-    observations: Dict[str, pd.Series] = {}
-    for date in dates:
-        path = Path(root) / date / f"spectrum_{date}_{variable}.csv"
-        if not path.is_file():
-            raise FileNotFoundError(
-                f"{name or root}: 缺 {path.name}（{date} 没算 {variable} 的纬向谱？）"
-            )
-        raw = _read_lead_frame(path)
-        pred_column = next((c for c in _SPECTRUM_PRED if c in raw.columns), None)
-        obs_column = next((c for c in _SPECTRUM_OBS if c in raw.columns), None)
-        if pred_column is None or obs_column is None:
-            raise ValueError(
-                f"{path.name}: 找不到预报/观测谱列；现有列: {list(raw.columns)}"
-            )
-        preds[date] = raw[pred_column]
-        observations[date] = raw[obs_column]
-    if not preds:
-        raise ValueError(f"{name or root}: 没有可读的 {variable} 谱文件")
-    return pd.DataFrame(preds), pd.DataFrame(observations)
+    path = Path(root) / DIAGNOSTICS_DIR / SPECTRUM_BY_INIT_NAME
+    if not path.is_file():
+        raise FileNotFoundError(
+            f"{name or root}: 缺 {DIAGNOSTICS_DIR}/{SPECTRUM_BY_INIT_NAME}"
+            f"（配置的 writers 里要有 spectrum 才会出这张表）"
+        )
+    raw = pd.read_csv(path)
+    for column in ("variable", "init_time", "wavenumber", "pred", "obs"):
+        if column not in raw.columns:
+            raise ValueError(f"{path} 缺列 {column!r}；现有列: {list(raw.columns)}")
+    raw = raw[raw["variable"].astype(str) == str(variable)]
+    if raw.empty:
+        available = sorted({str(v) for v in pd.read_csv(path, usecols=["variable"])["variable"].dropna()})
+        raise ValueError(f"{path}: 没有变量 {variable} 的谱；现有变量: {available}")
+    raw = raw.assign(init_date=_to_init_date(raw["init_time"]))
+    raw = raw[raw["init_date"].isin({str(d) for d in dates})]
+    if raw.empty:
+        raise ValueError(f"{path}: 请求的起报日区间内没有 {variable} 的谱")
+    pred = raw.pivot_table(
+        index="wavenumber", columns="init_date", values="pred", aggfunc="mean"
+    ).sort_index()
+    obs = raw.pivot_table(
+        index="wavenumber", columns="init_date", values="obs", aggfunc="mean"
+    ).sort_index()
+    return pred, obs
 
 
 # ================================================================== 统计检验
@@ -465,6 +704,13 @@ class Bundle(NamedTuple):
     anomaly_model: str
     anomaly_ratio: float
     lead_relative: pd.DataFrame  # lead × 模型（逐 lead 综合相对 RMSE）
+    # --- 分纬度带（可选块「附 L」）---
+    region_names: List[str]  # 各模型都有的带名（升序），空 = 本批出不了这一块
+    region_labels: Dict[str, str]  # 带名 -> 边界串（来自 manifest）
+    region_relative_composite: pd.DataFrame  # 带名 × 模型（带内综合相对 RMSE）
+    region_lead_relative: Dict[str, pd.DataFrame]  # 带名 -> lead × 模型
+    region_rmse_by_lead: Dict[str, Dict[str, pd.DataFrame]]  # 带名 -> 模型 -> lead × 变量
+    region_note: str  # 出不了这一块时的原因，渲染进「本批未出」那句
 
 
 def _lead_relative(rmse_by_lead: Mapping[str, pd.DataFrame], names: Sequence[str],
@@ -485,7 +731,7 @@ def analyze(
     *,
     declared: Optional[Mapping[str, Sequence[str]]] = None,
 ) -> Bundle:
-    """把 N 个归档算成一份 :class:`Bundle`。
+    """把 N 份产物算成一份 :class:`Bundle`。
 
     Raises:
         ValueError: 共同日期太少（< 2）或没有共享的 RMSE 变量。
@@ -537,19 +783,17 @@ def analyze(
     if not fa_variables:
         raise ValueError("这些模型没有共享的 <变量>_ratio 列，算不出 FA 偏差")
 
-    spectrum_variables = None
+    spectrum_vars = None
     for archive in archives:
-        # 谱文件在 <YYYYMMDD>/ 里，不在归档根下
-        prefix = f"spectrum_{dates[0]}_"
-        own = {
-            path.name[len(prefix): -4]
-            for path in (archive.root / dates[0]).glob(f"{prefix}*.csv")
-        }
-        spectrum_variables = own if spectrum_variables is None else (spectrum_variables & own)
-    spectrum_variables = sorted(spectrum_variables or set())
-    if not spectrum_variables:
-        raise ValueError(f"这些模型在 {dates[0]} 都没有 spectrum_*.csv，算不出频谱指标")
-    spectrum_variable = _pick_variable(set(spectrum_variables), variables)
+        own = set(spectrum_variables(archive.root))
+        spectrum_vars = own if spectrum_vars is None else (spectrum_vars & own)
+    spectrum_vars = sorted(spectrum_vars or set())
+    if not spectrum_vars:
+        raise ValueError(
+            "这些模型的产物里都没有纬向谱（diagnostics/"
+            f"{SPECTRUM_BY_INIT_NAME}），算不出频谱指标"
+        )
+    spectrum_variable = _pick_variable(set(spectrum_vars), variables)
 
     spectrum: Dict[str, pd.DataFrame] = {}
     spectrum_rms_values: Dict[str, float] = {}
@@ -608,10 +852,43 @@ def analyze(
     anomaly_variable, anomaly_model, anomaly_ratio = _detect_anomaly(mean_rmse, names)
     lead_relative = _lead_relative(rmse_by_lead, names, variables)
 
+    # --- 分纬度带（可选块「附 L」）：各模型都有的带才出，一个都没有就整块「本批未出」---
+    shared_regions: Optional[set] = None
+    for archive in archives:
+        own = set(region_names(archive.root))
+        shared_regions = own if shared_regions is None else (shared_regions & own)
+    region_list = sorted(shared_regions or set())
+    region_label_map = region_labels(archives[0].root)
+    region_rmse_by_lead: Dict[str, Dict[str, pd.DataFrame]] = {}
+    region_lead_relative: Dict[str, pd.DataFrame] = {}
+    per_region_composite: Dict[str, pd.Series] = {}
+    region_note = ""
+    for region in region_list:
+        own_models = {
+            archive.name: region_rmse_by_date(archive.root, region, dates)
+            .reindex(columns=variables).mean(axis=0)
+            for archive in archives
+        }
+        # 带内**自己的**几何均值基线：跨带比绝对值没有意义（热带与极区差一个量级），
+        # 除成本带基线之后，「哪个模型在这个带上更稳」才是可比的。
+        per_region_composite[region] = _composite(_relative(pd.DataFrame(own_models).reindex(index=variables)))
+        region_rmse_by_lead[region] = {
+            archive.name: _metric_by_lead(archive.root, "rmse", dates, archive.name, region=region)
+            for archive in archives
+        }
+        region_lead_relative[region] = _lead_relative(region_rmse_by_lead[region], names, variables)
+
+    if not region_list:
+        region_note = (
+            "这批产物的 scores.csv 里没有共同的 region 行——"
+            "评测配置的 config_options.regions 为空，或者各模型的分带对不上。"
+        )
+    region_relative_composite = pd.DataFrame(per_region_composite).T
+
     return Bundle(
         names=names, archives=by_name, dates=dates, common_variables=variables,
         acc_variable=acc_variable, fa_variables=fa_variables,
-        spectrum_variable=spectrum_variable, spectrum_variables=spectrum_variables,
+        spectrum_variable=spectrum_variable, spectrum_variables=spectrum_vars,
         rmse_by_date=rmse_by_date, acc_by_lead=acc_by_lead, fa_ratio_by_lead=fa_ratio_by_lead,
         rmse_by_lead=rmse_by_lead, spectrum=spectrum,
         relative=relative, per_date_relative=per_date_relative,
@@ -621,21 +898,28 @@ def analyze(
         overall_tests=overall_tests, acc_tests=acc_tests, win_counts=win_counts,
         anomaly_variable=anomaly_variable, anomaly_model=anomaly_model,
         anomaly_ratio=anomaly_ratio, lead_relative=lead_relative,
+        region_names=region_list, region_labels=region_label_map,
+        region_relative_composite=region_relative_composite,
+        region_lead_relative=region_lead_relative,
+        region_rmse_by_lead=region_rmse_by_lead, region_note=region_note,
     )
 
 
 def _acc_by_date(root: Path, dates: Sequence[str], variable: str, name: str) -> pd.Series:
-    """逐日 ACC 变量在全部 lead 上的平均（百分数），index=日期。"""
-    values = {}
-    for date in dates:
-        path = _pick_metric_file(Path(root) / date, "acc", date)
-        if path is None:
-            raise FileNotFoundError(f"{name}: {date} 目录下没有 acc_*.csv")
-        raw = _read_lead_frame(path)
-        if variable not in raw.columns:
-            raise ValueError(f"{name}: {path.name} 里没有 {variable} 列；现有列: {list(raw.columns)}")
-        values[date] = BASELINE * float(pd.to_numeric(raw[variable], errors="coerce").mean())
-    return pd.Series(values)
+    """逐起报日的 ACC 变量在全部 lead 上的平均（百分数），index=起报日。"""
+    acc = metric_rows(root, "acc", product_kind="deterministic")
+    rows = acc[acc["variable"].astype(str) == str(variable)]
+    if rows.empty:
+        available = sorted({str(v) for v in acc["variable"].dropna()})
+        raise ValueError(f"{name}: 产物里没有变量 {variable} 的 acc 结果；现有变量: {available}")
+    per_date = rows.groupby(rows["init_date"].astype(str))["value"].mean()
+    wanted = [str(date) for date in dates]
+    missing = [date for date in wanted if date not in per_date.index]
+    if missing:
+        raise FileNotFoundError(
+            f"{name}: {len(missing)} 个起报日没有 {variable} 的 acc 结果（如 {missing[0]}）"
+        )
+    return BASELINE * per_date.reindex(wanted)
 
 
 def _pick_variable(candidates: Iterable[str], fallback: Sequence[str]) -> str:
@@ -735,9 +1019,9 @@ def _section_samples(bundle: Bundle, declared: Optional[Mapping[str, Sequence[st
     for name in bundle.names:
         archive = bundle.archives[name]
         meta = archive.meta
-        listed = [str(d) for d in (meta.get("dates") or [])]
-        missing = probe_dates(archive.root, sorted(set(archive.summary["init_date"])), "rmse")
-        extra = sorted(set(archive.dates) - set(archive.summary["init_date"]))
+        # scores.csv 里出现过、却没有确定性 rmse 结果的起报日。正常产物是空的；
+        # 非空说明这次只算了一部分指标，那些日期也就进不了 summary 和共同日期。
+        missing = probe_dates(archive.root, archive.dates, "rmse")
         nan_variables = [
             v for v in rmse_mean_columns(archive.summary)
             if archive.summary[f"rmse_{v}_mean"].isna().all()
@@ -747,15 +1031,12 @@ def _section_samples(bundle: Bundle, declared: Optional[Mapping[str, Sequence[st
         check_rows.append([
             name,
             f"{n_ok}/{n_dates}" if n_ok is not None and n_dates is not None else "—",
-            str(len(archive.summary)),
-            f"{len(set(archive.summary['init_date']))} 天" + (f"（meta 列 {len(listed)}）" if listed else ""),
+            str(len(archive.dates)),
             str(len(missing)) if missing else "无",
             "无" if not nan_variables else "、".join(nan_variables[:4]),
-            str(len(extra)) if extra else "无",
         ])
     lines += _table(
-        ["**模型**", "**n_ok/n_dates**", "**summary 行数**", "**日期集合**",
-         "**缺失文件**", "**NaN RMSE**", "**额外目录**"],
+        ["**模型**", "**n_ok/n_dates**", "**起报日数**", "**缺 RMSE 的日期**", "**NaN RMSE**"],
         check_rows,
     )
     lines.append("")
@@ -765,7 +1046,7 @@ def _section_samples(bundle: Bundle, declared: Optional[Mapping[str, Sequence[st
     if broken:
         detail = "；".join(f"{name} 有 {len(items)} 个起报点失败" for name, items in broken.items())
     else:
-        detail = "所有模型的 batch_meta 都记录 n_ok = n_dates，没有失败起报点"
+        detail = "所有模型的产物里每一行 status 都是 success，n_ok = n_dates，没有失败起报点"
     lines.append(
         f"{detail}。正文与附录统一使用 {len(bundle.dates)} 个共同日期"
         f"（{_date_span(bundle.dates)}），非共同日期不参与任何统计与曲线，"
@@ -776,17 +1057,17 @@ def _section_samples(bundle: Bundle, declared: Optional[Mapping[str, Sequence[st
     declared = declared or {}
     unknown = [name for name in bundle.names if name not in declared]
     if not unknown:
-        lines.append("各模型的声明变量清单由 `--declared` 提供，与归档实际变量逐一对照见第 6.2 节。")
+        lines.append("各模型的声明变量清单由 `--declared` 提供，与产物实际变量逐一对照见第 6.2 节。")
     elif len(unknown) == len(bundle.names):
         lines.append(
             "本次未提供各模型的声明变量清单（`--declared`），"
-            "第 6.2 节的「声明变量数」一律记 —，只比较归档里实际算出来的变量。"
+            "第 6.2 节的「声明变量数」一律记 —，只比较产物里实际算出来的变量。"
         )
     else:
         lines.append(
             f"本次只为 {'、'.join(n for n in bundle.names if n not in unknown)} 提供了声明变量清单"
             f"（`--declared`），{'、'.join(unknown)} 的「声明变量数」记 —，"
-            f"变量覆盖是否完整只能看归档里实际算出来的变量。"
+            f"变量覆盖是否完整只能看产物里实际算出来的变量。"
         )
 
     lines += ["", "## 指标口径说明（FA）", ""]
@@ -987,7 +1268,7 @@ def _section_risks(bundle: Bundle, declared: Optional[Mapping[str, Sequence[str]
     counts = {name: len(summary_variables(bundle.archives[name])) for name in bundle.names}
     if len(set(counts.values())) == 1:
         lines.append(
-            f"各模型的 summary.csv 都覆盖 {list(counts.values())[0]} 个变量，变量覆盖一致；"
+            f"各模型的产物都覆盖 {list(counts.values())[0]} 个变量，变量覆盖一致；"
             f"本报告只对这 {len(bundle.common_variables)} 个共享 RMSE 变量做横向比较。"
         )
     else:
@@ -1021,10 +1302,10 @@ def _section_risks(bundle: Bundle, declared: Optional[Mapping[str, Sequence[str]
 
     lines += ["", "## 6.4 原始场独立复算不足", ""]
     lines.append(
-        "本报告的 RMSE / ACC / FA / 频谱全部读自各模型归档目录里的逐日结果文件，"
+        "本报告的 RMSE / ACC / FA / 频谱全部读自各模型产物目录里的 scores.csv 汇总行，"
         "没有回到原始预报场与观测场做独立复算；"
-        "因此归档生成环节（变量映射、插值、单位换算）如果出错，本报告会原样继承，无法自查。"
-        "归档目录里也确实不含原始场（只有 summary.csv、batch_meta.json 与逐日结果 CSV），"
+        "因此评测环节（变量映射、插值、单位换算）如果出错，本报告会原样继承，无法自查。"
+        "产物目录里也确实不含原始场（只有 scores.csv、manifest.json 与 diagnostics/ 下的谱表），"
         "这一点无法在本报告内弥补。结论用于模型间横向比较是充分的，"
         "用于绝对精度认定前建议抽一个日期回到原始场复算一次。"
     )
@@ -1275,6 +1556,299 @@ def _section_selection(bundle: Bundle) -> List[str]:
     return lines
 
 
+def _season_block() -> List[str]:
+    """「附 S 分季节结果（可选）」：固定输出「本批未出」的静态说明。
+
+    这一块要等评测侧把季节口径定下来（按起报时刻还是有效时刻切、DJF 跨年怎么归），
+    定之前**不出数也不出图**。所以这里是**纯静态文本、不含任何占位符**，
+    与 ``assets/templates/weather_rmse_single.md`` 的「附 S」逐字一致。
+    """
+    return [
+        "## 附 S 分季节结果（可选）",
+        "",
+        "**本块本批未出。** 产物长表里目前没有季节维度，渲染器保留节位并标注「本批未出」，",
+        "不静默省略、也不留空表。",
+        "",
+        "要接上这一块，得先把两条口径定下来（两条都不难，选错会让数对不上）：",
+        "",
+        "- 季节按**起报时刻**还是**有效时刻**切——同一份检验里两者会差一个时效的长度；",
+        "- DJF 跨年怎么归——12 月与次年 1、2 月要不要算同一个 DJF。",
+        "",
+        "定了之后这一块的形态与「附 L」完全一致：一张分季节表（一行一个季节，按 DJF、MAM、",
+        "JJA、SON 升序，各模型各占一列，末列 `Best`），加两张图——`season_summary.png`",
+        "（分季节综合相对RMSE 柱状图，`图 S1`）与 `season_rmse_vs_lead.png`（各季节",
+        "综合相对RMSE 随预报时效的变化，`图 S2`）。数据同样出自长表，**不需要重跑评测**。",
+        "",
+        "`图 S1`/`图 S2` 两个号现在**留空**：这一块没出数就不出图，不指不存在的文件。",
+        "接上之后按「附 L」的写法补 `![…]` 与 `图 S*：{图注}` 即可。",
+    ]
+
+
+def _best_names(series: pd.Series, digits: int = 3) -> List[str]:
+    """综合相对RMSE 并列第一的**全体**名字。
+
+    两个模型出自同一批产物时相对值会精确相等，只取 ``idxmin`` 挑中的那一个，
+    报告读起来就是「A 全面领先」，而事实是分不出高下。按**显示精度**判并列，
+    保证表里印出来的数字和这一列说的是同一件事。
+    """
+    finite = series.dropna()
+    if finite.empty:
+        return []
+    key = f"{float(finite.min()):.{digits}f}"
+    return [
+        str(name) for name, value in finite.items() if f"{float(value):.{digits}f}" == key
+    ]
+
+
+def _best_cell(series: pd.Series, digits: int = 3) -> str:
+    """附表「Best」列：并列第一逐个列出，不只报 ``idxmin`` 挑中的那个。"""
+    names = _best_names(series, digits)
+    if not names:
+        return "—"
+    return " / ".join(names) + ("（并列）" if len(names) > 1 else "")
+
+
+class RegionTable(NamedTuple):
+    """「分纬度带综合相对RMSE」那张表的三件套，外加全球口径的冠军。"""
+
+    rows: List[List[str]]                 # 表体（不含表头），一行一个带
+    best_of: Dict[str, List[str]]         # 带名 -> 并列第一的全体模型名
+    levels: Dict[str, Dict[str, float]]   # 带名 -> 变量 -> 该带该变量平均 RMSE
+    best_global: List[str]                # 全球口径并列第一的全体模型名
+
+
+def region_table(bundle: Bundle) -> RegionTable:
+    """构造「分纬度带综合相对RMSE」表。
+
+    det / ens / wave 三份报告的「附 L」第一张表完全同构，共用这一个构造函数——
+    各写一遍的话，并列判定之类的修订迟早只在其中一份上生效。
+    """
+    rows: List[List[str]] = []
+    best_of: Dict[str, List[str]] = {}
+    levels: Dict[str, Dict[str, float]] = {}
+    for region in bundle.region_names:
+        series = bundle.region_relative_composite.loc[region]
+        best_of[region] = _best_names(series)
+        rows.append(
+            [region_display(region, bundle.region_labels)]
+            + [_fmt(series[name]) for name in bundle.names]
+            + [_best_cell(series)]
+        )
+        # index=(模型, lead)、columns=变量 → 按变量对「模型 × lead」平均，
+        # 得到「这个带里这个变量的 RMSE 量级」。**不跨变量平均**，见 _region_reading。
+        stacked = pd.concat(bundle.region_rmse_by_lead[region].values())
+        levels[region] = {str(key): float(value) for key, value in stacked.mean(axis=0).items()}
+    return RegionTable(rows, best_of, levels, _best_names(bundle.relative_composite))
+
+
+def _region_reading(
+    bundle: Bundle,
+    best_global: Mapping[str, Any],
+    best_of: Mapping[str, Mapping[str, Any]],
+    levels: Mapping[str, Mapping[str, float]],
+) -> str:
+    """分带判读句：点名名次反转的带 + 带间绝对量级差。
+
+    ``levels`` 是 ``{带名: {变量: 该带该变量的 RMSE}}``。量级差**逐变量算比值再取
+    中位数**，不跨变量平均 RMSE——不同变量单位不同（``z500`` 是 m²/s²、``t2m`` 是 K），
+    先平均再比大小等于把量纲加在一起，出来的倍数没有意义。
+    """
+    global_names = list(best_global)
+    tied = len(global_names) > 1
+    head_global = "、".join(global_names) if global_names else "—"
+    tie_note = "（并列，分不出高下）" if tied else ""
+    global_value = _fmt(bundle.relative_composite[global_names[0]]) if global_names else "—"
+
+    flips = [
+        (region, list(best_of[region]))
+        for region in bundle.region_names
+        if set(best_of[region]) != set(global_names)
+    ]
+    if flips:
+        detail = "；".join(
+            f"{region_display(region, bundle.region_labels)} 的第一名是 {'、'.join(names)}"
+            f"（{_fmt(bundle.region_relative_composite.loc[region, names[0]])}）"
+            for region, names in flips
+        )
+        head = (
+            f"全球口径下综合相对RMSE最低的是 {head_global}{tie_note}（全球 {global_value}），"
+            f"但分带看这个结论并不是处处成立：{detail}——优势不是全纬度一致的，"
+            f"选型时要写清用在哪一纬带。"
+        )
+    elif tied:
+        head = (
+            f"各带的第一名与全球口径一致，都是 {head_global}{tie_note}"
+            f"（全球 {global_value}）——全球与各带都分不出高下，"
+            f"谈不上哪个模型在某一纬带上占优。"
+        )
+    else:
+        head = (
+            f"各带的第一名与全球口径一致，都是 {head_global}"
+            f"（全球 {global_value}）——它的优势在全纬度上都成立。"
+        )
+
+    variables = sorted({v for per_band in levels.values() for v in per_band})
+    spreads: List[float] = []
+    high_votes: Dict[str, int] = {}
+    low_votes: Dict[str, int] = {}
+    for variable in variables:
+        finite = {
+            region: per_band[variable]
+            for region, per_band in levels.items()
+            if np.isfinite(per_band.get(variable, np.nan)) and per_band.get(variable, 0) > 0
+        }
+        if len(finite) < 2:
+            continue
+        high = max(finite, key=lambda key: finite[key])
+        low = min(finite, key=lambda key: finite[key])
+        high_votes[high] = high_votes.get(high, 0) + 1
+        low_votes[low] = low_votes.get(low, 0) + 1
+        spreads.append(finite[high] / finite[low])
+    if spreads:
+        high_band = max(high_votes, key=lambda key: high_votes[key])
+        low_band = max(low_votes, key=lambda key: low_votes[key])
+        head += (
+            f" 各带的绝对 RMSE 量级差（同一变量在各带之间的极差，"
+            f"{len(spreads)}个变量的中位数）是 {_fmt(float(np.median(spreads)), 1)} 倍，"
+            f"最大出现在 {region_display(high_band, bundle.region_labels)}、"
+            f"最小出现在 {region_display(low_band, bundle.region_labels)}"
+            f"——带与带之间只能比相对值，比绝对值没有意义。"
+        )
+    return head
+
+
+def _region_block(bundle: Bundle, figures: Mapping[str, str]) -> List[str]:
+    """「附 L 分纬度带结果（可选）」。
+
+    没有共同的 region 行时保留节位、写一句「本批未出」并说明原因，不静默省略、
+    也不留一张空表——与球谐带那三节同一套约定。
+    """
+    count = len(bundle.names)
+    word = _model_count_word(count)
+    lines = ["## 附 L 分纬度带结果（可选）", ""]
+    if not bundle.region_names:
+        lines += [f"**本块本批未出。** {bundle.region_note}", ""]
+        return lines
+
+    table = region_table(bundle)
+    rows, best_of, levels, best_global = (
+        table.rows, table.best_of, table.levels, table.best_global,
+    )
+
+    lines += [
+        "本块把长表里 `region` 非空的行**单独汇总**，全球行**不参与**——全球平均与纬度带平均",
+        "是两个量，混在一起算会把带间差异整个抹平，这一块也就没有意义了。",
+        "带名与边界照搬评测配置 `options[\"regions\"]`：**报告不翻译、也不写死任何带名**，",
+        "配置里叫 `mid_latitudes` 就显示 `mid_latitudes`；要换一套切法改配置重跑即可，",
+        "报告这边一个字都不用动。表里的相对RMSE是**对本带基线**取的（100 = 该带内的",
+        f"{word}模型几何均值），不是全球基线——热带和极区的绝对 RMSE 差一个量级，",
+        "不除本带基线就没法横向比。",
+        "",
+        "**分纬度带综合相对RMSE**",
+        "",
+    ]
+    lines += _table(["纬度带"] + list(bundle.names) + ["Best"], rows)
+    lines += ["", _region_reading(bundle, best_global, best_of, levels), ""]
+    lines += [
+        f"![lat_band_rmse_vs_lead]({figures['lat_band_lead']})",
+        "",
+        f"图 L1：各纬度带综合相对RMSE随预报时效的变化"
+        f"（100 = 该带内{word}模型几何均值；{_date_span(bundle.dates)} 共同日期平均）",
+        "",
+        f"![lat_band_summary]({figures['lat_band_summary']})",
+        "",
+        f"图 L2：分纬度带综合相对RMSE"
+        f"（100 = 该带内{word}模型几何均值；{_date_span(bundle.dates)} 共同日期平均）",
+    ]
+    return lines
+
+
+#: 「谱比随时效」没出数时写这句。产物里逐波数的谱**只有逐起报一张**
+#: （``spectrum_by_init.csv`` 的列是 ``variable / init_time / wavenumber / pred / obs``，
+#: 没有 lead）；长表里带 lead 的 ``spectrum_power_ratio`` 是个**标量**、没有波数轴。
+#: 两头都凑不出「同一批波数、随 lead 变化」的曲线，所以这一节只能标未出。
+SPECTRUM_RATIO_ABSENT = (
+    "这一节**本批未出**。产物里逐波数的谱只有**逐起报**一张"
+    "（`diagnostics/spectrum_by_init.csv`，列是 "
+    "`variable / init_time / wavenumber / pred / obs`，**没有 lead**）；"
+    "长表里带 lead 的 `spectrum_power_ratio` 是**一个标量**、没有波数轴。"
+    "两头都凑不出「同一批波数、谱比随 lead 变化」的曲线，所以这一节给不出图，"
+    "也不拿平均谱顶替。要补上得让谱诊断按（起报, 时效）逐条落谱。"
+)
+
+
+def _heatmap_block(bundle: Bundle, figures: Mapping[str, str]) -> List[str]:
+    """「附 5 变量 × 时效 RMSE 热力图」（``图 5``）。"""
+    if "rmse_heatmap" not in figures:
+        return [
+            "## 附 5 变量 × 时效 RMSE 热力图",
+            "",
+            "**本批未出。** 只有单个 lead 时热力图没有可读的横向变化，"
+            "渲染器不出这张图。",
+        ]
+    count = len(bundle.names)
+    variables = len(bundle.common_variables)
+    first, last, leads = _lead_span(bundle.rmse_by_lead[bundle.names[0]].index)
+    return [
+        "## 附 5 变量 × 时效 RMSE 热力图",
+        "",
+        f"{count}幅子图，每个模型一幅：纵轴是{variables}个变量、横轴是全部{leads}个lead",
+        f"（{first}–{last}h）。格子里的数**不是 RMSE 本身，而是该模型在该变量、该 lead 上",
+        f"相对自己首时效（{first}h）的 RMSE 倍数**——除以首时效就把变量的量纲与气候态差异",
+        f"约掉了，{variables}个变量才能摆在同一根色标下横向比。",
+        "读法：同一行里颜色随列单调加深是正常的，**加深得慢**才说明这个变量扛得住长时效；",
+        "同一行里某一段突然跳深，通常不是模式变差，而是该时效上样本数或变量路由变了，",
+        "要回第 2 节核对样本。",
+        "",
+        f"![multi_model_rmse_heatmap]({figures['rmse_heatmap']})",
+        "",
+        f"图 5：{variables}个变量 × {leads}个 lead 的 RMSE 倍数热力图"
+        f"（各自除以本模型首时效 {first}h 的 RMSE；{_date_span(bundle.dates)} 共同日期平均）",
+    ]
+
+
+def _spectrum_ratio_block(bundle: Bundle) -> List[str]:
+    """「附 6 谱比随时效」（``图 6``）——产物给不出，见 :data:`SPECTRUM_RATIO_ABSENT`。"""
+    return [
+        f"## 附 6 {bundle.spectrum_variable} 谱比随时效",
+        "",
+        "横轴为波数（双对数），纵轴为 pred/obs，y=1 参考线画出；**每个 lead 一条曲线**，",
+        "颜色由浅到深对应 lead 由短到长。这一节回答的是「小尺度能量不足是随时间恶化，",
+        "还是一开始就缺」：曲线整体贴着 1、随 lead 一起下移，是误差累积，加长预报时长",
+        "可以缓解；曲线从最短时效就整体偏低、后续几乎不再下移，是模式本身的能量谱问题，",
+        "**不是**预报时长带来的，调时效救不回来。",
+        "",
+        SPECTRUM_RATIO_ABSENT,
+    ]
+
+
+def _single_init_block(bundle: Bundle, figures: Mapping[str, str]) -> List[str]:
+    """「附 7 单起报功率谱曲线」（``图 7``）。"""
+    count = len(bundle.dates)
+    init = str(bundle.dates[0]) if bundle.dates else ""
+    lines = [
+        f"## 附 7 单起报 {bundle.spectrum_variable} 功率谱曲线",
+        "",
+        f"附 4 是{count}个日期平均后的谱，平均会把个例差异抹平。这一节换成**单个起报**",
+        f"（{init}）的谱，用来核对平均谱上的结论在个例上是否成立——平均谱上「小尺度偏低」",
+        "如果只在少数个例出现，就不该写成模式的普遍特征。",
+        "",
+    ]
+    if "spectrum_curve" in figures:
+        lines += [
+            f"![spectrum_curve]({figures['spectrum_curve']})",
+            "",
+            f"图 7：{init} 单起报的 {bundle.spectrum_variable} 纬向功率谱"
+            f"（双对数；黑色虚线为同时刻观测谱）",
+        ]
+    else:
+        lines += [
+            f"**本批未出。** 产物里没有 {bundle.spectrum_variable} 的逐起报谱"
+            f"（`diagnostics/spectrum_by_init.csv`），出不了这张图。",
+        ]
+    return lines
+
+
 def _appendix(bundle: Bundle, figures: Mapping[str, str]) -> List[str]:
     count = len(bundle.names)
     listing = "、".join(bundle.names)
@@ -1319,7 +1893,17 @@ def _appendix(bundle: Bundle, figures: Mapping[str, str]) -> List[str]:
         f"![multi_model_spectrum]({figures['spectrum_plot']})",
         "",
         f"图 4：{bundle.spectrum_variable} 纬向功率谱（{_date_span(bundle.dates)} 共同日期平均）",
+        "",
     ]
+    lines += _heatmap_block(bundle, figures)
+    lines += [""]
+    lines += _spectrum_ratio_block(bundle)
+    lines += [""]
+    lines += _single_init_block(bundle, figures)
+    lines += [""]
+    lines += _region_block(bundle, figures)
+    lines += [""]
+    lines += _season_block()
     return lines
 
 
@@ -1342,18 +1926,20 @@ def render(
         "acc_plot": "multi_model_acc_vs_lead.png",
         "fa_plot": "multi_model_fa_ratio_vs_lead.png",
         "spectrum_plot": f"multi_model_spectrum_{bundle.spectrum_variable}.png",
+        "lat_band_lead": "lat_band_rmse_vs_lead.png",
+        "lat_band_summary": "lat_band_summary.png",
     }
     first, last, leads = _lead_span(bundle.rmse_by_lead[bundle.names[0]].index)
 
     lines: List[str] = []
     lines.append(title or f"# XMETAI 确定性{_model_count_word(count)}模型评估检验报告（单成员）")
-    lines += ["", f"**归档：{archive or '、'.join(bundle.names)}**", ""]
+    lines += ["", f"**产物：{archive or '、'.join(bundle.names)}**", ""]
     lines += [
         f"报告日期：{bundle.dates[-1]}    评估层级：输出级复核",
         "",
         "## 报告定位与衔接",
         "",
-        f"报告类型：确定性单成员预报（single/det）。本报告覆盖 {count} 个模型的批次归档目录，"
+        f"报告类型：确定性单成员预报（single/det）。本报告覆盖 {count} 个模型的评估产物目录，"
         f"正文与附录统一使用 {len(bundle.dates)} 个共同日期（{_date_span(bundle.dates)}），"
         f"逐日结果按 lead 平均后比较；非共同日期不参与任何统计。"
         + (f"本次相对上一版的改动：{change}" if change else ""),
@@ -1489,6 +2075,81 @@ def build_det_report(
         bundle.spectrum, bundle.spectrum_variable,
         save_path=out_dir / figures["spectrum_plot"],
     )
+
+    # 图 5：变量 × 时效 RMSE 热力图。格子是「除以本模型首时效」的倍数——各变量单位
+    # 不同，不归一化就没法共用一根色标。只有一个 lead 时没有横向变化可读，不出图。
+    ratios: Dict[str, pd.DataFrame] = {}
+    for name in bundle.names:
+        frame = bundle.rmse_by_lead[name]
+        if frame.empty:
+            continue
+        leads = sorted(frame.index)
+        if len(leads) < 2:
+            continue
+        base_lead = frame.loc[leads[0]]
+        ratios[name] = frame.div(base_lead.replace(0.0, np.nan))
+    if ratios:
+        figures["rmse_heatmap"] = "multi_model_rmse_heatmap.png"
+        plotter.plot_rmse_heatmap(
+            ratios, bundle.common_variables,
+            leads=sorted(bundle.rmse_by_lead[bundle.names[0]].index),
+            suptitle=f"{_model_count_word(len(bundle.names))}模型 RMSE 相对本模型首时效的倍数",
+            save_path=out_dir / figures["rmse_heatmap"],
+        )
+
+    # 图 7：单起报谱曲线。取共同日期里最早的那个起报，其余日期仍进平均谱（附 4）。
+    # 产物没有逐起报谱就**不出图**，报告那边写「本批未出」。
+    if bundle.dates:
+        init = str(bundle.dates[0])
+        single: Dict[str, pd.DataFrame] = {}
+        for archive in archives:
+            try:
+                pred, obs = load_spectrum(archive.root, [init], bundle.spectrum_variable,
+                                          archive.name)
+            except (FileNotFoundError, ValueError):
+                continue
+            if init in pred.columns:
+                single[archive.name] = pd.DataFrame({"pred": pred[init], "obs": obs[init]})
+        if single:
+            figures["spectrum_curve"] = f"spectrum_curve_{bundle.spectrum_variable}_{init}.png"
+            plotter.plot_model_spectrum(
+                single, bundle.spectrum_variable,
+                suptitle=f"{bundle.spectrum_variable} 纬向功率谱（{init} 单起报）",
+                save_path=out_dir / figures["spectrum_curve"],
+            )
+
+    # 分纬度带（可选块）：产物里没有共同的 region 行就**不出图**，也不往 artifacts 里
+    # 塞不存在的路径——报告那边会写「本批未出」，指一张没生成的图比不指更糟。
+    if bundle.region_names:
+        band_labels = [
+            region_display(region, bundle.region_labels) for region in bundle.region_names
+        ]
+        figures["lat_band_lead"] = "lat_band_rmse_vs_lead.png"
+        figures["lat_band_summary"] = "lat_band_summary.png"
+        plotter.plot_model_panels(
+            {
+                name: pd.DataFrame({
+                    label: bundle.region_lead_relative[region][name]
+                    for region, label in zip(bundle.region_names, band_labels)
+                })
+                for name in bundle.names
+            },
+            band_labels,
+            ylabel="综合相对 RMSE（100 = 该带内几何均值）",
+            ref_line=BASELINE,
+            ncols=min(len(band_labels), 3),
+            suptitle="分纬度带综合相对 RMSE 随预报时效的变化",
+            save_path=out_dir / figures["lat_band_lead"],
+        )
+        summary = bundle.region_relative_composite.copy()
+        summary.index = band_labels
+        plotter.plot_group_bars(
+            summary,
+            ylabel="综合相对 RMSE（100 = 该带内几何均值）",
+            ref_line=BASELINE,
+            suptitle="分纬度带综合相对 RMSE",
+            save_path=out_dir / figures["lat_band_summary"],
+        )
 
     text = render(
         bundle, title=title, change=change, archive=archive,

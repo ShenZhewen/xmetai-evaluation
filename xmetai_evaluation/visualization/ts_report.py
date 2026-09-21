@@ -4,7 +4,7 @@
 
 一句话用法::
 
-    python -m xmetai_evaluation.visualization.ts_report --csv ts.csv --out reports/fgvp --model FGVP
+    python -m xmetai_evaluation.visualization.ts_report --csv ts.csv --result reports/fgvp --model FGVP
 
 报告按**论文实验章节**的写法组织：每一节都是「引导句 → 图表 → 定量分析」。
 图就地带着图注出现（`图 N：…` / `表 N：…`，按出现顺序编号），图下必有图注、
@@ -1275,10 +1275,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser = argparse.ArgumentParser(
         description="把 TS 结果表画成图并写成 Markdown 报告",
         epilog="示例: python -m xmetai_evaluation.visualization.ts_report "
-        "--csv ts_fgvp_2025.csv --out reports/fgvp --model FGVP",
+        "--csv ts_fgvp_2025.csv --result reports/fgvp --model FGVP",
     )
     parser.add_argument("--csv", type=Path, required=True, help="TS 结果表（csv）")
-    parser.add_argument("--out", type=Path, required=True, help="输出目录")
+    parser.add_argument("--result", type=Path, required=True, help="输出目录")
     parser.add_argument("--model", default=None, help="模型名（默认取文件名）")
     parser.add_argument("--baseline-csv", type=Path, default=None, help="可选：基准模型结果表")
     parser.add_argument("--baseline-name", default=None, help="基准模型名")
@@ -1286,7 +1286,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser.add_argument("--dpi", type=int, default=150)
     args = parser.parse_args(argv)
 
-    from visualization.precipitation_plots import PrecipitationPlotter
+    from xmetai_evaluation.visualization.precipitation_plots import PrecipitationPlotter
 
     plt_dpi = args.dpi
     import matplotlib.pyplot as plt
@@ -1296,7 +1296,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     plotter = PrecipitationPlotter()
     artifacts = plotter.create_report(
         pd.read_csv(args.csv),
-        output_dir=args.out,
+        output_dir=args.result,
         model_name=model,
         lead_h=args.lead_h,
         baseline_df=pd.read_csv(args.baseline_csv) if args.baseline_csv else None,

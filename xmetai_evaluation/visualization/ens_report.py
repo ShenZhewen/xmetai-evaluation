@@ -1,21 +1,17 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""集合预报（ensemble）批次归档 → 多模型评估检验报告。
+"""集合预报（ensemble）多模型评估检验报告：读评估产物 → 渲染 Markdown。
 
-输入是 ``weather_rmse_<模型>_ens`` 支线的**批次归档目录**（``summarize_mode``
-为 ``--summarize-ens``）：``summary.csv`` + ``batch_meta.json`` + ``<YYYYMMDD>/``。
-逐日文件是集合特有的 ``crps_<日期>.csv`` / ``spread_<日期>.csv`` /
-``spread_rmse_ratio_<日期>.csv``，加上集合平均场口径的
-``rmse_<日期>_ensmean.csv`` / ``acc_<日期>_ensmean.csv`` /
-``fa_<日期>_ensmean.csv`` / ``spectrum_<日期>_<变量>.csv``。
+输入是 ``weather_rmse_<模型>_ens`` 支线的**评估产物目录**（形状见
+``det_report`` 的模块说明）：``scores.csv`` + ``manifest.json`` + ``diagnostics/``。
+集合特有的三个指标在长表里是 ``crps`` / ``spread`` / ``spread_error_ratio``。
 
-**与 ``_single`` 支线的三条硬差别**（踩了会静默算错，见
-``references/rmse-batch-evaluation.md`` §1.3）：
+**与 ``_single`` 支线的三条硬差别**（踩了会静默算错）：
 
-1. ``rmse`` / ``acc`` / ``fa`` 读的是后缀 ``_ensmean`` 的**集合平均场**，
-   不是单个成员。``det_report._pick_metric_file`` 认这个后缀，于是
-   ``det_report.analyze`` 能原样吃下集合归档；但**报告口径不是一回事**，
-   别拿 ``generate_det_report.py`` 出集合报告，也别拿本模块出单成员报告。
+1. ``rmse`` / ``acc`` 是集合平均场口径。长表里 ``spread_error`` 也展开出一个叫
+   ``rmse`` 的行，与确定性 RMSE **同名**，只能靠 ``product_kind``
+   （``ensemble`` / ``deterministic``）区分——``det_report.metric_rows`` 就是这个
+   过滤器。别拿 ``generate_det_report.py`` 出集合报告，也别拿本模块出单成员报告。
 2. 这里多两个集合特有指标：CRPS 与离散度（Spread、Spread/RMSE）。
 3. 对数底数是 **ln**，而 ``det_report`` 的 ``spectrum_rms`` 是 **log10**
    （两者差 ×2.3026）。本模块的 §4/§5 一律自算 ln 版，**不读**
@@ -23,25 +19,21 @@
    自相矛盾 2.3026 倍。``log_rms_ln`` 与 ``_save_figure`` 直接复用
    :mod:`visualization.wave_report`，它们本就与骨架口径对齐。
 
-**逐日文件一律严格按名字读，不做 glob 兜底**：兜底会把
-``rmse_<日期>_member_000.csv`` 这类单成员文件当成集合平均静默读进来，
-而集合与单成员的 ``crps`` / ``spread`` / ``spread_rmse_ratio`` 同名，
-选错文件时不会有任何报错。
-
-**不读 ``mean_*.csv`` / ``ens_summary_*.csv``**：那些是**该模型全部日期**口径，
-混进来会出现「表里 349 天、图里 27 天」的错位。
+**取数一律走 ``init_date``**（``init_time`` 前 10 位）。老归档那套
+``<stem>_<日期>_ensmean.csv`` 逐日文件没有了；靠文件名后缀区分集合/单成员的做法
+也随之作废——长表里由 ``product_kind`` 承担这个职责，比文件名可靠。
 
 格式契约是 ``skills/xmetai-evaluation/assets/templates/weather_rmse_ens.md``：
 章节用 ``# 1.``…``# 7.`` + 附录，**表不编号**，只有附录六张图带 ``图 N：``
 且必须 1–6 连续（``render_ens`` 末尾自检）。骨架**不含球谐带功率**
-（那是 ``weather_rmse_wave`` 的活），所以本模块也不读 ``spherical_bands_*.csv``。
+（那是 ``weather_rmse_wave`` 的活），所以本模块也不读 ``spherical_band_*``。
 """
 
 from __future__ import annotations
 
 import math
 from pathlib import Path
-from typing import Dict, List, Mapping, NamedTuple, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Mapping, NamedTuple, Optional, Sequence, Tuple
 
 import matplotlib
 
@@ -51,26 +43,32 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 
-from visualization.det_plots import DetPlotter, model_colors
-from visualization.precipitation_plots import setup_chinese_font
-from visualization.det_report import (
+from xmetai_evaluation.visualization.det_plots import DetPlotter, model_colors
+from xmetai_evaluation.visualization.precipitation_plots import setup_chinese_font
+from xmetai_evaluation.visualization.det_report import (
     Archive,
     Bundle,
     LEAD_BANDS,
     _CN_NUM,
+    _best_cell,
+    _best_names,
     _bullets,
     _date_span,
     _fmt,
     _lead_span,
-    _pick_metric_file,
-    _read_lead_frame,
+    _model_count_word,
     _relative,
     _table,
     analyze,
+    by_date_frames,
     load_spectrum,
+    SPECTRUM_RATIO_ABSENT,
+    metric_rows,
     paired_tests,
+    region_display,
+    region_table,
 )
-from visualization.wave_report import _save_figure, log_rms_ln
+from xmetai_evaluation.visualization.wave_report import _save_figure, log_rms_ln
 
 
 #: 综合相对 RMSE 的基线（各模型几何均值 = 100）
@@ -89,83 +87,78 @@ _FAMILY_DIRECTION = {"ACC": True}
 # ====================================================================== 加载
 
 
-def _daily_path(root: Path, stem: str, date: str) -> Path:
-    """集合归档里 ``<stem>_<日期>.csv`` 的**唯一**合法路径（不兜底）。"""
-    return Path(root) / date / f"{stem}_{date}.csv"
-
-
 def load_daily_frames(
-    root: Path, stem: str, dates: Sequence[str], name: str = ""
+    root: Path, stem: str, dates: Sequence[str], name: str = "", *, region: Optional[str] = None
 ) -> Tuple[pd.DataFrame, Dict[str, pd.DataFrame]]:
-    """逐日 ``<stem>_<日期>.csv`` → ``(按 lead 平均的表, {日期: 原表})``。
+    """集合特有指标 ``stem`` → ``(按 lead 平均的表, {起报日: 原表})``。
 
     两份都返回：出图与总表要按 lead 平均的表，配对检验要**逐日样本**
     （先平均再检验等于把样本量从 N 天压成 1 个点）。
 
+    长表里 ``crps`` 只有一份（``product_kind=ensemble``），不像 ``rmse`` 那样
+    和确定性指标撞名，所以这里不按 ``product_kind`` 过滤。
+
     Raises:
-        FileNotFoundError: 某个共同日期缺这个文件——不静默跳过。
-        ValueError: 各日期的列集合不一致——跨日平均会按「有几天算几天」
+        FileNotFoundError: 某个共同起报日缺这个指标的结果——不静默跳过。
+        ValueError: 各起报日的列集合不一致——跨日平均会按「有几天算几天」
             静默缩样本，让同一行里两个模型的样本量不同。
     """
-    frames: Dict[str, pd.DataFrame] = {}
+    rows = metric_rows(root, stem, region=region)
+    frames = by_date_frames(rows, dates, f"{name or root}: {stem}")
     columns: Optional[List[str]] = None
-    for date in dates:
-        path = _daily_path(root, stem, date)
-        if not path.is_file():
-            raise FileNotFoundError(
-                f"{name or root}: 缺 {path.name}（{date} 没算 {stem}？集合归档应当有）"
-            )
-        frame = _read_lead_frame(path)
+    for date, frame in frames.items():
         own = sorted(str(c) for c in frame.columns)
         if columns is None:
             columns = own
         elif own != columns:
             raise ValueError(
-                f"{name or root}: {stem} 逐日文件的列不一致——"
-                f"{date} 是 {own}，其余日期是 {columns}；"
+                f"{name or root}: {stem} 各起报日的列不一致——"
+                f"{date} 是 {own}，其余起报日是 {columns}；"
                 f"跨日平均会静默缩样本，不做"
             )
-        frames[date] = frame
     if not frames:
-        raise ValueError(f"{name or root}: 没有可读的 {stem} 逐日文件")
+        raise ValueError(f"{name or root}: 没有可读的 {stem} 结果")
     stacked = pd.concat(frames.values(), axis=0)
     return stacked.groupby(level=0).mean().sort_index(), frames
 
 
 def load_spread_rmse_ratio(
-    root: Path, dates: Sequence[str], name: str = ""
+    root: Path, dates: Sequence[str], name: str = "", *, region: Optional[str] = None
 ) -> Tuple[Dict[str, pd.DataFrame], str]:
-    """逐日 Spread/RMSE → ``({日期: lead × 变量}, 来源标签)``。
+    """Spread/RMSE → ``({起报日: lead × 变量}, 来源标签)``。
 
-    优先读归档自带的 ``spread_rmse_ratio_<日期>.csv``；**任一**共同日期缺它，
-    就整批退到 ``spread_<日期>.csv ÷ rmse_<日期>_ensmean.csv`` 现算——
-    不混口径（一半读归档、一半现算，两个来源的小数位与分母处理未必一致）。
+    ``spread_error`` 指标在长表里展开成 ``spread`` / ``rmse`` /
+    ``spread_error_ratio`` 三行，优先直接用现成的 ratio；**任一**起报日缺它，
+    就整批退到 ``spread ÷ rmse`` 现算——不混口径（一半读现成、一半现算，
+    两个来源的小数位与分母处理未必一致）。
+
+    注意这里的 ``rmse`` 要的是**集合口径**那一行（``product_kind=ensemble``），
+    不是同名的确定性 RMSE。
     """
-    if all(_daily_path(root, "spread_rmse_ratio", date).is_file() for date in dates):
-        frames = {
-            date: _read_lead_frame(_daily_path(root, "spread_rmse_ratio", date))
-            for date in dates
-        }
-        return frames, "归档自带 spread_rmse_ratio_<日期>.csv"
+    ratio_rows = metric_rows(root, "spread_error_ratio", region=region)
+    have = set(ratio_rows["init_date"].astype(str))
+    if all(str(date) in have for date in dates):
+        return by_date_frames(ratio_rows, dates, f"{name or root}: spread_error_ratio"), \
+            "产物自带的 spread_error_ratio"
 
-    frames = {}
-    for date in dates:
-        spread_path = _daily_path(root, "spread", date)
-        if not spread_path.is_file():
-            raise FileNotFoundError(f"{name or root}: 缺 {spread_path.name}")
-        rmse_path = _pick_metric_file(Path(root) / date, "rmse", date)
-        if rmse_path is None:
-            raise FileNotFoundError(f"{name or root}: {date} 目录下没有 rmse_*.csv")
-        spread = _read_lead_frame(spread_path)
-        rmse = _read_lead_frame(rmse_path)
-        shared = [c for c in spread.columns if c in rmse.columns]
+    spread = by_date_frames(
+        metric_rows(root, "spread", region=region), dates, f"{name or root}: spread"
+    )
+    rmse = by_date_frames(
+        metric_rows(root, "rmse", product_kind="ensemble", region=region),
+        dates, f"{name or root}: 集合 rmse",
+    )
+    frames: Dict[str, pd.DataFrame] = {}
+    for date in spread:
+        own_spread, own_rmse = spread[date], rmse[date]
+        shared = [c for c in own_spread.columns if c in own_rmse.columns]
         if not shared:
             raise ValueError(
                 f"{name or root}: {date} 的 spread 与 rmse 没有同名变量；"
-                f"spread 有 {list(spread.columns)}，rmse 有 {list(rmse.columns)}"
+                f"spread 有 {list(own_spread.columns)}，rmse 有 {list(own_rmse.columns)}"
             )
-        frames[date] = spread[shared] / rmse[shared].replace(0.0, np.nan)
-    return frames, "由 spread ÷ 集合均值 rmse 现算"
+        frames[date] = own_spread[shared] / own_rmse[shared].replace(0.0, np.nan)
+    return frames, "由 spread ÷ 集合口径 rmse 现算"
 
 
 def _per_date_means(frames: Mapping[str, pd.DataFrame]) -> Dict[str, pd.Series]:
@@ -197,7 +190,11 @@ def _shared_columns(frames: Mapping[str, pd.DataFrame]) -> List[str]:
 
 
 def _unique_summary_value(archive: Archive, column: str) -> Optional[int]:
-    """``summary.csv`` 某列的唯一数值；列缺失或有多值就返回 None。"""
+    """派生 summary 视图里某列的唯一数值；列缺失或有多值就返回 None。
+
+    新产物只在长表里记「算出来的数」，不记集合成员数这类**运行参数**，所以
+    ``n_members`` 一律取不到、渲染成「—」。``n_leads`` 有（由长表现算）。
+    """
     if column not in archive.summary.columns:
         return None
     values = pd.to_numeric(archive.summary[column], errors="coerce").dropna().unique()
@@ -207,26 +204,32 @@ def _unique_summary_value(archive: Archive, column: str) -> Optional[int]:
 def _acc_per_variable(
     root: Path, dates: Sequence[str], variables: Sequence[str], name: str = ""
 ) -> Dict[str, pd.Series]:
-    """逐日 ``acc_<日期>_ensmean.csv`` → ``{变量: 日期 → 全 lead 平均 ACC(%)}``。
+    """``acc`` 的确定性行 → ``{变量: 起报日 → 全 lead 平均 ACC(%)}``。
 
     ``det_report._acc_by_date`` 只算一个变量（报告只要 ``acc_variable``），
     §6 的 ACC 指标族要逐变量，所以这里重算一遍。``analyze`` 已经在入口乘过
     ``BASELINE``，本函数同样乘——**下游不要再乘一次**。
     """
-    values: Dict[str, Dict[str, float]] = {str(v): {} for v in variables}
-    for date in dates:
-        path = _pick_metric_file(Path(root) / date, "acc", date)
-        if path is None:
-            raise FileNotFoundError(f"{name or root}: {date} 目录下没有 acc_*.csv")
-        raw = _read_lead_frame(path)
-        for variable in variables:
-            if variable not in raw.columns:
-                raise ValueError(
-                    f"{name or root}: {path.name} 里没有 {variable} 列；"
-                    f"现有列: {list(raw.columns)}"
-                )
-            numbers = pd.to_numeric(raw[variable], errors="coerce")
-            values[variable][date] = BASELINE * float(numbers.mean())
+    acc = metric_rows(root, "acc", product_kind="deterministic")
+    per_date = acc.groupby([acc["init_date"].astype(str), acc["variable"].astype(str)])["value"].mean()
+    wanted = [str(date) for date in dates]
+    values: Dict[str, Dict[str, float]] = {}
+    for variable in variables:
+        variable = str(variable)
+        try:
+            series = per_date.xs(variable, level=1)
+        except KeyError:
+            available = sorted({str(v) for v in acc["variable"].dropna()})
+            raise ValueError(
+                f"{name or root}: 产物里没有变量 {variable} 的 acc 结果；现有变量: {available}"
+            ) from None
+        missing = [date for date in wanted if date not in series.index]
+        if missing:
+            raise FileNotFoundError(
+                f"{name or root}: {len(missing)} 个起报日没有 {variable} 的 acc 结果"
+                f"（如 {missing[0]}）"
+            )
+        values[variable] = {date: BASELINE * float(series[date]) for date in wanted}
     return {variable: pd.Series(series).sort_index() for variable, series in values.items()}
 
 
@@ -310,6 +313,10 @@ class EnsBundle(NamedTuple):
     spread_variables: List[str]
     spread_ratio_source: str
     spread_log_deviation: pd.Series  # 模型 -> mean|ln(Spread/RMSE)|
+    #: 带名 × 模型，该带上的平均 Spread/RMSE（与正文同源同口径，只是换了统计范围）。
+    #: 某个带取不到 spread 行时该行整体缺席，缺席的带名记在 ``region_spread_skipped``。
+    region_spread_ratio: pd.DataFrame
+    region_spread_skipped: List[str]
     spectrum_by_variable: Dict[str, Dict[str, pd.DataFrame]]  # 变量 -> 模型 -> 波数×{pred,obs}
     spectrum_deviation: pd.DataFrame  # 谱变量 × 模型（%）
     spectrum_deviation_scalar: pd.Series  # 模型 -> %（谱变量平均）
@@ -483,6 +490,25 @@ def analyze_ens(archives: Sequence[Archive]) -> EnsBundle:
     else:
         member_label = "/".join(str(m) for m in distinct_members)
 
+    # 分纬度带的离散度：口径与正文的 Spread/RMSE 完全一致（同样优先用产物自带的
+    # spread_error_ratio），只是把统计范围换成单个带。取不到的带**不塞 NaN 充数**，
+    # 整行缺席并把带名记下来，渲染层据此说明，不让人以为那个带算出过 0 或 1。
+    per_region_spread: Dict[str, pd.Series] = {}
+    region_spread_skipped: List[str] = []
+    for region in base.region_names:
+        own: Dict[str, float] = {}
+        try:
+            for archive in archives:
+                frames, _source = load_spread_rmse_ratio(
+                    archive.root, dates, archive.name, region=region
+                )
+                own[archive.name] = float(np.nanmean(pd.concat(frames.values(), axis=0).values))
+        except (FileNotFoundError, ValueError):
+            region_spread_skipped.append(region)
+            continue
+        per_region_spread[region] = pd.Series(own)
+    region_spread_ratio = pd.DataFrame(per_region_spread).T
+
     return EnsBundle(
         base=base,
         members=members,
@@ -499,6 +525,8 @@ def analyze_ens(archives: Sequence[Archive]) -> EnsBundle:
         spread_variables=spread_variables,
         spread_ratio_source="；".join(sorted(spread_sources)),
         spread_log_deviation=spread_log_deviation,
+        region_spread_ratio=region_spread_ratio,
+        region_spread_skipped=region_spread_skipped,
         spectrum_by_variable=spectrum_by_variable,
         spectrum_deviation=spectrum_deviation,
         spectrum_deviation_scalar=spectrum_deviation_scalar,
@@ -625,7 +653,7 @@ def _failures_phrase(bundle: EnsBundle) -> str:
     }
     broken = {name: count for name, count in broken.items() if count}
     if not broken:
-        return "所有模型的 batch_meta 都记录 n_ok = n_dates，没有失败起报点"
+        return "所有模型的产物里每一行 status 都是 success，n_ok = n_dates，没有失败起报点"
     return "；".join(f"{name} 有 {count} 个起报点失败" for name, count in broken.items())
 
 
@@ -634,7 +662,7 @@ def _section_conclusion(bundle: EnsBundle) -> List[str]:
     names = bundle.names
     best = base.relative_composite.idxmin()
     items = [
-        f"{_cn(len(names))}个集合归档完整性检查通过，共同日期 {len(bundle.dates)} 天"
+        f"{_cn(len(names))}个集合产物完整性检查通过，共同日期 {len(bundle.dates)} 天"
         f"（{_date_span(bundle.dates)}）；{_failures_phrase(bundle)}。",
         f"综合相对 RMSE 最好 {best}（{_fmt(base.relative_composite[best])}），"
         f"最差 {base.relative_composite.idxmax()}"
@@ -720,8 +748,9 @@ def _section_samples(bundle: EnsBundle) -> List[str]:
     lines += _bullets([
         f"正文与附录统一使用 {len(base.dates)} 个共同日期（{_date_span(base.dates)}）；"
         f"各模型的非共同日期不参与任何统计与曲线，因此各表样本量一致、可直接横向比较。",
-        f"「请求日期」「成功日期」取自各模型 ``batch_meta.json`` 的 "
-        f"``n_dates`` / ``n_ok``，「日期目录」是磁盘上真实存在的 ``<YYYYMMDD>/`` 个数。",
+        f"「起报日数」「成功日期」取自各模型 ``scores.csv`` 里出现过的 ``init_date`` "
+        f"其中全部行 ``status = success`` 的个数（新产物没有「请求日期」这个概念，"
+        f"``n_dates`` 就是实际出了数的天数）。",
         f"离散度比值来源：{bundle.spread_ratio_source}。",
     ] + _quality_notes(bundle))
     return lines
@@ -754,7 +783,7 @@ def _quality_notes(bundle: EnsBundle) -> List[str]:
     if any(declared.values()):
         counts = "、".join(f"{name} {len(v)} 个" for name, v in declared.items())
         notes.append(
-            f"变量覆盖按各模型 ``batch_meta.json → options.var_metrics`` 的声明口径："
+            f"变量覆盖按各模型配置里 ``var_metrics`` 的声明口径："
             f"{counts}。报告只比较共同日期上**都真的算出来**的变量"
             f"（RMSE {len(base.common_variables)} 个：{_named(base.common_variables)}；"
             f"ACC {len(bundle.acc_variables)} 个：{_named(bundle.acc_variables)}；"
@@ -779,7 +808,7 @@ def _quality_notes(bundle: EnsBundle) -> List[str]:
         f"指标列数在各模型间不完全一致也是同一原因：CRPS 只有 "
         f"{_named(bundle.crps_variables)}；ACC 只有 {_named(bundle.acc_variables)}"
         + (f"；FA 没有 {_named(fa_gap)}" if fa_gap else "")
-        + f"——集合归档的 ``crps`` / ``fa`` 是逐变量配置决定算不算的。"
+        + f"——集合支线的 ``crps`` / ``fa`` 是逐变量配置决定算不算的。"
     )
 
     if len({m for m in bundle.members.values() if m is not None}) > 1:
@@ -1190,11 +1219,12 @@ def _section_risks(bundle: EnsBundle) -> List[str]:
         f"样本量：全部统计基于 {len(base.dates)} 个共同日期"
         f"（{_date_span(base.dates)}），分时效段的每个点又只有其中一个子集，"
         f"越靠后的时效样本越少，末端时效的曲线波动要谨慎解读。",
-        f"口径边界：正文与附录只使用共同日期。各模型归档里还有大量非共同日期"
-        f"（逐日目录数远多于共同日期的那些模型尤其明显），本报告**没有**使用它们，"
-        f"因此不要把本报告的数字与各模型单批归档自身的汇总数直接对比。",
-        f"集合平均场口径：RMSE / ACC / FA 都来自逐日 ``*_ensmean.csv``，"
-        f"衡量的是集合平均场而不是最优成员；择优成员带来的收益在本报告中不可见。",
+        f"口径边界：正文与附录只使用共同日期。各模型产物里还有大量非共同日期"
+        f"（起报日数远多于共同日期的那些模型尤其明显），本报告**没有**使用它们，"
+        f"因此不要把本报告的数字与各模型单独跑出来的汇总数直接对比。",
+        f"集合平均场口径：RMSE / ACC / FA 都取自集合平均场（``product_kind`` 为 "
+        f"``deterministic`` 的那批结果），衡量的是集合平均场而不是最优成员；"
+        f"择优成员带来的收益在本报告中不可见。",
         f"对数底数：本报告的纬向谱偏差用 ln，``weather_rmse_single`` 报告的"
         f"「频谱对数 RMS」用 log10，数值相差 2.3026 倍，跨报告比大小前先统一底数。",
     ]
@@ -1305,20 +1335,306 @@ def _appendix(bundle: EnsBundle, figures: Mapping[str, str]) -> List[str]:
         f"图 6：{_named(base.spectrum_variables)} 的纬向功率谱"
         f"（双对数，{len(base.dates)} 个共同日期平均），"
         f"每条颜色曲线为一个模型的预测谱，黑色虚线为观测谱。",
+        "",
+    ] + _heatmap_block(bundle, figures) + [""] \
+      + _spectrum_ratio_block(bundle) + [""] \
+      + _single_init_block(bundle, figures) + [""] \
+      + _region_block(bundle, figures) + [""] + _season_block()
+
+
+def _heatmap_block(bundle: EnsBundle, figures: Mapping[str, str]) -> List[str]:
+    """「附 7 变量 × 时效 RMSE 热力图」（``图 7``）。"""
+    base = bundle.base
+    if "rmse_heatmap" not in figures:
+        return [
+            "## 附 7 变量 × 时效 RMSE 热力图",
+            "",
+            "**本批未出。** 只有单个 lead 时热力图没有可读的横向变化，"
+            "渲染器不出这张图。",
+        ]
+    count = len(base.names)
+    variables = len(base.common_variables)
+    first, last, leads = _lead_span(base.rmse_by_lead[base.names[0]].index)
+    return [
+        "## 附 7 变量 × 时效 RMSE 热力图",
+        "",
+        f"{count}幅子图，每个模型一幅：纵轴是{variables}个变量、横轴是全部{leads}个lead",
+        f"（{first}–{last}h）。格子里的数**不是 RMSE 本身，而是该模型在该变量、该 lead 上",
+        f"相对自己首时效（{first}h）的 RMSE 倍数**——除以首时效就把变量的量纲与气候态差异",
+        f"约掉了，{variables}个变量才能摆在同一根色标下横向比。这里的 RMSE 是**集合平均场**",
+        "口径，与正文第 4.2 节同源，不要和「附 2 的 Spread/RMSE」混读。",
+        "读法：同一行里颜色随列单调加深是正常的，**加深得慢**才说明这个变量扛得住长时效；",
+        "同一行里某一段突然跳深，通常不是模式变差，而是该时效上成员数或变量路由变了，",
+        "要回第 2 节核对样本。",
+        "",
+        f"![ensemble_rmse_heatmap]({figures['rmse_heatmap']})",
+        "",
+        f"图 7：{variables}个变量 × {leads}个 lead 的 RMSE 倍数热力图"
+        f"（各自除以本模型首时效 {first}h 的 RMSE；{_date_span(base.dates)} 共同日期平均）",
     ]
 
 
-def _check_figure_contract(text: str, count: int = 6) -> None:
-    """骨架的编号契约：``图 N：`` 必须 1..count 各出现一次，且首现位置递增。"""
+def _spectrum_ratio_block(bundle: EnsBundle) -> List[str]:
+    """「附 8 谱比随时效」（``图 8``）——产物给不出，见 :data:`SPECTRUM_RATIO_ABSENT`。"""
+    base = bundle.base
+    variable = _named(base.spectrum_variables)
+    return [
+        f"## 附 8 {variable} 谱比随时效",
+        "",
+        "横轴为波数（双对数），纵轴为 pred/obs，y=1 参考线画出；**每个 lead 一条曲线**，",
+        "颜色由浅到深对应 lead 由短到长。这一节回答的是「小尺度能量不足是随时间恶化，",
+        "还是一开始就缺」：曲线整体贴着 1、随 lead 一起下移，是误差累积；曲线从最短时效",
+        "就整体偏低、后续几乎不再下移，是模式本身的能量谱问题，调时效救不回来。",
+        f"附 6 是{len(base.dates)}个日期的平均谱，看不出这条随时间的变化，两张图要对着看。",
+        "",
+        SPECTRUM_RATIO_ABSENT,
+    ]
+
+
+def _single_init_block(bundle: EnsBundle, figures: Mapping[str, str]) -> List[str]:
+    """「附 9 单起报功率谱曲线」（``图 9``）。"""
+    base = bundle.base
+    variable = _named(base.spectrum_variables)
+    init = str(base.dates[0]) if base.dates else ""
+    lines = [
+        f"## 附 9 单起报 {variable} 功率谱曲线",
+        "",
+        f"附 6 是{len(base.dates)}个日期平均后的谱，平均会把个例差异抹平。这一节换成"
+        f"**单个起报**（{init}）的谱，用来核对平均谱上的结论在个例上是否成立——平均谱上"
+        "「小尺度偏低」如果只在少数个例出现，就不该写成模式的普遍特征。集合平均谱本身的",
+        "平滑也会掩盖成员间的谱差异，个例图里谱线更毛糙是正常的。",
+        "",
+    ]
+    if "spectrum_curve" in figures:
+        lines += [
+            f"![spectrum_curve]({figures['spectrum_curve']})",
+            "",
+            f"图 9：{init} 单起报的 {variable} 纬向功率谱"
+            f"（双对数；黑色虚线为同时刻观测谱）",
+        ]
+    else:
+        lines += [
+            f"**本批未出。** 产物里没有 {variable} 的逐起报谱"
+            f"（`diagnostics/spectrum_by_init.csv`），出不了这张图。",
+        ]
+    return lines
+
+
+def _season_block() -> List[str]:
+    """「附 S 分季节结果（可选）」：固定输出「本批未出」的静态说明。
+
+    与 ``assets/templates/weather_rmse_ens.md`` 的「附 S」逐字一致：纯静态文本、
+    不含占位符——这一块要等评测侧把季节口径定下来才会出数。
+    """
+    return [
+        "## 附 S 分季节结果（可选）",
+        "",
+        "**本块本批未出。** 产物长表里目前没有季节维度，渲染器保留节位并标注「本批未出」，",
+        "不静默省略、也不留空表。",
+        "",
+        "要接上这一块，得先把两条口径定下来（两条都不难，选错会让数对不上）：",
+        "",
+        "- 季节按**起报时刻**还是**有效时刻**切——同一份检验里两者会差一个时效的长度；",
+        "- DJF 跨年怎么归——12 月与次年 1、2 月要不要算同一个 DJF。",
+        "",
+        "定了之后这一块的形态与「附 L」完全一致：一张分季节表（一行一个季节，按 DJF、MAM、",
+        "JJA、SON 升序，各模型各占一列，末列 `Best`），加两张图——`season_summary.png`",
+        "（分季节综合相对RMSE 柱状图，`图 S1`）与 `season_rmse_vs_lead.png`（各季节",
+        "综合相对RMSE 随预报时效的变化，`图 S2`）。数据同样出自长表，**不需要重跑评测**。",
+        "",
+        "`图 S1`/`图 S2` 两个号现在**留空**：这一块没出数就不出图，不指不存在的文件。",
+        "接上之后按「附 L」的写法补 `![…]` 与 `图 S*：{图注}` 即可。",
+    ]
+
+
+def _region_block(bundle: EnsBundle, figures: Mapping[str, str]) -> List[str]:
+    """「附 L 分纬度带结果（可选）」：分带准确度 + 分带离散度，三张图。
+
+    没有共同的 region 行时保留节位、写明原因并标「本批未出」，不静默省略、
+    也不留一张空表。
+    """
+    base = bundle.base
+    count = _cn(len(base.names))
+    has_spread = not bundle.region_spread_ratio.empty and "lat_band_spread_ratio" in figures
+    lines = ["## 附 L 分纬度带结果（可选）", ""]
+    if not base.region_names:
+        lines += [f"**本块本批未出。** {base.region_note}", ""]
+        return lines
+
+    table = region_table(base)
+    rows, best_of, best_global = table.rows, table.best_of, table.best_global
+    spread_rows: List[List[str]] = []
+    for region in base.region_names:
+        if not has_spread:
+            continue
+        if region in bundle.region_spread_ratio.index:
+            spread = bundle.region_spread_ratio.loc[region]
+            spread_rows.append(
+                [region_display(region, base.region_labels)]
+                + [_fmt(spread[name]) for name in base.names]
+                # 「更接近1」= 距 1 的绝对偏差最小，同一套并列规则复用。
+                + [_best_cell((spread - 1.0).abs())]
+            )
+        else:
+            spread_rows.append(
+                [region_display(region, base.region_labels)]
+                + ["—"] * len(base.names)
+                + ["—"]
+            )
+
+    lines += [
+        "本块把长表里 `region` 非空的行**单独汇总**，全球行**不参与**——全球平均与纬度带平均",
+        "是两个量，混在一起算会把带间差异整个抹平。带名与边界照搬评测配置",
+        "`options[\"regions\"]`：**报告不翻译、也不写死任何带名**，配置里叫什么就显示什么。",
+        f"表里的相对RMSE是**对本带基线**取的（100 = 该带内的{count}模型几何均值），",
+        "不是全球基线——热带和极区的绝对 RMSE 差一个量级，不除本带基线没法横向比。",
+        "",
+        "**分纬度带综合相对RMSE**",
+        "",
+    ]
+    lines += _table(["纬度带"] + list(base.names) + ["Best"], rows)
+    if has_spread:
+        lines += ["", "**分纬度带 Spread/RMSE（距 1 越近越好）**", ""]
+        lines += _table(
+            ["纬度带"] + [f"{name} 平均Spread/RMSE" for name in base.names] + ["更接近1"],
+            spread_rows,
+        )
+    lines += ["", _region_reading_ens(bundle, best_global, best_of), ""]
+    lines += [
+        f"![lat_band_rmse_vs_lead]({figures['lat_band_rmse_vs_lead']})",
+        "",
+        f"图 L1：各纬度带集合均值 RMSE 的相对值随 lead 变化"
+        f"（各自除以本带基线，100 = 该带内{count}模型几何均值；"
+        f"{len(base.dates)} 个共同日期平均）。",
+        "",
+        f"![lat_band_summary]({figures['lat_band_summary']})",
+        "",
+        f"图 L2：分纬度带综合相对 RMSE"
+        f"（100 = 该带内{count}模型几何均值；{len(base.dates)} 个共同日期平均）。",
+    ]
+    if has_spread:
+        lines += [
+            "",
+            f"![lat_band_spread_ratio]({figures['lat_band_spread_ratio']})",
+            "",
+            f"图 L3：分纬度带平均 Spread / Ensemble-mean RMSE"
+            f"（虚线为理想值 1；{len(base.dates)} 个共同日期平均）。",
+        ]
+    return lines
+
+
+def _region_reading_ens(
+    bundle: EnsBundle, best_global: Mapping[str, Any], best_of: Mapping[str, Mapping[str, Any]],
+) -> str:
+    """集合分带判读：名次反转 + 离散度是否随带变化（两个方向业务含义相反）。"""
+    base = bundle.base
+    global_names = list(best_global)
+    tied = len(global_names) > 1
+    head_global = "、".join(global_names) if global_names else "—"
+    tie_note = "（并列，分不出高下）" if tied else ""
+    global_value = _fmt(base.relative_composite[global_names[0]]) if global_names else "—"
+
+    flips = [
+        (region, list(best_of[region]))
+        for region in base.region_names
+        if set(best_of[region]) != set(global_names)
+    ]
+    if flips:
+        detail = "；".join(
+            f"{region_display(region, base.region_labels)} 的第一名是 {'、'.join(names)}"
+            f"（{_fmt(base.region_relative_composite.loc[region, names[0]])}）"
+            for region, names in flips
+        )
+        head = (
+            f"全球口径下综合相对RMSE最低的是 {head_global}{tie_note}（全球 {global_value}），"
+            f"但分带看这个结论并不是处处成立：{detail}——优势不是全纬度一致的，"
+            f"选型时要写清用在哪一纬带。"
+        )
+    elif tied:
+        head = (
+            f"各带的第一名与全球口径一致，都是 {head_global}{tie_note}"
+            f"（全球 {global_value}）——全球与各带都分不出高下，"
+            f"谈不上哪个模型在某一纬带上占优。"
+        )
+    else:
+        head = (
+            f"各带的第一名与全球口径一致，都是 {head_global}"
+            f"（全球 {global_value}）——它的优势在全纬度上都成立。"
+        )
+
+    if not bundle.region_spread_ratio.empty:
+        # 「低纬误差小但过度离散、中高纬误差大却离散不足」是常见形态，两件事的
+        # 业务含义完全相反（前者该收窄集合、后者该放宽），所以必须分开点名。
+        per_region = bundle.region_spread_ratio
+        means = per_region.mean(axis=1)
+        if float(means.max() - means.min()) < 1e-9:
+            # 各带数值一模一样时，报「最高/最低」等于把同一条数念两遍再安上两个
+            # 带名，读起来像是找到了纬度依赖，其实是没切。宁可说清没切成。
+            head += (
+                f" 离散度一栏在本批各纬度带上数值完全相同（都是 {_fmt(float(means.iloc[0]))}），"
+                f"看不出纬度依赖——这一批的 spread 行看上去没有按带切开，"
+                f"要回评测侧核对，本批不能据此判断「离散度不随纬度变化」。"
+            )
+        else:
+            over = means.idxmax()
+            under = means.idxmin()
+            head += (
+                f" 离散度随纬度带变化：{region_display(over, base.region_labels)} 的 Spread/RMSE "
+                f"最高（{_fmt(means.loc[over])}），"
+                f"{region_display(under, base.region_labels)} 最低"
+                f"（{_fmt(means.loc[under])}）——偏离 1 的方向决定该收窄还是放宽集合，"
+                f"要按带分别处理，不能拿全球平均的一个数代替。"
+            )
+    if bundle.region_spread_skipped:
+        skipped = "、".join(
+            region_display(r, base.region_labels) for r in bundle.region_spread_skipped
+        )
+        head += f" {skipped} 上没有 spread 行，离散度一栏记 —。"
+    return head
+
+
+def _check_figure_contract(text: str, count: int = 9, required: int = 6) -> None:
+    """骨架的编号契约：``图 N：`` 的分布必须合法。
+
+    - ``图 N：``（``N`` 在 ``1..count``）**最多出现一次**，且首现位置递增；
+    - ``1..required`` 是**必出图**——产物里必然有对应数据，缺一个就报错；
+    - ``required+1..count`` 允许缺席：那几节的产物可能没出数（骨架对这种情况的
+      约定是保留节位、写明「本批未出」及原因，而不是画一张空图，更不是不指图却
+      把号占掉）。因此**号可以是不连续的**——比如图 7、图 9 在、图 8 缺，
+      对应的就是「谱比随时效」那一节本批没数据。
+
+    ``图 L1：``…``图 L3：`` 是**独立命名空间**（见骨架的编号契约）：可选块整块
+    删掉时正文编号不受影响，正是把它单开一套号的目的，所以单独校验、且不参与
+    ``1..count`` 的递增关系。
+    """
     positions = []
     for index in range(1, count + 1):
         marker = f"图 {index}："
         found = text.count(marker)
-        if found != 1:
-            raise ValueError(f"图注契约被破坏：{marker} 出现 {found} 次，应当恰好 1 次")
-        positions.append(text.index(marker))
-    if positions != sorted(positions):
+        if found > 1:
+            raise ValueError(f"图注契约被破坏：{marker} 出现 {found} 次，最多 1 次")
+        if found == 0:
+            if index <= required:
+                raise ValueError(
+                    f"图注契约被破坏：{marker} 缺失（图 1..{required} 是必出图）"
+                )
+            continue
+        positions.append((index, text.index(marker)))
+    if [where for _, where in positions] != sorted(where for _, where in positions):
         raise ValueError(f"图注契约被破坏：图 1..{count} 的首现位置不是递增的")
+
+    band = [f"图 L{index}：" for index in range(1, 4)]
+    present = [marker for marker in band if marker in text]
+    # 允许缺席，但必须是**从 L1 起的连续段**：整块不出（L1 就没有，标「本批未出」），
+    # 或者 L1..Lk 连续。中间跳号（有 L1、L3 没 L2）说明有节的产物数据没出，
+    # 编号却留了洞——那正是骨架要避免的。
+    if present != band[: len(present)]:
+        raise ValueError(
+            f"图注契约被破坏：分纬度带的图号必须从 图 L1 起连续，现在是 {present}"
+        )
+    for marker in present:
+        if text.count(marker) != 1:
+            raise ValueError(f"图注契约被破坏：{marker} 出现 {text.count(marker)} 次")
 
 
 def render_ens(bundle: EnsBundle, figures: Mapping[str, str], *,
@@ -1333,7 +1649,7 @@ def render_ens(bundle: EnsBundle, figures: Mapping[str, str], *,
     lines: List[str] = [
         f"# XMETAI 集合预报{count}模型评估检验报告（{bundle.member_label}成员）",
         "",
-        f"**归档：{archive or _named(names)}**",
+        f"**产物：{archive or _named(names)}**",
         "",
         f"报告日期：{base.dates[-1]}    报告类型：集合预报（{bundle.member_label}成员）",
         "",
@@ -1449,6 +1765,102 @@ def build_ens_report(archives: Sequence[Archive], out_dir: Path, *,
         variables=base.spectrum_variables, names=names,
         suptitle=f"{count}模型纬向功率谱（{date_note}）",
     )
+
+    # 图 7：变量 × 时效 RMSE 热力图。格子是「除以本模型首时效」的倍数——各变量单位
+    # 不同，不归一化就没法共用一根色标。只有一个 lead 时没有横向变化可读，不出图。
+    ratios: Dict[str, pd.DataFrame] = {}
+    for name in names:
+        frame = base.rmse_by_lead[name]
+        if frame.empty:
+            continue
+        leads = sorted(frame.index)
+        if len(leads) < 2:
+            continue
+        ratios[name] = frame.div(frame.loc[leads[0]].replace(0.0, np.nan))
+    if ratios:
+        figures["rmse_heatmap"] = "ensemble_rmse_heatmap.png"
+        plotter.plot_rmse_heatmap(
+            ratios, base.common_variables,
+            leads=sorted(base.rmse_by_lead[names[0]].index),
+            suptitle=f"{count}模型集合均值 RMSE 相对本模型首时效的倍数",
+            save_path=out_dir / figures["rmse_heatmap"],
+        )
+        plt.close("all")
+
+    # 图 9：单起报谱曲线。取共同日期里最早的那个起报，其余日期仍进平均谱（附 6）。
+    if base.dates:
+        init = str(base.dates[0])
+        single: Dict[str, pd.DataFrame] = {}
+        for archive in archives:
+            try:
+                pred, obs = load_spectrum(archive.root, [init], base.spectrum_variable,
+                                          archive.name)
+            except (FileNotFoundError, ValueError):
+                continue
+            if init in pred.columns:
+                single[archive.name] = pd.DataFrame({"pred": pred[init], "obs": obs[init]})
+        if single:
+            figures["spectrum_curve"] = f"spectrum_curve_{base.spectrum_variable}_{init}.png"
+            _spectrum_panels(
+                out_dir, figures["spectrum_curve"],
+                {base.spectrum_variable: single},   # _spectrum_panels 是 变量 -> 模型 -> 表
+                variables=[base.spectrum_variable], names=list(single),
+                suptitle=f"{count}模型 {base.spectrum_variable} 纬向功率谱（{init} 单起报）",
+            )
+            plt.close("all")
+
+    # 图 L1–L3：分纬度带（可选块）。产物里没有共同的 region 行就**不出图**，也不往
+    # artifacts 里塞不存在的路径——报告那边会写「本批未出」，指一张没生成的图更糟。
+    if base.region_names:
+        band_labels = [
+            region_display(region, base.region_labels) for region in base.region_names
+        ]
+        figures["lat_band_rmse_vs_lead"] = "lat_band_rmse_vs_lead.png"
+        figures["lat_band_summary"] = "lat_band_summary.png"
+        figures["lat_band_spread_ratio"] = "lat_band_spread_ratio.png"
+
+        plotter.plot_model_panels(
+            {
+                name: pd.DataFrame({
+                    label: base.region_lead_relative[region][name]
+                    for region, label in zip(base.region_names, band_labels)
+                })
+                for name in names
+            },
+            band_labels,
+            ylabel="综合相对 RMSE（100 = 该带内几何均值）", ref_line=100.0,
+            ncols=min(len(band_labels), 3),
+            suptitle=f"{count}模型分纬度带综合相对 RMSE 随 lead 变化（{date_note}）",
+            save_path=out_dir / figures["lat_band_rmse_vs_lead"],
+        )
+        plt.close("all")
+
+        summary = base.region_relative_composite.copy()
+        summary.index = band_labels
+        plotter.plot_group_bars(
+            summary, ylabel="综合相对 RMSE（100 = 该带内几何均值）",
+            ref_line=100.0,
+            suptitle=f"分纬度带综合相对 RMSE（{count}模型，{date_note}）",
+            save_path=out_dir / figures["lat_band_summary"],
+        )
+        plt.close("all")
+
+        if not bundle.region_spread_ratio.empty:
+            spread = bundle.region_spread_ratio.copy()
+            spread.index = [
+                region_display(region, base.region_labels)
+                for region in bundle.region_spread_ratio.index
+            ]
+            plotter.plot_group_bars(
+                spread, ylabel="Spread / Ensemble-mean RMSE", ref_line=1.0,
+                suptitle=f"分纬度带平均 Spread/RMSE（理想值 1，{date_note}）",
+                save_path=out_dir / figures["lat_band_spread_ratio"],
+            )
+            plt.close("all")
+        else:
+            # 一个带都取不到 spread 行：整段离散度（表 + 图 L3）都不出，不留空图名。
+            # 「图 L1…Lk 必须是从 L1 起的连续段」由 _check_figure_contract 守。
+            figures.pop("lat_band_spread_ratio")
 
     text = render_ens(bundle, figures, archive=archive)
     report_path = out_dir / "REPORT.md"

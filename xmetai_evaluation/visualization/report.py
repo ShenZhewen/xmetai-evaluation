@@ -4,7 +4,7 @@
 
 一句话用法::
 
-    python -m xmetai_evaluation.visualization.report <产物目录> [--out 输出目录]
+    python -m xmetai_evaluation.visualization.report <产物目录> [--result 输出目录]
 
 **能力身份从产物自己认，不靠目录名**：``manifest.json`` 里的
 ``resolved_config.pipeline`` 是权威判据（``runner`` 无条件写它）。目录名与
@@ -31,7 +31,7 @@ import json
 from pathlib import Path
 from typing import Dict, Optional, Sequence
 
-from visualization.field_report import manifest_info_from
+from xmetai_evaluation.visualization.field_report import manifest_info_from
 
 #: 已经有报告模板的能力：流程名 -> 所属**报告家族**。
 #: 同一家族的流程共用一套模板与图表，因为它们写出的产物表结构相同
@@ -63,11 +63,7 @@ _FALLBACK_RULES = (
     ("weather_ts_det", "station_valid_time", frozenset({"ts"})),
 )
 
-DETAILS_RELATIVE_PATH = Path("diagnostics") / "scores_detail.csv"
 CATEGORICAL_WIDE_RELATIVE_PATH = Path("diagnostics") / "categorical_wide.csv"
-#: 连续场的聚合视图，跟 scores.csv 平级（``field_summary`` writer 落的）。有它才能
-#: 画纬向谱面板、算分波段功率比——谱曲线在 scores.csv 里根本没有。
-SUMMARY_RELATIVE_PATH = Path("summary.csv")
 
 
 def parse_compare_specs(specs: Optional[Sequence[str]]) -> Dict[str, Path]:
@@ -155,7 +151,7 @@ def build_report(
     out_dir: Optional[Path] = None,
     model_name: Optional[str] = None,
     spectrum_variable: Optional[str] = None,
-    spectrum_lead: Optional[float] = None,
+    spectrum_init: Optional[str] = None,
     change_description: Optional[str] = None,
     compare: Optional[Sequence[str]] = None,
 ) -> Dict[str, Path]:
@@ -171,9 +167,9 @@ def build_report(
             拿它当标题会张冠李戴。
         compare: 对比模型，``["名字=CSV路径", …]``，只在 TS 系列上有意义。
             给出来的模型会和主模型一起进箱线图、差值图和对比表。
-        spectrum_variable / spectrum_lead: 只在连续场链路、且要看逐波数谱曲线时才给——
-            给了才会去读很大的 ``diagnostics/scores_detail.csv``。
-            ``spectrum_lead`` 省略时取该变量的最大时效。
+        spectrum_variable / spectrum_init: 只在连续场链路、且要点名看**某一个起报**
+            的谱曲线时才给（读 ``diagnostics/spectrum_by_init.csv``）。
+            ``spectrum_init`` 省略时取最后一个起报。
 
     Raises:
         ValueError: 该能力要的结果表不存在，或认不出能力，或 ``compare`` 不合法。
@@ -209,7 +205,7 @@ def build_report(
         full_model_name,
         info,
         spectrum_variable,
-        spectrum_lead,
+        spectrum_init,
         change_description,
     )
 
@@ -232,7 +228,7 @@ def _render_ts(
     try:
         import pandas as pd
 
-        from visualization.precipitation_plots import PrecipitationPlotter
+        from xmetai_evaluation.visualization.precipitation_plots import PrecipitationPlotter
     except ImportError as error:  # pragma: no cover - 取决于环境
         raise ImportError(
             "出图需要 matplotlib（可选依赖），先装：pip install -e .[viz]。"
@@ -259,7 +255,7 @@ def _render_field(
     model_name: str,
     info: Dict[str, object],
     spectrum_variable: Optional[str],
-    spectrum_lead: Optional[float],
+    spectrum_init: Optional[str],
     change_description: Optional[str],
 ) -> Dict[str, Path]:
     """连续场：长表 → 曲线图 + 报告。"""
@@ -269,22 +265,21 @@ def _render_field(
     try:
         import pandas as pd
 
-        from visualization.field_plots import FieldScorePlotter
+        from xmetai_evaluation.visualization.field_plots import FieldScorePlotter
     except ImportError as error:  # pragma: no cover - 取决于环境
         raise ImportError(
             "出图需要 matplotlib（可选依赖），先装：pip install -e .[viz]。"
             f"原始错误：{error}"
         ) from error
 
-    details_path = output_dir / DETAILS_RELATIVE_PATH
-    summary_path = output_dir / SUMMARY_RELATIVE_PATH
     return FieldScorePlotter().create_report(
-        pd.read_csv(scores_path),
+        # low_memory=False：长表的 ``unit`` 列是混合类型（``m^2/s^2`` / ``1`` / 空），
+        # 分块推断会一边读一边告警"列有混合类型"，也让 dtype 随块变化。
+        pd.read_csv(scores_path, low_memory=False),
         output_dir=target,
-        summary_path=summary_path if summary_path.is_file() else None,
-        details_path=details_path if details_path.is_file() else None,
+        spectrum_dir=output_dir,
         spectrum_variable=spectrum_variable,
-        spectrum_lead=spectrum_lead,
+        spectrum_init=spectrum_init,
         model_name=model_name,
         sources={"scores": str(scores_path)},
         manifest_info=info,
@@ -296,16 +291,17 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser = argparse.ArgumentParser(
         description="按评测产物目录自动选模板，出图并写 Markdown 报告",
         epilog="示例: python -m xmetai_evaluation.visualization.report "
-        "evaluation_results/weather_ts_single_fgvp --out reports/weather_ts_single_fgvp",
+        "evaluation_results/weather_ts_single_fgvp --result reports/weather_ts_single_fgvp",
     )
     parser.add_argument("output_dir", type=Path, help="评测产物目录（含 scores.csv 与 manifest.json）")
-    parser.add_argument("--out", type=Path, default=None, help="报告输出目录（默认 reports/<run_id>）")
+    parser.add_argument("--result", type=Path, default=None, help="报告输出目录（默认 reports/<run_id>）")
     parser.add_argument("--model", default=None, help="模型名（默认取 manifest 的 run_id）")
     parser.add_argument(
         "--spectrum-variable", default=None, help="要看谱曲线的变量（需变量真的算过纬向谱）"
     )
     parser.add_argument(
-        "--spectrum-lead", type=float, default=None, help="谱曲线的时效(h)，省略取该变量最大时效"
+        "--spectrum-init", default=None,
+        help="谱曲线的起报时刻，按子串匹配 init_time（如 20250102），省略取最后一个起报",
     )
     parser.add_argument("--change", default=None, help="本次改动说明，写进报告第一节")
     parser.add_argument(
@@ -317,10 +313,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     artifacts = build_report(
         args.output_dir,
-        out_dir=args.out,
+        out_dir=args.result,
         model_name=args.model,
         spectrum_variable=args.spectrum_variable,
-        spectrum_lead=args.spectrum_lead,
+        spectrum_init=args.spectrum_init,
         change_description=args.change,
         compare=args.compare,
     )

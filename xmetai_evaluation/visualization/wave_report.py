@@ -1,26 +1,31 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""纬向 FFT 与球谐谱补充分析报告：加载批次归档 → 谱统计 → 渲染 Markdown。
+"""纬向 FFT 与球谐谱补充分析报告：读评估产物 → 谱统计 → 渲染 Markdown。
 
-输入是 ``weather_rmse_wave_<模型>`` 支线的**批次归档目录**，形状与 ``_single``
-支线完全相同（``summary.csv`` + ``batch_meta.json`` + ``<YYYYMMDD>/``）——两条
-支线吃同一份归档，区别只在报告口径：这一份**专管谱**，走「总体结果 → RMSE 分
-变量 → 功率谱检验 → 异常与风险 → 验收建议」这条链，不重复逐变量 RMSE/ACC 明细。
+输入是 ``weather_rmse_wave_<模型>`` 支线的**评估产物目录**，形状与 ``_single``
+支线完全相同（``scores.csv`` + ``manifest.json`` + ``diagnostics/``）——两条支线
+吃同一份产物，区别只在报告口径：这一份**专管谱**，走「总体结果 → RMSE 分变量 →
+功率谱检验 → 异常与风险 → 验收建议」这条链，不重复逐变量 RMSE/ACC 明细。
 
 格式契约是 ``skills/xmetai-evaluation/assets/templates/weather_rmse_wave.md``：
 章节用 ``# 1.``…``# 7.`` + 附录，**表不编号、图带 ``图 N：`` 且连续**，中文数字
 由渲染器给（``{模型数}`` 填「五」而不是「5」）。
 
-**口径与 ``_single`` 支线的差异（容易踩）**：纬向谱 log-RMS 这里用 **ln**，
-``det_report.analyze`` 的 ``spectrum_rms`` 用的是 **log10**，两者差 ×2.3026。
-本模块照骨架 §2.1 的定义走 ln，不复用 ``spectrum_rms``。
+**两套谱，别混**：
 
-**球谐带（5.1–5.3）的数据来自归档里的带功率文件**：``spherical_bands_<日期>_<变量>.csv``
-（纬向的是 ``zonal_bands_<日期>_<变量>.csv``，本报告的 §5.4.1 不用它——那一节按骨架
-走 ``WAVE_BANDS`` 的波数带，与归档里球谐口径的 ``DEFAULT_BANDS`` 不是同一套分段）。
-列名契约见 ``vfc.metrics.spectrum.band_power_frame``，行是 ``lead_h``、列是
-``{zonal|spherical}_{pred|obs|ratio}_{lo}_{hi}``。**老归档（这两类文件之前产出的）
-读不到球谐列**，此时 §5.1–5.3 退化成「本批未出」的占位说明，不静默省略、也不留空表。
+* **纬向 FFT 谱**（§2–§4、§5.4）来自 ``diagnostics/spectrum_by_init.csv``，
+  逐起报一条曲线，波数 1–720。log-RMS 这里用 **ln**，而 ``det_report.analyze``
+  的 ``spectrum_rms`` 用 **log10**，两者差 ×2.3026——本模块照骨架 §2.1 的定义
+  走 ln，**不复用** ``spectrum_rms``。
+* **球谐带功率**（§5.1–5.3）来自长表里 ``spherical_bands`` 展开的三行
+  （``spherical_band_power_forecast`` / ``_observation`` / ``_ratio``），
+  **频带靠 ``group`` 列区分**（``1_4`` / ``5_20`` …）。它按球谐总阶数 ``l`` 分段
+  （``DEFAULT_SPHERICAL_BANDS``），与 §5.4.1 按纬向波数分的 ``WAVE_BANDS``
+  不是同一套分段，不能互相换算。
+
+球谐带这一节在**两种**情况下退化成「本批未出」的占位说明（不静默省略、也不留
+空表）：配置里没有 ``spherical_bands``，或结果行缺 ``group`` 列认不出频带。
+第二种情况下**绝不能把几个频带混起来平均**——那样得到的数不属于任何尺度。
 
 占位符 ``{匹配尺度上限}`` 取 128，依据是骨架 §5.4.3 的「1–128 波数逐变量结果」
 与 §5.4 的「与球谐损失的最高阶数同范围」两处措辞。
@@ -39,29 +44,35 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 
-from visualization.det_plots import DetPlotter, model_colors
-from visualization.precipitation_plots import setup_chinese_font
-from visualization.det_report import (
+from xmetai_evaluation.visualization.det_plots import DetPlotter, model_colors
+from xmetai_evaluation.visualization.precipitation_plots import setup_chinese_font
+from xmetai_evaluation.visualization.det_report import (
     Archive,
+    BASELINE,
     Bundle,
     PairTest,
     _CN_NUM,
     _date_span,
     _fmt,
+    SPECTRUM_RATIO_ABSENT,
     _lead_span,
+    _model_count_word,
     _rank,
     _table,
     analyze,
-    _read_lead_frame,
+    _region_reading,
+    region_display,
+    region_table,
     _signed,
     load_spectrum,
+    metric_rows,
     paired_tests,
     probe_dates,
 )
 
-from vfc.metrics.spectrum import DEFAULT_BANDS
+from xmetai_evaluation.metrics.specialized import DEFAULT_SPHERICAL_BANDS
 
-#: 纬向谱的完整波数范围（``spectrum_<date>_<变量>.csv`` 的 wavenumber 1–720）
+#: 纬向谱的完整波数范围（``diagnostics/spectrum_by_init.csv`` 的 wavenumber 1–720）
 FULL_K_MAX = 720
 
 #: 与球谐损失的最高阶数同范围的「匹配尺度」上限
@@ -76,15 +87,16 @@ WAVE_BANDS: Tuple[Tuple[int, int, str], ...] = (
     (61, FULL_K_MAX, "小尺度"),
 )
 
-#: 球谐带频带 ``(下界, 上界)``。直接取归档写文件时用的那一套分段，报告端与
-#: ``regr_ens`` / ``regr_pair`` 的 ``band_power_frame`` 同源，不另立口径。
+#: 球谐带频带 ``(下界, 上界)``。直接取**算分那一侧**的常量，报告端与
+#: ``metrics/specialized.py`` 的 ``spherical_bands`` 同源，不另立口径——
+#: 这里写死一份，配置改了带边界报告就会跟着错。
 SPHERICAL_BANDS: Tuple[Tuple[int, int], ...] = tuple(
-    (int(lo), int(hi)) for lo, hi in DEFAULT_BANDS
+    (int(lo), int(hi)) for lo, hi in DEFAULT_SPHERICAL_BANDS
 )
 
 
 def _band_tag(low: int, high: int) -> str:
-    """归档列名里的频带标签（``spherical_pred_1_4`` 的 ``1_4``）。"""
+    """频带标签，也是长表 ``group`` 列的取值（``1_4`` / ``5_20`` …）。"""
     return f"{low}_{high}"
 
 
@@ -95,11 +107,110 @@ def _band_label(low: int, high: int) -> str:
 #: 球谐带功率谱的频带数（骨架里写死「五个球谐总阶数频带」）
 SPHERICAL_BAND_COUNT = len(SPHERICAL_BANDS)
 
-#: 归档里没有带功率文件时写进正文的说明（老归档，或造归档时关掉了 SPECTRUM_BANDS）
+#: 产物里没有**可用**的球谐带功率结果时写进正文的说明。两种情况都走这里：
+#: 一是配置的 ``metrics`` 里压根没有 ``spherical_bands``；二是算了，但结果行缺
+#: ``group`` 列、认不出哪一行属于哪个频带（修复前的产物就是这样，重跑评测即可）。
 SPHERICAL_ABSENT = (
-    "归档未含 `spherical_bands_*` 文件（该批归档由不含球谐带功率的版本产出），"
-    "**本批未出**。"
+    "产物里没有可用的球谐带功率结果（要么配置的 `metrics` 里没有 `spherical_bands`，"
+    "要么结果行缺 `group` 列、认不出频带），**本批未出**。"
 )
+
+#: 谱诊断没有按纬度带切开时，「附 L」第二张表（分纬度带纬向谱）写这句。
+#: 谱诊断 ``diagnostics/spectrum_by_init.csv`` 的列是
+#: ``variable / init_time / wavenumber / wavelength_km / pred / obs``——**没有 region**，
+#: 纬向谱跟不准到带上，这一栏就只能标未出，不能拿全球谱冒充某一带。
+REGION_SPECTRUM_ABSENT = (
+    "纬向谱这一项**本批未出**：谱诊断 `diagnostics/spectrum_by_init.csv` 只有 "
+    "`variable / init_time / wavenumber / wavelength_km / pred / obs`，**没有 `region` 列**，"
+    "谱没有跟纬度带绑在一起，拿全球谱顶替某一带会得出错的结论。要补上得让评测侧在谱诊断里"
+    "也写 `region`（与 scores.csv 的 `region` 同口径），报告这边不用改。"
+)
+
+
+def _season_block() -> List[str]:
+    """「附 S 分季节结果（可选）」——与另两份骨架同一段静态说明。
+
+    这一块现在**没有数**：长表里没有季节维度。按骨架的约定，保留节位、写清「本批未出」
+    与接上它需要先定的两条口径，而不是留一张空表。
+    """
+    return [
+        "## 附 S 分季节结果（可选）",
+        "",
+        "**本块本批未出。** 产物长表里目前没有季节维度，渲染器保留节位并标注「本批未出」，",
+        "不静默省略、也不留空表。",
+        "",
+        "要接上这一块，得先把两条口径定下来（两条都不难，选错会让数对不上）：",
+        "",
+        "- 季节按**起报时刻**还是**有效时刻**切——同一份检验里两者会差一个时效的长度；",
+        "- DJF 跨年怎么归——12 月与次年 1、2 月要不要算同一个 DJF。",
+        "",
+        "定了之后这一块的形态与「附 L」一致：一张分季节表（一行一个季节，按 DJF、MAM、",
+        "JJA、SON 升序，各模型各占一列，末列 `Best`），加两张图——`season_summary.png`",
+        "（分季节综合相对RMSE 柱状图，`图 S1`）与 `season_rmse_vs_lead.png`（各季节",
+        "综合相对RMSE 随预报时效的变化，`图 S2`）。数据同样出自长表，**不需要重跑评测**。",
+        "",
+        "`图 S1`/`图 S2` 两个号现在**留空**：这一块没出数就不出图，不指不存在的文件。",
+    ]
+
+
+def _region_block(bundle: WaveBundle, figures: Mapping[str, str]) -> List[str]:
+    """「附 L 分纬度带结果（可选）」。
+
+    与 det / ens 的差别只有一处：本报告的落脚点是谱，骨架要求这一块**同时给出 RMSE 与
+    纬向谱两项**。谱诊断里没有 `region`，所以第二张表本批给不出，只能标未出——见
+    :data:`REGION_SPECTRUM_ABSENT`。
+    """
+    base = bundle.base
+    count = len(base.names)
+    word = _model_count_word(count)
+    lines = ["## 附 L 分纬度带结果（可选）", ""]
+    if not base.region_names:
+        lines += [f"**本块本批未出。** {base.region_note}", ""]
+        return lines
+
+    table = region_table(base)
+    lines += [
+        "本块把长表里 `region` 非空的行**单独汇总**，全球行**不参与**——全球平均与纬度带平均",
+        "是两个量，混在一起算会把带间差异整个抹平。带名与边界照搬评测配置",
+        "`options[\"regions\"]`：**报告不翻译、也不写死任何带名**，配置里叫什么就显示什么。",
+        f"表里的相对RMSE是**对本带基线**取的（100 = 该带内的{word}模型几何均值），",
+        "不是全球基线——热带和极区的绝对 RMSE 差一个量级，不除本带基线没法横向比。",
+        "",
+        "本报告的落脚点是谱，所以分带表**同时给出 RMSE 与纬向谱两项**：如果某个带里",
+        "RMSE 排名与谱排名不一致，多半是该带的观测谱在高波数段本身接近零，",
+        "谱指标在那里被放大，判读要以 RMSE 为准，并在正文点名说明。",
+        "",
+        "**分纬度带综合相对RMSE**",
+        "",
+    ]
+    lines += _table(["纬度带"] + list(base.names) + ["Best"], table.rows)
+    lines += [
+        "",
+        f"**分纬度带纬向谱 log-RMS×100（全波数 1–{FULL_K_MAX}）**",
+        "",
+        REGION_SPECTRUM_ABSENT,
+        "",
+    ]
+    reading = _region_reading(
+        base, table.best_global, table.best_of, table.levels,
+    )
+    reading += (
+        " 两个口径（RMSE 与谱）的排名在高纬是否一致，这一批**核不了**："
+        "分带的纬向谱没有出数（原因见上），等谱诊断带上 `region` 之后再回来对。"
+    )
+    lines += [reading, ""]
+    lines += [
+        f"![lat_band_rmse_vs_lead]({figures['lat_band_lead']})",
+        "",
+        f"图 L1：各纬度带综合相对RMSE随预报时效的变化"
+        f"（100 = 该带内{word}模型几何均值；{_date_span(bundle.dates)} 共同日期平均）",
+        "",
+        f"![lat_band_summary]({figures['lat_band_summary']})",
+        "",
+        f"图 L2：分纬度带综合相对RMSE"
+        f"（100 = 该带内{word}模型几何均值；{_date_span(bundle.dates)} 共同日期平均）",
+    ]
+    return lines
 
 
 # ====================================================================== 谱指标
@@ -173,62 +284,72 @@ def band_power_ratio(pred: pd.DataFrame, obs: pd.DataFrame,
     return pred_mean / obs_mean
 
 
-def _band_column(frame: pd.DataFrame, kind: str, which: str, tag: str) -> Optional[str]:
-    """在带功率表里找 ``{kind}_{which}_{tag}`` 列。
-
-    集合归档写成 ``ensmean_spherical_pred_1_4``，单成员归档不带前缀
-    （``spherical_pred_1_4``，与 ``regr_pair`` 逐列一致），两种都认。
-    """
-    for prefix in ("ensmean_", ""):
-        column = f"{prefix}{kind}_{which}_{tag}"
-        if column in frame.columns:
-            return column
-    return None
+def _band_series(rows: pd.DataFrame, tag: str, date: str) -> pd.Series:
+    """某个频带、某个起报日的值 → ``index = lead_h`` 的一列。"""
+    own = rows[(rows["group"].astype(str) == tag) & (rows["init_date"].astype(str) == date)]
+    return own.set_index("lead_h")["value"].sort_index()
 
 
-def load_band_power(root, dates: Sequence[str], variable: str, kind: str,
+def load_band_power(root, dates: Sequence[str], variable: str,
                     name: str = "") -> Dict[str, Tuple[pd.DataFrame, pd.DataFrame]]:
-    """逐日 ``{kind}_bands_<日期>_<变量>.csv`` → ``{频带标签: (pred, obs)}``。
+    """``spherical_bands`` 的结果 → ``{频带标签: (pred, obs)}``。
 
-    每张表 ``index = lead_h``、``columns = 日期``；``kind`` 取 ``"zonal"`` 或
-    ``"spherical"``。缺文件直接抛，交给调用方决定是整节标注缺席还是报错。
+    每个频带两张表，``index = lead_h``、``columns = 起报日``——两张都要，因为
+    :func:`log_ratio_arrays` 按**逐样本**池化（骨架 §2.1 要的是总均方根，
+    不是「先按日均值再对日均值取均方根」）。
+
+    三个量在长表里各占一行（``spherical_band_power_forecast`` / ``_observation``
+    / ``_ratio``），是哪个频带靠 ``group`` 列（``1_4`` / ``5_20`` …）。
 
     Raises:
-        FileNotFoundError: 某个日期没有该变量的带功率文件。
-        ValueError: 文件在，但没有任何一条契约里的频带列。
+        FileNotFoundError: 某个起报日没有该变量的球谐带结果。
+        ValueError: 结果在，但 ``group`` 列缺失或全空，分不出频带。
     """
-    tags = [_band_tag(lo, hi) for lo, hi in SPHERICAL_BANDS]
-    preds: Dict[str, Dict[str, pd.Series]] = {}
-    observations: Dict[str, Dict[str, pd.Series]] = {}
-    for date in dates:
-        path = Path(root) / date / f"{kind}_bands_{date}_{variable}.csv"
-        if not path.is_file():
-            raise FileNotFoundError(
-                f"{name or root}: 缺 {path.name}（{date} 没算 {variable} 的{kind}带功率？）"
-            )
-        raw = _read_lead_frame(path)
-        for tag in tags:
-            pred_column = _band_column(raw, kind, "pred", tag)
-            obs_column = _band_column(raw, kind, "obs", tag)
-            if pred_column is None or obs_column is None:
-                continue
-            preds.setdefault(tag, {})[date] = raw[pred_column]
-            observations.setdefault(tag, {})[date] = raw[obs_column]
-    if not preds:
+    forecast = metric_rows(root, "spherical_band_power_forecast")
+    observed = metric_rows(root, "spherical_band_power_observation")
+    forecast = forecast[forecast["variable"].astype(str) == str(variable)]
+    observed = observed[observed["variable"].astype(str) == str(variable)]
+    if forecast.empty:
+        raise FileNotFoundError(f"{name or root}: 没有 {variable} 的球谐带功率结果")
+    if "group" not in forecast.columns or forecast["group"].isna().all():
         raise ValueError(
-            f"{Path(root) / dates[0] / f'{kind}_bands_{dates[0]}_{variable}.csv'}: "
-            f"没有契约里的频带列（{tags}）"
+            f"{name or root}: {variable} 的球谐带结果没有 group 列，认不出频带；"
+            f"把几个频带混起来平均会得到一个不属于任何尺度的数，所以不做"
         )
-    return {tag: (pd.DataFrame(preds[tag]), pd.DataFrame(observations[tag]))
-            for tag in tags if tag in preds}
+    wanted = [str(date) for date in dates]
+    have = set(forecast["init_date"].astype(str))
+    missing = [date for date in wanted if date not in have]
+    if missing:
+        raise FileNotFoundError(
+            f"{name or root}: {len(missing)} 个起报日没有 {variable} 的球谐带结果"
+            f"（如 {missing[0]}）"
+        )
+    groups = set(forecast["group"].astype(str))
+    table: Dict[str, Tuple[pd.DataFrame, pd.DataFrame]] = {}
+    for low, high in SPHERICAL_BANDS:
+        tag = _band_tag(low, high)
+        if tag not in groups:
+            continue
+        pred_columns = {date: _band_series(forecast, tag, date) for date in wanted}
+        obs_columns = {date: _band_series(observed, tag, date) for date in wanted}
+        table[tag] = (pd.DataFrame(pred_columns), pd.DataFrame(obs_columns))
+    return table
 
 
 def probe_bands(root, dates: Sequence[str], variables: Sequence[str]) -> bool:
-    """归档里有没有球谐带功率文件（只要首个日期、全部变量都在就算有）。"""
+    """产物里有没有**可用**的球谐带功率结果。
+
+    光有结果行不够——还得分得出频带（``group`` 列非空），否则 §5.1–5.3 只能记缺席。
+    """
     if not dates or not variables:
         return False
-    return all((Path(root) / dates[0] / f"spherical_bands_{dates[0]}_{v}.csv").is_file()
-               for v in variables)
+    rows = metric_rows(root, "spherical_band_power_forecast")
+    if rows.empty or "group" not in rows.columns or rows["group"].isna().all():
+        return False
+    return (
+        {str(date) for date in dates} <= set(rows["init_date"].astype(str))
+        and {str(v) for v in variables} <= set(rows["variable"].astype(str))
+    )
 
 
 def log_ratio_arrays(pred: pd.DataFrame, obs: pd.DataFrame) -> Tuple[np.ndarray, np.ndarray]:
@@ -329,7 +450,7 @@ class WaveBundle(NamedTuple):
     zonal_tests: List[PairTest]   # 全波数口径的配对检验
     primary: str                # 主模型（FGVP_pinpu 之类），没有就是空串
     reference: str              # 主模型的对照模型（FGVP）
-    sph_available: bool         # 归档里有没有球谐带功率文件
+    sph_available: bool         # 产物里有没有可用的球谐带功率结果（含 group 列）
     sph_rms: pd.Series          # 模型 -> 球谐带 log-RMS×100（全频带/变量/lead/日期 总均方根）
     sph_bias: pd.Series         # 模型 -> 球谐带比偏差 (%)，mean|pred/obs−1|
     sph_band_logrms: pd.DataFrame   # 频带 × 模型
@@ -439,7 +560,7 @@ def analyze_wave(archives: Sequence[Archive]) -> WaveBundle:
     zonal_tests = paired_tests(zonal_per_date)
     primary, reference = _pick_primary(names)
 
-    # --- 球谐带功率（老归档没有 *_bands_* 文件，此时整块留空、正文标注缺席）---
+    # --- 球谐带功率（没有结果、或结果缺 group 列认不出频带时，整块留空、正文标注缺席）---
     band_names = [_band_label(lo, hi) for lo, hi in SPHERICAL_BANDS]
     sph_available = all(probe_bands(a.root, dates, variables) for a in archives)
     sph_tests: Dict[str, List[PairTest]] = {}
@@ -459,8 +580,7 @@ def analyze_wave(archives: Sequence[Archive]) -> WaveBundle:
             per_variable: Dict[str, List[np.ndarray]] = {}
             daily_parts: Dict[str, List[pd.Series]] = {b: [] for b in band_names}
             for variable in variables:
-                table = load_band_power(archive.root, dates, variable,
-                                        "spherical", archive.name)
+                table = load_band_power(archive.root, dates, variable, archive.name)
                 for low, high in SPHERICAL_BANDS:
                     label = _band_label(low, high)
                     pair = table.get(_band_tag(low, high))
@@ -626,7 +746,7 @@ def _section_conclusion(bundle: WaveBundle) -> List[str]:
     fa_best = base.fa_bias.idxmin()
 
     items = [
-        f"{_cn(len(names))}个归档完整性检查通过，共同日期 {len(bundle.dates)} 天"
+        f"{_cn(len(names))}个产物完整性检查通过，共同日期 {len(bundle.dates)} 天"
         f"（{_date_span(bundle.dates)}），全部模型 `n_ok = n_dates`，无失败起报点。",
         f"综合相对 RMSE 最好 {best}（{_fmt(base.relative_composite[best])}），"
         f"最差 {worst}（{_fmt(base.relative_composite[worst])}）；"
@@ -743,7 +863,7 @@ def _section_scope(bundle: WaveBundle) -> List[str]:
         f"（{first}–{last}h）。RMSE 使用{_cn(len(variables))}个共同变量；"
         f"FA 使用所有模型都提供的{_cn(len(fa_variables))}个变量："
         f"{'、'.join(fa_variables)}；功率谱使用{_cn(len(spectrum_variables))}个变量："
-        f"{'、'.join(spectrum_variables)}。全部{_cn(len(names))}个模型在整个共同日期区间上都有完整归档，"
+        f"{'、'.join(spectrum_variables)}。全部{_cn(len(names))}个模型在整个共同日期区间上都有完整结果，"
         f"无缺席模型。",
         "",
         "## 2.1 指标定义",
@@ -1061,14 +1181,15 @@ def _spherical_tests_section(bundle: WaveBundle) -> List[str]:
     return lines
 
 
-def _section_spectrum(bundle: WaveBundle) -> List[str]:
+def _section_spectrum(bundle: WaveBundle, figures: Mapping[str, str]) -> List[str]:
     base = bundle.base
     names = bundle.names
     variables = bundle.spectrum_variables
     lines = [
         "# 5. 功率谱检验",
         "",
-        f"归档保留两套功率谱定义：纬向 FFT 谱（`spectrum_*`）和球谐带功率（`spherical_bands_*`）。"
+        f"产物保留两套功率谱定义：纬向 FFT 谱（`diagnostics/spectrum_by_init.csv`）"
+        f"和球谐带功率（`scores.csv` 里 `spherical_bands` 的结果行）。"
         f"两者都只使用功率或功率谱，不包含相位；本报告分别给出完整结果，不用一套指标替代另一套。"
         + ("" if bundle.sph_available else SPHERICAL_ABSENT),
         "",
@@ -1167,6 +1288,13 @@ def _section_spectrum(bundle: WaveBundle) -> List[str]:
     # --- 5.5 主模型专项 ---
     if bundle.primary and bundle.reference:
         lines += _section_primary(bundle)
+
+    lines += [""]
+    lines += _heatmap_block(bundle, figures)
+    lines += [""]
+    lines += _spectrum_ratio_block(bundle)
+    lines += [""]
+    lines += _single_init_block(bundle, figures)
     return lines
 
 
@@ -1243,6 +1371,83 @@ def _section_primary(bundle: WaveBundle) -> List[str]:
     return lines
 
 
+def _heatmap_block(bundle: WaveBundle, figures: Mapping[str, str]) -> List[str]:
+    """「§5.5 变量 × 时效 RMSE 热力图」（``图 8``）——给谱结论做 RMSE 侧对照。"""
+    base = bundle.base
+    if "rmse_heatmap" not in figures:
+        return [
+            "## 5.5 变量 × 时效 RMSE 热力图（谱结论的 RMSE 侧对照）",
+            "",
+            "**本批未出。** 只有单个 lead 时热力图没有可读的横向变化，"
+            "渲染器不出这张图。",
+        ]
+    count = len(base.names)
+    variables = len(base.common_variables)
+    first, last, leads = _lead_span(base.rmse_by_lead[base.names[0]].index)
+    return [
+        "## 5.5 变量 × 时效 RMSE 热力图（谱结论的 RMSE 侧对照）",
+        "",
+        f"{count}幅子图，每个模型一幅：纵轴是{variables}个变量、横轴是全部{leads}个lead",
+        f"（{first}–{last}h）。格子里的数**不是 RMSE 本身，而是该模型在该变量、该 lead 上",
+        f"相对自己首时效（{first}h）的 RMSE 倍数**，除以首时效就把量纲与气候态差异约掉了。",
+        "这一节是给前面几节的谱结论做**对照**用的，本身不是谱指标：谱上说某模型小尺度能量",
+        "偏低，就该在这张图上看到对应的变量（通常是高层风场与位势高度）误差随 lead 加深更快；",
+        "图上看不到对应信号，说明谱偏差还没传导到场误差，正文里要照实写，",
+        "不能只报谱上的差距。",
+        "",
+        f"![multi_model_rmse_heatmap]({figures['rmse_heatmap']})",
+        "",
+        f"图 8：{variables}个变量 × {leads}个 lead 的 RMSE 倍数热力图"
+        f"（各自除以本模型首时效 {first}h 的 RMSE；{_date_span(base.dates)} 共同日期平均）",
+    ]
+
+
+def _spectrum_ratio_block(bundle: WaveBundle) -> List[str]:
+    """「§5.6 谱比随时效」（``图 9``）——产物给不出，见 :data:`SPECTRUM_RATIO_ABSENT`。"""
+    base = bundle.base
+    return [
+        "## 5.6 谱比随时效",
+        "",
+        "横轴为波数（双对数），纵轴为 pred/obs，y=1 参考线画出；**每个 lead 一条曲线**，",
+        "颜色由浅到深对应 lead 由短到长。§5.4.2 的 `spectrum_ratio` 是"
+        f"{len(base.dates)}个日期、",
+        "全部 lead 平均后的比值，看不出这条随时间的走向，两节要对着看。",
+        "这一节回答的是「小尺度能量不足是随时间恶化，还是一开始就缺」：曲线整体贴着 1、",
+        "随 lead 一起下移，是误差累积；曲线从最短时效就整体偏低、后续几乎不再下移，",
+        "是模式本身的能量谱问题，**不是**预报时长带来的，调时效救不回来。",
+        "",
+        SPECTRUM_RATIO_ABSENT,
+    ]
+
+
+def _single_init_block(bundle: WaveBundle, figures: Mapping[str, str]) -> List[str]:
+    """「§5.7 单起报谱曲线」（``图 10``）。"""
+    base = bundle.base
+    variable = base.spectrum_variable
+    init = str(base.dates[0]) if base.dates else ""
+    lines = [
+        "## 5.7 单起报谱曲线",
+        "",
+        f"§5.4.2 是{len(base.dates)}个日期平均后的谱，平均会把个例差异抹平。这一节换成"
+        f"**单个起报**（{init}）的谱，用来核对平均谱上的结论在个例上是否成立——平均谱上",
+        "「小尺度偏低」如果只在少数个例出现，就不该写成模式的普遍特征。",
+        "",
+    ]
+    if "spectrum_curve" in figures:
+        lines += [
+            f"![spectrum_curve]({figures['spectrum_curve']})",
+            "",
+            f"图 10：{init} 单起报的 {variable} 纬向功率谱"
+            f"（双对数；黑色虚线为同时刻观测谱）",
+        ]
+    else:
+        lines += [
+            f"**本批未出。** 产物里没有 {variable} 的逐起报谱"
+            f"（`diagnostics/spectrum_by_init.csv`），出不了这张图。",
+        ]
+    return lines
+
+
 def _section_risks(bundle: WaveBundle) -> List[str]:
     base = bundle.base
     names = bundle.names
@@ -1296,10 +1501,10 @@ def _section_risks(bundle: WaveBundle) -> List[str]:
         "",
         "## 6.3 原始场独立复算不足（中高优先级）",
         "",
-        f"本报告的纬向谱、综合相对 RMSE、ACC 与 FA 全部读自各模型归档目录里的逐日结果文件，"
-        f"没有回到原始预报场与观测场做独立复算。归档目录只含 `summary.csv`、`batch_meta.json` "
-        f"与逐日结果 CSV，不含原始场，这一点无法在本报告内弥补。"
-        f"因此归档生成环节（变量映射、插值、单位换算、谱变换）如果出错，"
+        f"本报告的纬向谱、综合相对 RMSE、ACC 与 FA 全部读自各模型产物目录里的 "
+        f"scores.csv 汇总行与 diagnostics/ 下的谱表，没有回到原始预报场与观测场做独立复算。"
+        f"产物目录不含原始场，这一点无法在本报告内弥补。"
+        f"因此评测环节（变量映射、插值、单位换算、谱变换）如果出错，"
         f"本报告会原样继承且无法自查。结论用于模型间横向比较是充分的；"
         f"用于绝对谱保真度认定前，建议抽一个日期回到原始场复算一次谱。",
         "",
@@ -1377,9 +1582,9 @@ def _appendix(bundle: WaveBundle, figures: Mapping[str, str],
     lines += _table(
         ["**项目**", "**值**"],
         [
-            ["归档文件", archive or "、".join(names)],
-            ["归档大小", f"{total_bytes / 1024 / 1024:.1f} MB"],
-            ["SHA-256", "—（多目录归档，未逐文件计算）"],
+            ["产物目录", archive or "、".join(names)],
+            ["产物大小", f"{total_bytes / 1024 / 1024:.1f} MB"],
+            ["SHA-256", "—（多目录产物，未逐文件计算）"],
             ["模型", "、".join(names)],
             ["共同日期", f"{len(bundle.dates)} 天，{_date_span(bundle.dates)}"],
             ["lead", f"{leads} 个，{first}–{last}h，间隔 {step:g}h"],
@@ -1388,11 +1593,18 @@ def _appendix(bundle: WaveBundle, figures: Mapping[str, str],
     )
     lines += [
         "",
-        f"**本补充报告不修订、不替代原评估报告；全部结论仅来自用户指定归档中的"
+        f"**本补充报告不修订、不替代原评估报告；全部结论仅来自用户指定产物目录中的"
         f"{_cn(len(names))}个 single 输出"
-        + ("，球谐带功率取自归档内 `spherical_bands_<日期>_<变量>.csv`。**"
+        + ("，球谐带功率取自 scores.csv 里 `spherical_bands` 的结果行。**"
            if bundle.sph_available else
-           "，归档未含球谐带功率谱文件，相关章节已标注「本批未出」。**"),
+           "，产物里没有可用的球谐带功率结果，相关章节已标注「本批未出」。**"),
+        "",
+    ]
+    # 骨架把可选块定在「附录那张表之后」，图件清单是渲染器自己加的一节，排在可选块后面。
+    lines += _region_block(bundle, figures)
+    lines += [""]
+    lines += _season_block()
+    lines += [
         "",
         "## 附：图件清单",
         "",
@@ -1414,7 +1626,7 @@ def render_wave(bundle: WaveBundle, figures: Mapping[str, str], *,
         "",
         f"{'、'.join(shown)} {_cn(len(names))}模型输出与纬向 FFT、球谐谱补充分析",
         "",
-        f"数据归档：{archive or '、'.join(names)}",
+        f"数据产物：{archive or '、'.join(names)}",
         "",
         f"报告日期：{bundle.dates[-1]}    模型：{'、'.join(shown)}    评估层级：输出级复核",
         "",
@@ -1427,7 +1639,7 @@ def render_wave(bundle: WaveBundle, figures: Mapping[str, str], *,
         _section_scope(bundle),
         _section_overall(bundle),
         _section_rmse(bundle),
-        _section_spectrum(bundle),
+        _section_spectrum(bundle, figures),
         _section_risks(bundle),
         _section_acceptance(bundle),
         _appendix(bundle, figures, archive, out_dir),
@@ -1521,6 +1733,81 @@ def build_wave_report(archives: Sequence[Archive], out_dir: Path, *,
         out_dir, figures["spectrum_ratio"], spectra, variable=variable,
         suptitle=f"{variable} 纬向谱 pred/obs 比值（理想值 1）",
     )
+
+    # 图 8：变量 × 时效 RMSE 热力图（§5.5），给谱结论做 RMSE 侧对照。格子是
+    # 「除以本模型首时效」的倍数——各变量单位不同，不归一化就没法共用一根色标。
+    ratios: Dict[str, pd.DataFrame] = {}
+    for name in names:
+        frame = base.rmse_by_lead[name]
+        if frame.empty:
+            continue
+        lead_values = sorted(frame.index)
+        if len(lead_values) < 2:
+            continue
+        ratios[name] = frame.div(frame.loc[lead_values[0]].replace(0.0, np.nan))
+    if ratios:
+        figures["rmse_heatmap"] = "multi_model_rmse_heatmap.png"
+        DetPlotter().plot_rmse_heatmap(
+            ratios, base.common_variables,
+            leads=sorted(base.rmse_by_lead[names[0]].index),
+            suptitle=f"{_cn(len(names))}模型 RMSE 相对本模型首时效的倍数",
+            save_path=out_dir / figures["rmse_heatmap"],
+        )
+
+    # 图 10：单起报谱曲线（§5.7）。取共同日期里最早的那个起报，其余日期仍进 §5.4.2
+    # 的平均谱。产物没有逐起报谱就**不出图**，报告那边写「本批未出」。
+    if base.dates:
+        init = str(base.dates[0])
+        single: Dict[str, pd.DataFrame] = {}
+        for archive in archives:
+            try:
+                pred, obs = load_spectrum(archive.root, [init], base.spectrum_variable,
+                                          archive.name)
+            except (FileNotFoundError, ValueError):
+                continue
+            if init in pred.columns:
+                single[archive.name] = pd.DataFrame({"pred": pred[init], "obs": obs[init]})
+        if single:
+            figures["spectrum_curve"] = f"spectrum_curve_{base.spectrum_variable}_{init}.png"
+            _plot_mean_spectrum(
+                out_dir, figures["spectrum_curve"], single,
+                variable=base.spectrum_variable,
+                suptitle=f"{base.spectrum_variable} 纬向功率谱（{init} 单起报）",
+            )
+
+    # 图 L1 / 图 L2：分纬度带（可选块）。没有共同的 region 行就**不出图**，也不往
+    # figures 里塞不存在的文件名——报告那边会写「本批未出」，指一张没生成的图比不指更糟。
+    if base.region_names:
+        band_labels = [
+            region_display(region, base.region_labels) for region in base.region_names
+        ]
+        figures["lat_band_lead"] = "lat_band_rmse_vs_lead.png"
+        figures["lat_band_summary"] = "lat_band_summary.png"
+        plotter = DetPlotter()
+        plotter.plot_model_panels(
+            {
+                name: pd.DataFrame({
+                    label: base.region_lead_relative[region][name]
+                    for region, label in zip(base.region_names, band_labels)
+                })
+                for name in names
+            },
+            band_labels,
+            ylabel="综合相对 RMSE（100 = 该带内几何均值）",
+            ref_line=BASELINE,
+            ncols=min(len(band_labels), 3),
+            suptitle="分纬度带综合相对 RMSE 随预报时效的变化",
+            save_path=out_dir / figures["lat_band_lead"],
+        )
+        summary = base.region_relative_composite.copy()
+        summary.index = band_labels
+        plotter.plot_group_bars(
+            summary,
+            ylabel="综合相对 RMSE（100 = 该带内几何均值）",
+            ref_line=BASELINE,
+            suptitle="分纬度带综合相对 RMSE",
+            save_path=out_dir / figures["lat_band_summary"],
+        )
 
     text = render_wave(bundle, figures, archive=archive, out_dir=out_dir)
     report_path = out_dir / "REPORT.md"

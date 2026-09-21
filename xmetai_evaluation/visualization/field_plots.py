@@ -18,9 +18,9 @@
   混在一根纵轴上比大小是错的，所以一个单位一个子图；
 * **热力图用"相对首时效的倍数"**。同理，跨变量的原始值不可比；除过首时效之后
   无量纲，行与行才可比，行标签里同时写上首时效的绝对值，尺度不丢；
-* **谱曲线优先读 ``summary.csv``**（``scope=wavenumber`` 档），那是一张已经跨起报
-  平均好的逐波数表，一个变量一次画全。只有要看**指定时效**的谱时才去读
-  ``diagnostics/scores_detail.csv``——本仓库那份是 492MB / 1.67 亿行，为一张图读它不划算；
+* **谱曲线读 ``diagnostics/spectrum_<变量>.csv``**，那是一张已经跨起报、跨时效
+  加权平均好的逐波数表，一个变量一次画全。要看**某一个起报**的谱才去读同目录的
+  ``spectrum_by_init.csv``——它逐起报存一条，长表那条链路**没有**逐时效的谱；
 * **参考线只在有理想值时画**（语义表里的 ``ref_result``）：比值类画 ``y=1``，ACC 画 ``y=1``，
   RMSE 没有理想值就不画。
 """
@@ -38,29 +38,35 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 
-from visualization.field_report import (
+from xmetai_evaluation.visualization.field_report import (
     SKILL_METRICS,
     build_field_report,
+    global_rows,
     metric_label,
     metric_ref,
     requested_from,
 )
-from visualization.precipitation_plots import setup_chinese_font
+from xmetai_evaluation.visualization.precipitation_plots import setup_chinese_font
 
 REQUIRED_COLUMNS = ("lead_h", "variable", "metric", "value")
-
-#: ``details`` 里逐波数谱的 group 形如 ``k=0`` / ``k=720``；``summary`` 是总功率行。
-_WAVENUMBER_PATTERN = r"^k=\d+$"
-
-#: 读大明细表时只取这几列（实测 90 万行，全读没必要）。
-_DETAIL_COLUMNS = ("variable", "lead_h", "group", "field", "value")
 
 #: 折线图里跨起报离散带取的分位。用 10–90 而不是 min–max：后者由单次极端起报
 #: 决定上下沿，带子会宽得看不出形态。
 _SPREAD_QUANTILES = (0.10, 0.90)
 
-#: ``summary.csv`` 的逐波数档只取这几列。
-_SUMMARY_SPECTRUM_COLUMNS = ("scope", "variable", "wavenumber", "field", "value")
+#: 谱曲线产物的位置与表头。逐波数曲线**不在** ``scores.csv`` 里（长表一行一个
+#: 变量的总量），走 ``MetricResult.curve``，由 ``components.py`` 落到
+#: ``<产物目录>/diagnostics/`` 下，两个文件：
+#:
+#: * ``spectrum_<变量>.csv``：``wavenumber, wavelength_km, pred_mean, obs_mean``，
+#:   全时段加权平均，一个变量一张——面板与分波段表用它；
+#: * ``spectrum_by_init.csv``：``variable, init_time, wavenumber, wavelength_km,
+#:   pred, obs``，逐起报，一个文件装所有变量——点名看某一个起报用它。
+SPECTRUM_DIRNAME = "diagnostics"
+SPECTRUM_GLOBAL_PREFIX = "spectrum_"
+SPECTRUM_BY_INIT_NAME = "spectrum_by_init.csv"
+_SPECTRUM_GLOBAL_COLUMNS = ("wavenumber", "pred_mean", "obs_mean")
+_SPECTRUM_BY_INIT_COLUMNS = ("variable", "init_time", "wavenumber", "pred", "obs")
 
 #: 赤道周长（km）。纬向波数 k 的波长按 ``40075 / k`` 算，与参考实现的
 #: ``mean_spectrum_<var>.csv`` 里 ``wavelength_km`` 列同口径（k=1 → 40075km）。
@@ -75,7 +81,7 @@ def prepare_field_dataframe(df: pd.DataFrame) -> pd.DataFrame:
     Raises:
         ValueError: 缺少必需列，或数据为空 / 没有可用的 ``lead_h``。
     """
-    data = df.copy()
+    data = global_rows(df.copy())
     data.columns = [str(column).strip() for column in data.columns]
 
     missing = [column for column in REQUIRED_COLUMNS if column not in data.columns]
@@ -144,76 +150,141 @@ def lead_aggregate(chunk: pd.DataFrame) -> pd.DataFrame:
     return stats.sort_index()
 
 
-def load_spectrum_details(
-    path: Path, variable: Optional[str] = None, lead_h: Optional[float] = None
-) -> pd.DataFrame:
-    """读 ``diagnostics/scores_detail.csv`` 里的逐波数谱，按变量/时效过滤。
+def _spectrum_directory(directory: Path) -> Path:
+    """定位谱曲线所在的目录：给产物目录就进 ``diagnostics/``，给的已经是它就原样用。"""
+    directory = Path(directory)
+    nested = directory / SPECTRUM_DIRNAME
+    return nested if nested.is_dir() else directory
 
-    明细表很大（本仓库实测 90 万行），所以只取用得上的几列再过滤。
 
-    Raises:
-        ValueError: 过滤后没有任何 ``k=<波数>`` 行。
+def spectrum_files(directory: Path) -> Dict[str, Path]:
+    """``{变量: 全时段平均谱文件}``，来自 ``diagnostics/spectrum_<变量>.csv``。
+
+    只认**逐变量**那一种；``spectrum_by_init.csv`` 是同目录下的另一个文件
+    （逐起报），前缀相同，要显式排掉——否则它会被当成一个叫 ``by_init`` 的变量。
     """
-    frame = pd.read_csv(path, usecols=lambda name: name in _DETAIL_COLUMNS)
-    for column in _DETAIL_COLUMNS:
-        if column not in frame.columns:
-            raise ValueError(f"明细表 {path} 缺少列 {column}；现有列: {list(frame.columns)}")
-    frame["group"] = frame["group"].astype(str)
-    frame = frame[frame["group"].str.match(_WAVENUMBER_PATTERN)]
-    frame["lead_h"] = pd.to_numeric(frame["lead_h"], errors="coerce")
-    frame["value"] = pd.to_numeric(frame["value"], errors="coerce")
-    if variable is not None:
-        frame = frame[frame["variable"].astype(str) == str(variable)]
-    if lead_h is not None:
-        frame = frame[frame["lead_h"] == float(lead_h)]
-    if frame.empty:
-        hint = ""
-        if variable is not None:
-            hint = "；该变量可能没算纬向谱（逐变量路由的结果）"
-        raise ValueError(
-            f"{path} 里没有 variable={variable!r} lead_h={lead_h!r} 的逐波数谱{hint}"
-        )
-    return frame
+    root = _spectrum_directory(directory)
+    found: Dict[str, Path] = {}
+    for path in sorted(root.glob(f"{SPECTRUM_GLOBAL_PREFIX}*.csv")):
+        if path.name == SPECTRUM_BY_INIT_NAME:
+            continue
+        variable = path.stem[len(SPECTRUM_GLOBAL_PREFIX) :]
+        if variable:
+            found[variable] = path
+    return found
 
 
-def load_wavenumber_spectra(path: Path) -> pd.DataFrame:
-    """读 ``summary.csv`` 里 ``scope=wavenumber`` 的逐波数谱曲线。
+def _spectrum_long(frame: pd.DataFrame, variable: str, pred: str, obs: str) -> pd.DataFrame:
+    """``variable / wavenumber / field / value`` 长表——本模块谱图的统一入口口径。"""
+    wide = frame.rename(columns={pred: "power_forecast", obs: "power_observation"})
+    long = wide.melt(
+        id_vars=["wavenumber"],
+        value_vars=["power_forecast", "power_observation"],
+        var_name="field",
+        value_name="value",
+    )
+    long["variable"] = str(variable)
+    long["wavenumber"] = pd.to_numeric(long["wavenumber"], errors="coerce")
+    long["value"] = pd.to_numeric(long["value"], errors="coerce")
+    return long.dropna(subset=["wavenumber", "value"])
 
-    这是**已经跨起报（并跨时效）平均**好的一张表，跟参考实现的
-    ``mean_spectrum_<var>.csv`` 同口径，所以一个变量一张谱、一次读全，
-    不必为了看一眼谱去啃几百 MB 的 ``diagnostics/scores_detail.csv``。
 
-    两条路的差别要说清楚：这里的谱是**全时段平均**的，看不出谱随预报时效怎么退化；
-    要比某个具体时效的谱，用 :func:`load_spectrum_details` 那条路。
+def load_wavenumber_spectra(directory: Path) -> pd.DataFrame:
+    """读产物目录里 ``diagnostics/spectrum_<变量>.csv`` 的逐波数谱曲线。
+
+    这是**已经跨起报、跨时效加权平均**好的一张表（跟参考实现的
+    ``mean_spectrum_<var>.csv`` 同口径），所以一个变量一张谱、一次读全。
+
+    口径差别要说清楚：这里的谱是**全时段平均**的，看不出谱随预报时效怎么退化；
+    要看某一个起报的谱，用 :func:`load_init_spectra` 那条路。
 
     Args:
-        path: ``summary.csv`` 的路径。
+        directory: 产物目录（含 ``scores.csv`` 与 ``diagnostics/``），
+            也可以直接给 ``diagnostics`` 目录本身。
 
     Returns:
         长表，列为 ``variable / wavenumber / field / value``，
         ``field`` ∈ {``power_forecast``, ``power_observation``}。
 
     Raises:
-        ValueError: 表里没有 ``scope=wavenumber`` 的行，或缺少必需列。
+        ValueError: 一个 ``spectrum_<变量>.csv`` 都没找到，或文件缺列。
     """
-    path = Path(path)
-    if not path.is_file():
-        raise ValueError(f"{path} 不存在")
-    frame = pd.read_csv(path, usecols=lambda name: name in _SUMMARY_SPECTRUM_COLUMNS)
-    missing = [name for name in _SUMMARY_SPECTRUM_COLUMNS if name not in frame.columns]
-    if missing:
-        raise ValueError(f"{path} 缺少列 {missing}；现有列: {list(frame.columns)}")
-    frame = frame[frame["scope"].astype(str) == "wavenumber"].copy()
-    if frame.empty:
+    files = spectrum_files(directory)
+    if not files:
         raise ValueError(
-            f"{path} 里没有 scope=wavenumber 的行：这条流程的配置没写 field_summary，"
+            f"{_spectrum_directory(directory)} 下没有 {SPECTRUM_GLOBAL_PREFIX}<变量>.csv："
+            f"这条流程的配置里没写 `zonal_spectrum` / `spectrum`，"
             f"或者纬度方向的格点数不足以做纬向谱"
         )
-    frame["variable"] = frame["variable"].astype(str)
-    frame["field"] = frame["field"].astype(str)
-    for column in ("wavenumber", "value"):
-        frame[column] = pd.to_numeric(frame[column], errors="coerce")
-    return frame.dropna(subset=["wavenumber", "value"]).sort_values(["variable", "wavenumber"])
+    frames = []
+    for variable, path in files.items():
+        frame = pd.read_csv(path)
+        missing = [name for name in _SPECTRUM_GLOBAL_COLUMNS if name not in frame.columns]
+        if missing:
+            raise ValueError(f"{path} 缺少列 {missing}；现有列: {list(frame.columns)}")
+        frames.append(_spectrum_long(frame, variable, "pred_mean", "obs_mean"))
+    return (
+        pd.concat(frames, ignore_index=True)
+        .sort_values(["variable", "wavenumber"])
+        .reset_index(drop=True)
+    )
+
+
+def load_init_spectra(
+    directory: Path, variable: str, init: Optional[str] = None
+) -> pd.DataFrame:
+    """读 ``diagnostics/spectrum_by_init.csv`` 里某个变量某个起报的谱曲线。
+
+    ``spectrum_by_init.csv`` 的每一行是该起报**跨时效加权平均**后的功率，
+    不是某个具体时效的谱——长表那条链路的曲线只按起报存，没有逐时效的谱。
+
+    Args:
+        directory: 产物目录（含 ``diagnostics/``），也可以直接给 ``diagnostics``。
+        variable: 变量名。
+        init: 起报时刻，按**子串**匹配 ``init_time``（写 ``20250102`` 或整条
+            ISO 串都行）。``None`` 取最后一个起报。
+
+    Raises:
+        ValueError: 文件不存在 / 缺列 / 该变量在该起报下没有谱。
+    """
+    path = _spectrum_directory(directory) / SPECTRUM_BY_INIT_NAME
+    if not path.is_file():
+        raise ValueError(f"{path} 不存在")
+    frame = pd.read_csv(
+        path, usecols=lambda name: name in _SPECTRUM_BY_INIT_COLUMNS
+    )
+    missing = [name for name in _SPECTRUM_BY_INIT_COLUMNS if name not in frame.columns]
+    if missing:
+        raise ValueError(f"{path} 缺少列 {missing}；现有列: {list(frame.columns)}")
+    frame = frame[frame["variable"].astype(str) == str(variable)].copy()
+    if frame.empty:
+        known = sorted(set(pd.read_csv(path, usecols=["variable"])["variable"].astype(str)))
+        raise ValueError(
+            f"{path} 里没有 variable={variable!r} 的谱；有谱的是 {'、'.join(known) or '（无）'}"
+        )
+    frame["init_time"] = frame["init_time"].astype(str)
+    if init is None:
+        chosen = frame["init_time"].max()
+    else:
+        # 去掉日期里的连字符再匹配：``init_time`` 是 ISO 串，让人写
+        # ``20250102``（跟别的产物目录名同一种写法）比逼人抄整条 ISO 串友好。
+        haystack = frame["init_time"].str.replace("-", "", regex=False)
+        needle = str(init).replace("-", "")
+        matches = frame.loc[haystack.str.contains(needle, regex=False), "init_time"]
+        if matches.empty:
+            raise ValueError(
+                f"{variable} 没有起报时刻含 {init!r} 的谱；"
+                f"现有起报：{'、'.join(sorted(set(frame['init_time'])))}"
+            )
+        chosen = matches.max()
+    frame = frame[frame["init_time"] == chosen]
+    long = _spectrum_long(frame, variable, "pred", "obs")
+    if long["wavenumber"].le(0).all():
+        raise ValueError(f"{variable} @ {chosen} 的谱线只有 k=0，没有可画的波数")
+    long = long.sort_values(["variable", "wavenumber"]).reset_index(drop=True)
+    # 真正选中的那个起报（调用方可能只给了子串、或者干脆没给），回传出去给图题用
+    long.attrs["init_time"] = str(chosen)
+    return long
 
 
 def spectrum_series(spectra: pd.DataFrame, variable: str) -> pd.DataFrame:
@@ -419,44 +490,41 @@ class FieldScorePlotter:
     # ------------------------------------------------------------------ #
     def plot_spectrum_curve(
         self,
-        details: pd.DataFrame,
+        spectra: pd.DataFrame,
         variable: str,
-        lead_h: float,
+        label: str,
         *,
         title: Optional[str] = None,
         save_path: Optional[Path] = None,
     ):
-        """波数 vs 功率，预报/实况两条线 + 总功率比标注（log 纵轴）。"""
-        frame = details.copy()
-        frame["group"] = frame["group"].astype(str)
-        frame = frame[frame["group"].str.match(_WAVENUMBER_PATTERN)]
-        wide = frame.pivot_table(index="group", columns="field", values="value")
-        for field in ("power_forecast", "power_observation"):
-            if field not in wide.columns:
-                raise ValueError(f"明细表里没有 {field} 字段；现有字段: {list(wide.columns)}")
-        wide["wavenumber"] = [
-            int(str(index).split("=")[1]) for index in wide.index
-        ]
-        wide = wide.sort_values("wavenumber")
-        wide = wide[wide["wavenumber"] > 0]  # k=0 的功率恒为 0，log 轴画不了
+        """波数 vs 功率，预报/实况两条线 + 总功率比标注（log 纵轴）。
+
+        Args:
+            spectra: 长表（``variable / wavenumber / field / value``），
+                由 :func:`load_init_spectra` 或 :func:`load_wavenumber_spectra` 读来。
+            label: 图题里那个"这一条是什么"的标注（起报时刻或"全时段平均"）。
+        """
+        wide = spectrum_series(spectra, variable)
+        wide = wide[wide.index > 0]  # k=0 的功率恒为 0，log 轴画不了
         if wide.empty:
-            raise ValueError(f"{variable} @ {lead_h:g}h 的谱线只有 k=0，没有可画的波数")
+            raise ValueError(f"{variable} @ {label} 的谱线只有 k=0，没有可画的波数")
 
         forecast_total = float(wide["power_forecast"].sum())
         observation_total = float(wide["power_observation"].sum())
         ratio = forecast_total / observation_total if observation_total else float("nan")
 
         figure, axis = plt.subplots(figsize=(11, 6))
-        axis.plot(wide["wavenumber"], wide["power_forecast"], linewidth=1.6, label="预报")
-        axis.plot(wide["wavenumber"], wide["power_observation"], linewidth=1.6, label="实况")
+        axis.plot(wide.index, wide["power_forecast"], linewidth=1.6, label="预报")
+        axis.plot(wide.index, wide["power_observation"], linewidth=1.6, label="实况")
+        axis.set_xscale("log")
         axis.set_yscale("log")
-        axis.set_xlabel("纬向波数 k", fontsize=10)
+        axis.set_xlabel("纬向波数 k（对数轴）", fontsize=10)
         axis.set_ylabel("功率（对数轴）", fontsize=10)
         axis.grid(alpha=0.3, which="both", linewidth=0.6)
         axis.legend(loc="best", fontsize=10)
         axis.set_title(
             title
-            or f"{variable} 纬向谱 @ {lead_h:g}h（总功率比 预报/实况 = {ratio:.3f}）",
+            or f"{variable} 纬向谱 @ {label}（总功率比 预报/实况 = {ratio:.3f}）",
             fontsize=12,
         )
         axis.annotate(
@@ -540,10 +608,9 @@ class FieldScorePlotter:
         scores_df: pd.DataFrame,
         output_dir: Path,
         *,
-        summary_path: Optional[Path] = None,
-        details_path: Optional[Path] = None,
+        spectrum_dir: Optional[Path] = None,
         spectrum_variable: Optional[str] = None,
-        spectrum_lead: Optional[float] = None,
+        spectrum_init: Optional[str] = None,
         model_name: str = "model",
         sources: Optional[Dict[str, str]] = None,
         manifest_info: Optional[Dict[str, object]] = None,
@@ -551,9 +618,12 @@ class FieldScorePlotter:
     ) -> Dict[str, Path]:
         """出图 + 写 Markdown 报告，返回 ``{名称: 路径}``。
 
-        ``summary_path`` 给了就出一张全变量的纬向谱面板，并让报告多一节分波段
-        功率比；``details_path`` 只在点名要看**指定时效**的谱曲线时才读
-        （单变量单时效就有 721 个波数，本仓库那份明细表是 492MB）。
+        Args:
+            spectrum_dir: 产物目录（含 ``diagnostics/``）。给了就出一张全变量的
+                纬向谱面板，并让报告多一节分波段功率比；目录里没有谱文件就照常
+                出别的图，不报错。
+            spectrum_variable / spectrum_init: 点名看**某一个起报**的谱曲线时才给；
+                ``spectrum_init`` 省略时取最后一个起报。
         """
         output_dir = Path(output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
@@ -588,55 +658,58 @@ class FieldScorePlotter:
             artifacts["rmse_heatmap"] = path
 
         spectra = None
-        if summary_path:
+        if spectrum_dir:
             try:
-                spectra = load_wavenumber_spectra(Path(summary_path))
+                spectra = load_wavenumber_spectra(Path(spectrum_dir))
             except ValueError as error:
                 print(f"  跳过纬向谱面板：{error}")
         if spectra is not None and not spectra.empty:
             path = output_dir / "spectrum_panel.png"
             self.plot_spectrum_panel(
                 spectra,
-                title=f"{model_name} 纬向功率谱（跨起报平均）",
+                title=f"{model_name} 纬向功率谱（全时段加权平均）",
                 save_path=path,
             )
             plt.close()
             artifacts["spectrum_panel"] = path
 
         spectrum_note = None
-        if spectrum_variable and details_path:
-            details = load_spectrum_details(
-                Path(details_path), variable=spectrum_variable, lead_h=spectrum_lead
-            )
-            lead = (
-                float(spectrum_lead)
-                if spectrum_lead is not None
-                else float(details["lead_h"].max())
-            )
-            details = details[details["lead_h"] == lead]
-            path = output_dir / f"spectrum_curve_{spectrum_variable}_{lead:g}h.png"
-            self.plot_spectrum_curve(
-                details,
-                spectrum_variable,
-                lead,
-                title=f"{model_name} {spectrum_variable} 纬向谱 @ {lead:g}h",
-                save_path=path,
-            )
-            plt.close()
-            artifacts[f"spectrum_curve_{spectrum_variable}_{lead:g}h"] = path
+        if spectrum_variable and spectrum_dir:
+            try:
+                one = load_init_spectra(Path(spectrum_dir), spectrum_variable, spectrum_init)
+            except ValueError as error:
+                spectrum_note = f"要求了谱曲线但没出图：{error}"
+            else:
+                stamp = pd.to_datetime(one.attrs.get("init_time") or "", errors="coerce")
+                ok = pd.notna(stamp)
+                shown = f"{stamp:%Y-%m-%d %H}" if ok else str(spectrum_init or "")
+                token = f"{stamp:%Y%m%d%H}" if ok else "unknown"
+                path = output_dir / f"spectrum_curve_{spectrum_variable}_{token}.png"
+                self.plot_spectrum_curve(
+                    one,
+                    spectrum_variable,
+                    shown or "最后一个起报",
+                    title=f"{model_name} {spectrum_variable} 纬向谱 @ {shown} 起报",
+                    save_path=path,
+                )
+                plt.close()
+                artifacts[path.stem] = path
+                spectrum_note = (
+                    f"谱曲线：`{path.name}`（{spectrum_variable}，{shown} 起报）—— 双对数坐标，"
+                    f"两条线分别是预报与实况的功率谱，总功率比见左上角标注。"
+                    f"注意这是**该起报跨时效加权平均**后的谱，不是某个时效的谱。"
+                )
+        elif spectrum_variable and not spectrum_dir:
             spectrum_note = (
-                f"谱曲线：`{path.name}`（{spectrum_variable} @ {lead:g}h）—— 纵轴对数，"
-                f"两条线分别是预报与实况的功率谱，总功率比见右上角标注。"
-            )
-        elif spectrum_variable and not details_path:
-            spectrum_note = (
-                "要求了谱曲线但没给明细表路径，未出图"
-                "（逐波数谱在 `diagnostics/scores_detail.csv` 里）。"
+                "要求了谱曲线但没给产物目录，未出图"
+                "（逐波数谱在 `diagnostics/spectrum_by_init.csv` 里）。"
             )
 
         report_path = output_dir / "REPORT.md"
         build_field_report(
-            data,
+            # 给**原始**帧而不是滤过区域的 data：报告要如实写"长表一共多少行、
+            # 其中多少行是区域行没进统计"。两边的全球行口径一致，数字对得上。
+            scores_df,
             report_path,
             model_name=model_name,
             requested=requested_from(manifest_info or {}),

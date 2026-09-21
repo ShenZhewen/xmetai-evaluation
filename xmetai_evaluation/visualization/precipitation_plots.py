@@ -30,7 +30,7 @@ import numpy as np
 import pandas as pd
 from matplotlib.patches import Patch
 
-from visualization.ts_report import (
+from xmetai_evaluation.visualization.ts_report import (
     box_stats,
     build_ts_report,
     collect_box_models,

@@ -5,7 +5,7 @@
 一句话用法::
 
     python -m xmetai_evaluation.visualization.field_report \
-        --scores scores.csv --out reports/field_fuxi --model FuXi
+        --scores scores.csv --result reports/field_fuxi --model FuXi
 
 覆盖流程 ``weather_field_scores``（RMSE / ACC / 预报活跃度 / 纬向谱），
 指标语义集中在本模块的 ``METRIC_SEMANTICS``，出图和报告都从这里取。
@@ -18,10 +18,19 @@ RMSE 随时效表、活跃度表、**分波段功率比表**、图表索引、�
 * **只用数据内证据**。不引入没有来源的绝对合格线，所以报告里不会出现
   "ACC ≥ 0.6 算合格"这类判决，只在数据内部比大小、看形态。
 * **不重算指标**。只消费已经落盘的表，缺行缺列如实写出来，不猜也不补。
-  ``scores.csv`` 是数值主来源；逐波数谱只存在于 ``summary.csv`` 的
-  ``scope=wavenumber`` 档，所以那一节从 ``summary.csv`` 取（见 :func:`spectrum_bands`）。
+  ``scores.csv`` 是数值主来源；逐波数谱不在长表里（长表一行一个变量的总量），
+  走 ``MetricResult.curve`` 落成 ``diagnostics/spectrum_<变量>.csv``，那一节从它取
+  （见 :func:`spectrum_bands`）。
 * **比值要连着分母一起看**。分波段那节同时给「实况占比」，因为一个占比 0.01%
   的波段有着 5 倍的功率比，也不说明模式在那一档失真。
+
+两处容易算错、本模块显式挡掉的地方（都在 :func:`summarize` 里）：
+
+* **区域行**：新格式对每个「起报 × 时效 × 指标」写一行全球 + 每区域一行。
+  只统计全球行（:func:`global_rows`），区域平均不能和全球混在一起平均；
+* **分组指标**：球谐带功率一个频带一行，靠 ``group`` 区分。行键带上频带标签
+  （``z500·1_4``）；**认不出频带时宁可不聚合**——把五个频带按 mean 平均会得到
+  一个不属于任何频带、数值却挺像样的数。
 """
 
 from __future__ import annotations
@@ -71,6 +80,25 @@ METRIC_SEMANTICS: Dict[str, Dict[str, object]] = {
         "ref_result": None,
         "direction": None,
     },
+    # 球谐带功率：**逐频带**一行，靠长表的 ``group`` 列（``1_4`` / ``5_20`` …）
+    # 区分。它和上面的 ``spectrum_power_ratio`` 是两套分解——那个按**纬向波数**分，
+    # 这个按**球谐总阶数 l** 分——不能互相换算，也不该混在一张表里比。
+    # 三个名字都得登记：没登记的报告会按"未知指标"报出来，看着像出了问题。
+    "spherical_band_power_ratio": {
+        "label": "球谐带功率比",
+        "ref_result": 1.0,
+        "direction": "target",
+    },
+    "spherical_band_power_forecast": {
+        "label": "球谐带预报功率",
+        "ref_result": None,
+        "direction": None,
+    },
+    "spherical_band_power_observation": {
+        "label": "球谐带实况功率",
+        "ref_result": None,
+        "direction": None,
+    },
 }
 
 #: 逐时效折线图默认画这四个；``activity_bias`` 与 ``activity_ratio`` 信息重复，
@@ -80,9 +108,10 @@ SKILL_METRICS = ("rmse", "acc", "activity_ratio", "spectrum_power_ratio")
 #: **配置里的原始指标名** → 它在长表里展开成的指标名。
 #:
 #: 长表一行一个**展开后**的指标：``activity`` 拆成 ratio / bias / forecast /
-#: observation 四行，``zonal_spectrum`` 只留 ``spectrum_power_ratio``（``summary``
-#: 里的总量字段进了评分表，波数明细进了 ``scores_detail.csv``）。而 ``manifest``
-#: 的 ``metric_options`` 记的是**原始**指标名——两边不同名。
+#: observation 四行，``zonal_spectrum`` 只留 ``spectrum_power_ratio``（总量字段
+#: 进了评分表，逐波数曲线走 ``MetricResult.curve``、落 ``diagnostics/spectrum_*.csv``），
+#: ``spherical_bands`` 拆成 forecast / observation / ratio 三个名字（再用 ``group``
+#: 分频带）。而 ``manifest`` 的 ``metric_options`` 记的是**原始**指标名——两边不同名。
 #:
 #: 缺项检查要把它们对齐，否则 ``curves.get("zonal_spectrum")`` 永远是空，**每个谱
 #: 变量都会被误报成"该算没算"**。这不是假想：``weather_rmse_single_fuxi``
@@ -95,8 +124,31 @@ METRIC_EXPANSIONS: Dict[str, tuple] = {
         "activity_forecast",
         "activity_observation",
     ),
+    # ``zonal_spectrum`` 与 ``spectrum`` 是同一个指标在两个流程模板里的注册名，
+    # 展开后都只有 ``spectrum_power_ratio`` 一个名字，长表里分不出来。
     "zonal_spectrum": ("spectrum_power_ratio",),
+    "spectrum": ("spectrum_power_ratio",),
+    "spherical_bands": (
+        "spherical_band_power_forecast",
+        "spherical_band_power_observation",
+        "spherical_band_power_ratio",
+    ),
+    # 分类 / 概率检验：配置名与展开名不同，展开名见 output/table.py 的 _SCORE_FIELDS。
+    "ts_score": ("ts", "pod", "far", "miss_rate", "frequency_bias"),
+    "ensemble_probability": ("aroc", "bs", "bss"),
+    # ``spread_error`` 展开出来的 ``rmse`` 与确定性 RMSE **同名**，靠 ``product_kind``
+    # 区分（见 output/table.py）；这里只做"名字有没有出现过"的检查，够用。
+    "spread_error": ("spread", "rmse", "spread_error_ratio"),
 }
+
+#: 长表 ``group`` 列的哨兵值：``zonal_spectrum`` 把总量字段放在 ``summary`` 这一层
+#: （见 ``metrics/specialized.py``），它展开出来的 ``spectrum_power_ratio`` 一行一个
+#: 变量，**不是**子维度。同名的子维度另有 ``1_4`` 这种频带标签。
+GROUP_SUMMARY = "summary"
+
+#: 行键里变量名与子维度标签之间的分隔符（``z500·1_4``）。选它是因为变量名里
+#: 不会出现，切出来的前半段一定还是变量名。
+ROW_KEY_SEPARATOR = "·"
 
 _CN_NUMBERS = ("一", "二", "三", "四", "五", "六", "七", "八", "九", "十")
 
@@ -202,6 +254,37 @@ def _series_stats(values: Sequence[float], leads: Sequence[float], unit: str) ->
 # --------------------------------------------------------------------------- #
 # 汇总与诊断
 # --------------------------------------------------------------------------- #
+def global_rows(data: pd.DataFrame) -> pd.DataFrame:
+    """只留**全球**行。
+
+    新格式的长表对每个「起报 × 时效 × 指标」写一行全球、再给每个配置的区域各写一行
+    （``region`` 列是 ``tropics`` / ``nh_extratropics`` / …，全球那行是空值）。
+    不过滤的话，同名的几行会被 :func:`summarize` 的透视表**悄悄按 mean 平均**——
+    4 个区域平均出来的"RMSE"不属于任何一块地方，数值还挺像样。
+    长表里没有 ``region`` 列（老格式）时原样返回。
+    """
+    if "region" not in data.columns:
+        return data
+    region = data["region"]
+    return data[region.isna() | (region.astype(str).str.strip() == "")]
+
+
+def _row_keys(data: pd.DataFrame) -> pd.Series:
+    """长表的**行键**：变量名；带子维度的指标再缀上 ``group`` 标签。
+
+    ``rmse`` / ``spectrum_power_ratio`` 这类一行一个变量的指标，键就是变量名
+    （``group`` 为空，或者恰好是总量档的哨兵 :data:`GROUP_SUMMARY`）。球谐带功率
+    一行一个频带，键是 ``z500·1_4`` 这样——**不把频带并进键，透视表会把五个频带
+    平均成一个不属于任何频带的数**，而那个数看着还挺正常。
+    """
+    keys = data["variable"].astype(str)
+    if "group" not in data.columns:
+        return keys
+    group = data["group"].astype(str).str.strip()
+    group = group.where(group.ne("") & group.ne("nan") & group.ne(GROUP_SUMMARY), "")
+    return keys.where(group.eq(""), keys + ROW_KEY_SEPARATOR + group)
+
+
 def summarize(
     scores: pd.DataFrame,
     requested: Optional[Dict[str, Sequence[str]]] = None,
@@ -216,13 +299,19 @@ def summarize(
             某个要素，reader 会跳过并只留一行日志）。``None`` 时缺口为空。
 
     Returns:
-        ``variables`` / ``leads`` / ``metrics`` / ``units``（metric→variable→单位）/
-        ``pivots``（metric→变量×时效透视表）/ ``per_variable`` / ``missing`` /
+        ``variables`` / ``leads`` / ``metrics`` / ``units``（metric→行键→单位）/
+        ``pivots``（metric→行键×时效透视表）/ ``per_variable`` / ``missing`` /
         ``n_rows`` / ``n_success`` / ``n_failed`` / ``failed_statuses`` /
-        ``unknown_metrics``。
+        ``unknown_metrics`` / ``ambiguous_metrics``。
+
+    「行键」是变量名，带 ``group`` 子维度的指标（球谐带功率）再缀上频带标签；
+    ``per_variable`` 仍按**变量**组织，所以只有前缀对得上的行才会出现在里面。
     """
     data = scores.copy()
     data.columns = [str(column).strip() for column in data.columns]
+    global_only = global_rows(data)  # 区域行不能混进来一起平均
+    n_region_rows = int(len(data) - len(global_only))
+    data = global_only
 
     for column in ("lead_h", "value"):
         if column in data.columns:
@@ -269,20 +358,38 @@ def summarize(
     leads = sorted({float(value) for value in usable.get("lead_h", pd.Series(dtype=float))})
     units: Dict[str, Dict[str, str]] = {}
     pivots: Dict[str, pd.DataFrame] = {}
+    ambiguous: List[Dict[str, object]] = []
 
     if not usable.empty:
-        group_columns = ["metric", "variable"]
-        for (metric, variable), subset in usable.groupby(group_columns, observed=True):
-            metric, variable = str(metric), str(variable)
+        keyed = usable.copy()
+        keyed["_key"] = _row_keys(keyed)
+        # 透视表会把起报（区域行则已经被 global_rows 滤掉）平均掉，那是**故意**的；
+        # 所以重行要按「起报内」数——同一个起报里「行键 × 时效」还有两行，才说明
+        # 这个指标有一层子维度没被 ``group`` 区分开（球谐带功率遇上没写 group 列的
+        # 产物就是这样）。这时透视表的默认 aggfunc=mean 会把这些行**悄悄平均**成
+        # 一个不属于任何频带的数——宁可不出一列。
+        duplicates_on = [name for name in ("metric", "_key", "init_time", "lead_h") if name in keyed.columns]
+        counts = keyed.groupby(duplicates_on, observed=True).size()
+        collapsed = counts[counts > 1].groupby(level=0, observed=True).size()
+        ambiguous = [
+            {"metric": str(metric), "n_collapsed": int(count)}
+            for metric, count in collapsed.items()
+        ]
+        if ambiguous:
+            keyed = keyed[~keyed["metric"].astype(str).isin([item["metric"] for item in ambiguous])]
+
+        group_columns = ["metric", "_key"]
+        for (metric, key), subset in keyed.groupby(group_columns, observed=True):
+            metric, key = str(metric), str(key)  # type: ignore[assignment]
             texts = (
                 [str(unit) for unit in subset["unit"].dropna().unique() if str(unit)]
                 if "unit" in subset.columns
                 else []
             )
-            units.setdefault(metric, {})[variable] = texts[0] if texts else ""
-        for metric, subset in usable.groupby("metric", observed=True):
+            units.setdefault(metric, {})[key] = texts[0] if texts else ""
+        for metric, subset in keyed.groupby("metric", observed=True):
             pivots[str(metric)] = subset.pivot_table(
-                index="variable", columns="lead_h", values="value", observed=True
+                index="_key", columns="lead_h", values="value", observed=True
             )
 
     # metric -> variable -> 曲线统计量
@@ -310,12 +417,20 @@ def summarize(
         per_variable.append(entry)
 
     missing: List[Dict[str, str]] = []
+    ambiguous_names = {str(item["metric"]) for item in ambiguous}
     for metric, names in (requested or {}).items():
         metric = str(metric)
-        # 配置用的是原始指标名，长表用的是展开后的名字，先把两边对齐（见 METRIC_EXPANSIONS）
+        # 配置用的是原始指标名，长表用的是展开后的名字，先把两边对齐（见 METRIC_EXPANSIONS）；
+        expanded_names = METRIC_EXPANSIONS.get(metric, (metric,))
+        if expanded_names and all(name in ambiguous_names for name in expanded_names):
+            # 行在长表里，只是认不出子维度、聚不了。这不是"该算没出数"，
+            # 别混进缺项清单里让人去查数据源，理由由 ``ambiguous_metrics`` 那条说。
+            continue
         present: set = set()
         for expanded in METRIC_EXPANSIONS.get(metric, (metric,)):
-            present |= set(curves.get(expanded, {}))
+            present |= {
+                str(key).split(ROW_KEY_SEPARATOR, 1)[0] for key in curves.get(expanded, {})
+            }
         for name in names or []:
             if str(name) not in present:
                 missing.append({"metric": metric, "variable": str(name)})
@@ -330,6 +445,8 @@ def summarize(
         "per_variable": per_variable,
         "missing": missing,
         "unknown_metrics": [name for name in curves if name not in METRIC_SEMANTICS],
+        "ambiguous_metrics": ambiguous,
+        "n_region_rows": n_region_rows,
         "n_rows": n_rows,
         "n_success": int(len(usable)),
         "n_failed": n_failed,
@@ -352,8 +469,10 @@ def spectrum_bands(spectra: Optional[pd.DataFrame]) -> List[Dict[str, object]]:
     尺度选择性的。
 
     Args:
-        spectra: 逐波数长表（``variable / wavenumber / field / value``），来自
-            ``summary.csv`` 的 ``scope=wavenumber`` 档。``None`` / 空表返回 ``[]``。
+        spectra: 逐波数长表（``variable / wavenumber / field / value``），来自产物
+            目录的 ``diagnostics/spectrum_<变量>.csv``，由
+            :func:`field_plots.load_wavenumber_spectra` 读成这个口径。
+            ``None`` / 空表返回 ``[]``。
 
     Returns:
         ``[{variable, band, wavelength_min_km, wavelength_max_km, forecast,
@@ -489,6 +608,21 @@ def diagnose(
             f"报告只按数值原样列出，不解读含义。"
         )
 
+    ambiguous = summary.get("ambiguous_metrics") or []
+    if ambiguous:
+        names = "；".join(
+            f"`{item['metric']}`（{item['n_collapsed']} 个「变量 × 时效」有重行）"
+            for item in ambiguous
+        )
+        findings.append(
+            f"有 {len(ambiguous)} 个指标在同一个「变量 × 时效」下写了多行，"
+            f"而 `group` 列**区分不开**它们：{names}。"
+            f"这类指标通常是分组的（球谐带功率一行一个频带），"
+            f"把几行平均起来会得到一个不属于任何频带的数，所以本报告**不聚合**它们、"
+            f"也不出曲线，上面几节的变量数里不含它们。"
+            f"要看频带明细，用带 `group` 列的产物重跑（或转看球谐带/波动报告）。"
+        )
+
     rmse_items = _series_of(summary, "rmse")
     if rmse_items:
         ranked = sorted(rmse_items, key=lambda item: item[1]["ratio"], reverse=True)
@@ -556,9 +690,10 @@ def diagnose(
                 head += "是哪个尺度出的问题，看下一节的「分波段功率比」表。"
             else:
                 head += (
-                    "本报告没拿到 `summary.csv`，出不了分波段表；"
-                    "要看是哪个波段的问题，用 `--spectrum-variable` / `--spectrum-lead` "
-                    "读 `scores_detail.csv` 出谱曲线。"
+                    "本次没读到产物目录的 `diagnostics/spectrum_<变量>.csv`，"
+                    "出不了分波段表；那份文件是谱指标的曲线产物（走 "
+                    "`MetricResult.curve`），配置里没写 `zonal_spectrum` / `spectrum` "
+                    "就不会有。"
                 )
         findings.append(head)
 
@@ -804,9 +939,9 @@ def build_field_report(
             只写能从头几个参数拿到的内容。
         artifacts: ``{名称: 路径}``，图片会被写成 Markdown 图片。
         spectrum_note: 谱曲线的说明（按需出图时由调用方给出）。
-        spectra: 逐波数长表（``summary.csv`` 的 ``scope=wavenumber`` 档）；
-            给了才会出分波段功率比表。谱曲线在 ``scores.csv`` 里根本没有，
-            所以这节只能从 ``summary.csv`` 来。
+        spectra: 逐波数长表（口径见 :func:`spectrum_bands`）；给了才会出分波段功率比表。
+            谱曲线**不在** ``scores.csv`` 里——长表一行一个变量的总量，逐波数曲线是
+            ``MetricResult.curve``，只落 ``diagnostics/spectrum_*.csv``。
     """
     output_path = Path(output_path)
     info = dict(manifest_info or {})
@@ -843,6 +978,12 @@ def build_field_report(
             f"- **实际结果**：{len(variables)} 个变量 × {len(metrics)} 个指标"
             f"（{'、'.join(metrics)}），时效 {leads[0]:g}–{leads[-1]:g}h 共 {len(leads)} 个，"
             f"长表 {summary['n_rows']} 行"
+            + (
+                f"（**只算全球行**，另有 {summary['n_region_rows']} 行区域行没有进统计——"
+                f"区域平均不能和全球混在一起）"
+                if summary.get("n_region_rows")
+                else ""
+            )
         )
     head.append(f"- **预报来源文件**：{_file_summary(info.get('forecast_source_files') or [])}")
     head.append(f"- **实况来源文件**：{_file_summary(info.get('observation_source_files') or [])}")
@@ -925,20 +1066,25 @@ def build_field_report(
         "（单起报单时效就是 1），它不是样本量，不能拿来判断结果可不可信。",
         "- **`value` 为空不等于 0**：为空说明这一个组合没算出来，看同行 `status`；"
         "本报告只对 `status=success` 的行做统计。",
-        "- **`level` / `region` / `threshold` / `window_h` / `weights_id` 恒为空**，"
-        "这是 `grid_valid_time` 协议的设计（默认口径只有 `variable` / `sample_unit` / `unit`），"
-        "不是缺数据。",
+        "- **只统计全球行**：长表对每个「起报 × 时效 × 指标」写一行全球、再给配置的每个"
+        "区域各写一行（`region` = `tropics` / `nh_extratropics` / …，全球那行是空）。"
+        "本报告的每一个数都只取全球行——4 个区域平均出来的 RMSE 不属于任何一块地方。"
+        "`threshold` / `level` / `window_h` / `weights_id` 仍然是空的，那是 "
+        "`grid_valid_time` 协议的设计，不是缺数据。",
+        "- **同名指标靠 `product_kind` 区分**：集合评估展开出来的 `rmse`（来自 "
+        "`spread_error`）与确定性的 `rmse` 在长表里同名，看 `product_kind` 列"
+        "（`deterministic` / `ensemble`）才分得开。本报告走的是确定性链路。",
         "- **首/末时效不是稳定的统计量**：起报数与样本区间决定了这条曲线的形态，"
         "本报告里「涨到几倍」这类说法只在当前这套输入下成立，"
         "跨批次比较要用同样的起报集合与时段。",
-        "- **逐波数谱曲线不在 `scores.csv` 里**，在 `summary.csv` 的 `scope=wavenumber` 档"
-        "（跨起报、跨时效平均后的逐波数功率）。报告的分波段表与谱面板都从这里取；"
-        "`summary.csv` 不存在时这两块直接不出现，不从别处凑。要**指定时效**的谱，"
-        "得读 `diagnostics/scores_detail.csv` 的 `group=k=<波数>` 行"
-        "（单变量单时效就有 721 个波数，本仓库那份 492MB），用 "
-        "`--spectrum-variable` / `--spectrum-lead` 按需出图。",
-        "- 本报告**不重算任何指标**，只消费已落盘的表：数值主来源是 `scores.csv`，"
-        "逐波数谱那两块来自 `summary.csv`。缺表缺行如实写出，不猜也不补。",
+        "- **逐波数谱曲线不在 `scores.csv` 里**：长表一行一个变量的**总量**"
+        "（`spectrum_power_ratio`），逐波数曲线走 `MetricResult.curve`，落成 "
+        "`diagnostics/spectrum_<变量>.csv`（全时段加权平均）与 "
+        "`diagnostics/spectrum_by_init.csv`（逐起报）。报告的分波段表与谱面板都从前者取，"
+        "取不到时这两块直接不出现，不从别处凑；要**某一个起报**的谱，用 "
+        "`--spectrum-variable` / `--spectrum-init` 读后者。",
+        "- 本报告**不重算任何指标**，只消费已落盘的表：数值来自 `scores.csv`（全球行），"
+        "逐波数谱来自 `diagnostics/spectrum_*.csv`。缺表缺行如实写出，不猜也不补。",
     ]
 
     sections: List[tuple] = [
@@ -972,17 +1118,17 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser = argparse.ArgumentParser(
         description="把连续场评分长表画成图并写成 Markdown 报告",
         epilog="示例: python -m xmetai_evaluation.visualization.field_report "
-        "--scores scores.csv --out reports/field_fuxi --model FuXi",
+        "--scores scores.csv --result reports/field_fuxi --model FuXi",
     )
     parser.add_argument("--scores", type=Path, required=True, help="长表 scores.csv")
-    parser.add_argument("--out", type=Path, required=True, help="输出目录")
+    parser.add_argument("--result", type=Path, required=True, help="输出目录")
     parser.add_argument("--model", default=None, help="模型名（默认取 model_id 列）")
     parser.add_argument("--manifest", type=Path, default=None, help="可选：manifest.json")
     parser.add_argument("--change", default=None, help="可选：本次改动说明")
     parser.add_argument("--dpi", type=int, default=150)
     args = parser.parse_args(argv)
 
-    from visualization.field_plots import FieldScorePlotter
+    from xmetai_evaluation.visualization.field_plots import FieldScorePlotter
 
     scores = pd.read_csv(args.scores)
     manifest = (
@@ -991,14 +1137,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     info = manifest_info_from(manifest)
     model = args.model or str(info.get("model_id") or args.scores.stem)
 
-    # summary.csv 是 scores.csv 的同级产物（field_summary writer 落的），有就用它出
-    # 纬向谱面板与分波段功率比；没有就照常出图，不额外要一个开关。
-    summary_path = args.scores.with_name("summary.csv")
+    # 纬向谱面板与分波段功率比读 scores.csv 同级 diagnostics/ 下的
+    # ``spectrum_<变量>.csv``；没有就照常出图，不额外要一个开关。
+    spectrum_dir = args.scores.parent
     plotter = FieldScorePlotter()
     artifacts = plotter.create_report(
         scores,
-        output_dir=args.out,
-        summary_path=summary_path if summary_path.is_file() else None,
+        output_dir=args.result,
+        spectrum_dir=spectrum_dir,
         model_name=model,
         manifest_info=info,
         sources={"scores": str(args.scores)},
