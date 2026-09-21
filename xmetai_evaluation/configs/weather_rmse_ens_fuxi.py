@@ -31,24 +31,28 @@ VARS = ["z500"]
 #   spherical_bands         球谐带功率（总波数分带，老仓 spherical_bands_*.csv
 #                           同口径），重指标；只对全球含极网格有定义——配了
 #                           下方 regions 分带时它恒全球，不逐带出分
-#   crps / spread_error     集合族：crps 吃原始成员；spread_error 另带 Spread /
-#                           离散度-误差比（本配置没点名，要加就写进某组
-#                           variables 下）
+#   crps / spread_error     集合族：crps 吃原始成员；spread_error 出 Spread /
+#                           RMSE(集合平均) / 离散度-误差比三个数——老仓 regr_ens
+#                           对集合**无条件**出这两个表（spread_*.csv /
+#                           spread_rmse_ratio_*.csv），不看 metrics 列表，所以
+#                           这里每个变量都点名（对齐老档案）
 #   ts_score / fss / ensemble_probability  分类/空间/概率族（本流程不用）
 # ⚠ 每个用到的指标都必须点到某组 variables 下（漏点名的会拿到整批多变量
 #   数据，single_variable 直接报错——这是框架故意的，防静默出假数）。
-# ⚠ crps 只路由给 z500（xu 也只对它算）。
+# ⚠ crps 只路由给 z500（xu 也只对它算；spread 老仓是全变量出的）。
 VAR_METRICS = {
-    "z500": ["rmse", "crps", "acc", "activity", "zonal_spectrum", "spherical_bands"],
+    "z500": ["rmse", "crps", "spread_error", "acc", "activity",
+             "zonal_spectrum", "spherical_bands"],
 }
 
 # 全量表（正式跑用，替换上面一块）：
 # VAR_METRICS = {
-#     "z500": ["rmse", "crps", "acc", "activity", "zonal_spectrum", "spherical_bands"],
-#     "msl": ["rmse", "acc"],
-#     "u200": ["rmse", "activity", "zonal_spectrum", "spherical_bands"],
-#     "v200": ["rmse", "activity", "zonal_spectrum", "spherical_bands"],
-#     "ws200": ["rmse", "activity", "zonal_spectrum", "spherical_bands"],
+#     "z500": ["rmse", "crps", "spread_error", "acc", "activity",
+#              "zonal_spectrum", "spherical_bands"],
+#     "msl": ["rmse", "spread_error", "acc"],
+#     "u200": ["rmse", "spread_error", "activity", "zonal_spectrum", "spherical_bands"],
+#     "v200": ["rmse", "spread_error", "activity", "zonal_spectrum", "spherical_bands"],
+#     "ws200": ["rmse", "spread_error", "activity", "zonal_spectrum", "spherical_bands"],
 # }
 
 METRIC_OPTIONS = metric_options_from_var_metrics(VAR_METRICS)
@@ -69,6 +73,10 @@ METRIC_OPTIONS["zonal_spectrum"] = {
 #     **METRIC_OPTIONS["spherical_bands"],
 #     "bands": ((1, 4), (5, 20), (21, 40), (41, 64), (65, 128)),
 # }
+# spread 的归一口径：0 = 除以成员数 N（老仓 vfc regr_ens 的 p.std(ddof=0)，
+# 对拍 ref_result 的 spread_*.csv 用这个）；1 = 除以 M−1 无偏（FDP 口径，
+# 不写时的默认）。两口径差 sqrt((M-1)/M)，M=51 时约 1%。
+METRIC_OPTIONS["spread_error"] = {**METRIC_OPTIONS["spread_error"], "ddof": 0}
 
 _ERA5_STORE_ROOT = "/workspace/data/liujunjie/era5_foundation_store2"
 

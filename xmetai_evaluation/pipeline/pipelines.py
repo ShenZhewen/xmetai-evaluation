@@ -159,14 +159,18 @@ PIPELINE_TEMPLATES: Dict[str, PipelineTemplate] = {
         name="weather_ens_field_scores",
         protocol="grid_valid_time",
         description=(
-            "集合场检验：RMSE / CRPS / ACC / 预报活跃度 / 纬向谱 / 球谐带功率\n"
+            "集合场检验：RMSE / CRPS / Spread-Error / ACC / 预报活跃度 / 纬向谱 / 球谐带功率\n"
             "  用途  同一批集合样本上既看确定性误差（集合均值 vs 实况），\n"
-            "        也看集合分布本身的质量（CRPS）\n"
+            "        也看集合分布本身的质量（CRPS、离散度标定）\n"
             "  数据  预报 集合预报（fuxi_ens / fengqing 等）/ 观测 格点实况（era5_zarr）\n"
             "        参考 日气候态 —— ACC / 活跃度必需，纬向谱不需要\n"
             "  计算  grid_valid_time：格点有效时刻配对；集合均值另算\n"
-            "        CRPS 直接吃原始成员，不走均值\n"
-            "  指标  rmse、crps、acc、activity、zonal_spectrum、spherical_bands\n"
+            "        CRPS / spread_error 直接吃原始成员，不走均值\n"
+            "  指标  rmse、crps、spread_error、acc、activity、zonal_spectrum、\n"
+            "        spherical_bands\n"
+            "        spread_error 出 Spread/RMSE/比，对标老仓 regr_ens 无条件\n"
+            "        输出的 spread_*.csv / spread_rmse_ratio_*.csv（ddof 经\n"
+            "        metric_options 配：对拍老仓用 0）\n"
             "        球谐带功率只对全球含极网格有定义（区域网格报错），\n"
             "        长表 group 列带频带标签，对标老仓 spherical_bands_*.csv\n"
             "        产出 scores.csv、diagnostics/spectrum_{var}.csv（全体均值曲线）、\n"
@@ -176,6 +180,7 @@ PIPELINE_TEMPLATES: Dict[str, PipelineTemplate] = {
         metrics=[
             MetricSpec("rmse"),
             MetricSpec("crps"),
+            MetricSpec("spread_error"),
             MetricSpec("acc"),
             MetricSpec("activity"),
             MetricSpec("zonal_spectrum"),
