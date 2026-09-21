@@ -30,7 +30,7 @@ from xmetai_evaluation.core.contracts import (
 )
 from xmetai_evaluation.core.errors import DecodeError, DiscoveryError
 from xmetai_evaluation.core.variables import TemporalKind
-from xmetai_evaluation.io.base import DataCatalog, Reader
+from xmetai_evaluation.io.base import DataCatalog, Reader, hdf5_guard
 from xmetai_evaluation.io.layouts import GriddedLayout
 
 # 常见坐标别名 -> 标准坐标名
@@ -332,6 +332,14 @@ class GriddedReader(Reader):
             )
 
     def _read_record(
+        self, record: GriddedRecord, variables: Sequence[str]
+    ) -> Optional[xr.Dataset]:
+        # HDF5 后端不是线程安全的，threads 形态下并发读会段错误（见 base.hdf5_guard），
+        # 所以文件访问排队；锁只包这一层，归一化/换算在锁外照常并发。
+        with hdf5_guard(self.layout.engine, self.layout.engine_fallback):
+            return self._read_record_unlocked(record, variables)
+
+    def _read_record_unlocked(
         self, record: GriddedRecord, variables: Sequence[str]
     ) -> Optional[xr.Dataset]:
         if self.layout.per_variable_open:

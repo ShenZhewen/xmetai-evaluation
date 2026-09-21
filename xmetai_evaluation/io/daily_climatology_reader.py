@@ -48,7 +48,7 @@ from xmetai_evaluation.core.contracts import (
 )
 from xmetai_evaluation.core.errors import DecodeError, DiscoveryError
 from xmetai_evaluation.core.variables import DataKind, TemporalKind
-from xmetai_evaluation.io.base import DataCatalog, Reader
+from xmetai_evaluation.io.base import DataCatalog, Reader, hdf5_guard
 
 log = logging.getLogger(__name__)
 
@@ -319,7 +319,8 @@ class DailyClimatologyReader(Reader):
         path = Path(index.available[0]["path"])
         times = sorted(request.init_times)
 
-        with xr.open_dataset(path) as dataset:
+        # 本读只认 .nc（见 catalog 的 glob），是 HDF5 存储，得排队（base.hdf5_guard）
+        with hdf5_guard("netcdf"), xr.open_dataset(path) as dataset:
             hours = self._time_hours(dataset, path)
             steps_per_day = self._steps_per_day(hours, path)
             year_days = self._year_length(hours, steps_per_day, path)

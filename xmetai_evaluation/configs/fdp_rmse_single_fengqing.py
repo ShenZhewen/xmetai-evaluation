@@ -27,7 +27,7 @@ cfg = EvalConfig(
     forecast_reader={
         "type": "fengqing",
         "root_dir": os.environ.get(
-            "FDP_FENGQING_ROOT", "/mnt/d/气象研究/春燕_weather_test_bash/fengqing"
+            "FDP_FENGQING_ROOT", "/mnt/d/weather_main/chunyan_weather_test_bash/fengqing"
         ),
         "variables": ["z500"],
         "step_hours": 6.0,      # 布局步长：lead_from="filename"，文件名里的 3 位时效 × 6h
@@ -42,7 +42,7 @@ cfg = EvalConfig(
     observation_reader={
         "type": "cra",
         "root_dir": os.environ.get(
-            "FDP_CRA_ROOT", "/mnt/d/气象研究/春燕_weather_test_bash/cra_root"
+            "FDP_CRA_ROOT", "/mnt/d/weather_main/chunyan_weather_test_bash/cra_root"
         ),
         "variables": ["z500"],
     },
@@ -87,12 +87,15 @@ cfg = EvalConfig(
     #                                 子进程顺序处理（段内相邻块能命中窗块缓存）
     #                      auto       推导：单块 → serial；重指标 → processes；
     #                                 轻指标 → threads
-    #                    本流程的 rmse / bias / acc 都是轻指标。但**具体落地成什么
-    #                    取决于块数**：本配置钉死了 1 个起报 × 5 个时效、chunk_days=1
-    #                    → 只切出 1 个块 → 落地 serial（单块没必要并发）；哪天把
-    #                    init_times 铺成一整段，块数上去就会变成 threads。
+    #                    本流程的 rmse / bias / acc 都是轻指标，落成什么形态看块数：
+    #                    块按 (chunk_days 个起报日) × (lead_chunk_days 天时效) 切，
+    #                    本配置 5 个时效跨 5 个日期 → **5 个块 → threads × 4**
+    #                    （时效若都落在同一天，才是 1 个块 → serial）。
     #                    所以这一项写 auto 而不是某个具体形态——写死了反而会在
-    #                    起报数变化时卡在错误的选择上。结果三者都一样，只影响速度。
+    #                    起报数变化时卡在错误的选择上。
+    #                    ⚠ threads 会并发打开各自的 .nc，而 HDF5 不是线程安全的：
+    #                    IO 层已用 hdf5_guard 把文件访问串行化（见 io/base.py），
+    #                    所以三种形态结果一致，只差速度。
     #   n_workers        进程/线程数。推导缺省 processes = CPU 核数、threads = 4
     #   chunk_days       一个工作块装几个**起报日**（缺省 1）——管起报跨度
     #   lead_chunk_days  一个工作块装几天**时效**（缺省 1）——管时效跨度。本配置

@@ -28,7 +28,7 @@ from xmetai_evaluation.core.contracts import (
 )
 from xmetai_evaluation.core.errors import DecodeError, DiscoveryError
 from xmetai_evaluation.core.variables import DataKind, TemporalKind
-from xmetai_evaluation.io.base import DataCatalog, Reader
+from xmetai_evaluation.io.base import DataCatalog, Reader, hdf5_guard
 
 DEFAULT_GRIB_FILTERS: Dict[str, Dict[str, Any]] = {
     "z500": {"shortName": "gh", "typeOfLevel": "isobaricInhPa", "level": 500},
@@ -189,7 +189,8 @@ class ClimatologyReader(Reader):
                 ) as source:
                     dataset = source.load()
             else:
-                with xr.open_dataset(path) as source:
+                # 非 cfgrib 分支就是 HDF5 存储，得和别的线程排队（base.hdf5_guard）
+                with hdf5_guard(self.engine), xr.open_dataset(path) as source:
                     dataset = source.load()
                 if name not in dataset.data_vars:
                     continue
