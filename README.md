@@ -124,6 +124,27 @@ xmetai-eval --config weather_rmse_single_multi
 `configs/weather_rmse_single_multi.py` 的 `MODELS` 表；每个模型各落各的
 `output_dir`，产物与单模型配置完全同构，下游报告与对拍不用改。
 
+### 分纬度带评估（regions）
+
+格点协议（`grid_valid_time`）支持在 `options` 里声明纬度带，逐带出分：
+
+```python
+options={
+    "sample_by": "init_lead",
+    "regions": {
+        "tropics": {"lat_min": -20, "lat_max": 20},
+        "nh_extratropics": {"lat_min": 20, "lat_max": 90},
+    },
+}
+```
+
+每个 (起报, 时效) 样本除全球行外再逐带各出一行，长表里用 `region` 列区分
+（全球行该列为空）。实现口径：带边界是闭区间；数据不裁、只把 `valid_mask`
+收缩到带内，标量指标（RMSE/Bias/ACC/活跃度等按掩码加权或筛点的）逐带出分；
+谱类（`zonal_spectrum`）与 FSS 需要**完整空间场**，不分区、只出全球行。不写
+`regions` 键则完全回到只有全球行的老行为。`weather_rmse_single_fuxi` 已启用
+经典三分带（热带 ±20° / 两半球中高纬），可作模板。
+
 ## 执行策略（并发与数据加载）
 
 评测的本质是三个数据集做差：**预报（驱动集）、观测（配对集）、参考（辅助集）**。

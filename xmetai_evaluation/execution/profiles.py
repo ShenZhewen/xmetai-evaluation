@@ -61,6 +61,17 @@ def _profile_for_name(name: str) -> ResourceProfile:
     return ResourceProfile(compute_class="light")
 
 
+def needs_full_field(metric: Any) -> bool:
+    """该指标是否必须拿完整未插值场。
+
+    分纬度带评估的 region 样本对这类指标没有意义——谱/FSS 在掩掉的子区域
+    上算出来的不是同一个物理量——执行层用这个钩子把它们跳过，只在全球
+    样本上算。
+    """
+    name = str(getattr(metric, "name", "") or "")
+    return _profile_for_name(name).needs_full_field
+
+
 def union_profile(metrics: Iterable[Any]) -> ResourceProfile:
     """一段里全部指标的联合画像（按指标实例算，不猜配置）。
 

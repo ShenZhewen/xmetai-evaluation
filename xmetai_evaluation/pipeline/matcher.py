@@ -166,6 +166,35 @@ def narrow_batch(batch: EvaluationBatch, variable: str) -> Optional[EvaluationBa
     )
 
 
+def restrict_to_latitude_band(
+    batch: EvaluationBatch, lat_min: float, lat_max: float
+) -> EvaluationBatch:
+    """把批次的 valid_mask 收缩到 [lat_min, lat_max] 内（闭区间）。
+
+    分纬度带评估用。数据一个格点不裁、只挡掩码：标量指标（rmse/bias/
+    acc/activity）全部按 valid_mask 加权或筛点，带外的格点自然不进任何
+    统计量。要完整场的指标（谱/FSS）在执行层就被跳过 region 样本，
+    不会走到这里。
+
+    必须在 ``narrow_batch`` **之后**调用：收窄会按单变量重算 valid_mask，
+    先叠的带掩码会被重算覆盖掉。
+    """
+    mask = batch.valid_mask
+    if mask is None or mask.dims[-2:] != ("lat", "lon") or "lat" not in mask.coords:
+        raise AlignmentError(
+            "分纬度带评估需要带 lat/lon 坐标的格点有效掩码，"
+            f"当前掩码维度是 {tuple(mask.dims) if mask is not None else None}"
+        )
+    lat = mask.coords["lat"].values
+    inside = (lat >= lat_min) & (lat <= lat_max)
+    band = xr.DataArray(
+        np.broadcast_to(inside[:, None], mask.shape[-2:]),
+        coords={"lat": lat, "lon": mask.coords["lon"].values},
+        dims=["lat", "lon"],
+    )
+    return replace(batch, valid_mask=mask & band)
+
+
 class Matcher:
     """
     预报与观测配对器

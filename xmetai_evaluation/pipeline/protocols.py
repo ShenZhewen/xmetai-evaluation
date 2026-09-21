@@ -585,6 +585,39 @@ class GridValidTimeProtocol(Protocol):
         #: 需要成员场的指标所路由到的变量；空表示这次评测不取成员
         self.member_vars: List[str] = []
         self.batches: Dict[Any, EvaluationBatch] = {}
+        #: 分纬度带评估：[(带名, 南界, 北界)]，来自 options["regions"]；
+        #: 空 = 不分区，输出与没有这个能力之前逐行一致
+        self.regions = self._parse_regions(spec.options.get("regions"))
+
+    @staticmethod
+    def _parse_regions(raw: Any) -> List[Tuple[str, float, float]]:
+        """解析 ``options["regions"] = {带名: {"lat_min": 南界, "lat_max": 北界}}``。
+
+        带名进结果坐标（长表里现成的 ``region`` 列）、边界闭区间。只有显式
+        声明才分区——不提供任何"预设带"，要哪几条带写在配置里一目了然。
+        """
+        if not raw:
+            return []
+        if not isinstance(raw, dict):
+            raise ConfigError(
+                "regions 必须是 {带名: {'lat_min': 南界, 'lat_max': 北界}} 字典，"
+                f"收到 {type(raw).__name__}"
+            )
+        parsed: List[Tuple[str, float, float]] = []
+        for name, bounds in raw.items():
+            try:
+                lat_min = float(bounds["lat_min"])  # type: ignore[index]
+                lat_max = float(bounds["lat_max"])  # type: ignore[index]
+            except (KeyError, TypeError, ValueError) as exc:
+                raise ConfigError(
+                    f"纬度带 {name!r} 需要数值 lat_min / lat_max，收到 {bounds!r}"
+                ) from exc
+            if lat_min >= lat_max:
+                raise ConfigError(
+                    f"纬度带 {name!r} 的 lat_min({lat_min}) 必须小于 lat_max({lat_max})"
+                )
+            parsed.append((str(name), lat_min, lat_max))
+        return parsed
 
     def prepare(self, context: PipelineContext) -> None:
         forecast = context.forecast
@@ -830,24 +863,40 @@ class GridValidTimeProtocol(Protocol):
         for key in sorted(self.batches):
             batch = self.batches[key]
             record = batch.sample_keys[0] if batch.sample_keys else {}
-            yield Sample(
-                key=(
-                    ("init_lead", key[0], key[1])
-                    if self._init_lead
-                    else ("valid_time", key)
+            base_key = (
+                ("init_lead", key[0], key[1])
+                if self._init_lead
+                else ("valid_time", key)
+            )
+            base_coordinates = {
+                "variable": variable,
+                # 键是 (起报, 时效) 时有效时刻只能从记录里取
+                "valid_time": (
+                    record.get("valid_time", "") if self._init_lead else key
                 ),
-                coordinates={
-                    "variable": variable,
-                    # 键是 (起报, 时效) 时有效时刻只能从记录里取
-                    "valid_time": (
-                        record.get("valid_time", "") if self._init_lead else key
-                    ),
-                    "init_time": record.get("init_time", ""),
-                    "lead_h": record.get("lead_h", ""),
-                    "sample_unit": batch.sample_dim,
-                },
+                "init_time": record.get("init_time", ""),
+                "lead_h": record.get("lead_h", ""),
+                "sample_unit": batch.sample_dim,
+            }
+            # 全球行不带 region 坐标——不分区时的输出行和这个能力出现之前逐行一致
+            yield Sample(
+                key=base_key,
+                coordinates=base_coordinates,
                 payload={"batch_key": key},
             )
+            # 每个纬度带再各出一个样本：键尾追加带名，region 进结果坐标
+            # （长表现成的 region 列）。带掩码不在 build_batch 里叠——
+            # 变量路由的指标会先过 narrow_batch、valid_mask 会被重算——
+            # 执行层在收窄**之后**按 payload 里的 region_bounds 叠掩码。
+            for name, lat_min, lat_max in self.regions:
+                yield Sample(
+                    key=base_key + (name,),
+                    coordinates={**base_coordinates, "region": name},
+                    payload={
+                        "batch_key": key,
+                        "region_bounds": (lat_min, lat_max),
+                    },
+                )
 
     def build_batch(
         self, context: PipelineContext, sample: Sample
@@ -886,6 +935,11 @@ class GridValidTimeProtocol(Protocol):
         else:
             valid_times = sorted(self.batches)
         summary: Dict[str, Any] = {"valid_times": valid_times}
+        if self.regions:
+            summary["regions"] = [
+                f"{name}[{lat_min:g}, {lat_max:g}]"
+                for name, lat_min, lat_max in self.regions
+            ]
         for name, bundle in (
             ("forecast", self.forecast_bundle),
             ("observation", self.observation_bundle),

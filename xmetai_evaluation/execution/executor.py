@@ -37,8 +37,9 @@ from tqdm import tqdm
 
 from xmetai_evaluation.components import register_builtin_components
 from xmetai_evaluation.core.errors import ConfigError, EvaluationError, MetricError
+from xmetai_evaluation.execution.profiles import needs_full_field
 from xmetai_evaluation.core.registry import ComponentType, get_registry
-from xmetai_evaluation.pipeline.matcher import narrow_batch
+from xmetai_evaluation.pipeline.matcher import narrow_batch, restrict_to_latitude_band
 from xmetai_evaluation.pipeline.protocols import PipelineContext
 from xmetai_evaluation.pipeline.spec import PipelineSpec
 
@@ -229,13 +230,23 @@ def _sample_loop(protocol: Any, context: PipelineContext, runs: List[MetricRun])
         try:
             batch = protocol.build_batch(context, sample)
             if batch is not None:
+                # 分纬度带的 region 样本：谱/FSS 这类要完整场的指标跳过
+                # （全球样本上照常算），标量指标在收窄之后叠带掩码——
+                # narrow_batch 会重算 valid_mask，先叠会被覆盖掉
+                region_bounds = sample.payload.get("region_bounds")
                 for index, run in enumerate(runs):
+                    if region_bounds is not None and needs_full_field(run.metric):
+                        continue
                     # 路由到某个变量的指标只看该变量；数据源缺它就跳过这个 run
                     target = (
                         narrow_batch(batch, run.variable) if run.variable else batch
                     )
                     if target is None:
                         continue
+                    if region_bounds is not None:
+                        target = restrict_to_latitude_band(
+                            target, region_bounds[0], region_bounds[1]
+                        )
                     run.metric.validate(target)
                     states.setdefault((index, sample.key), []).append(
                         run.metric.accumulate(target)
