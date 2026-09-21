@@ -1,19 +1,23 @@
 # -*- coding: utf-8 -*-
-"""专项指标：Z500 活跃度比与纬向功率谱。
+"""专项指标：Z500 活跃度比、纬向功率谱与球谐带功率。
 
-口径与参考实现 ``ref/fdp/verify/verify/activity_spectrum_verifier.py`` 一致：
+口径与参考实现一致（逐项对齐，便于对拍）：
 
-* **活跃度比**：距平（场 − 气候态）的纬度加权标准差之比
-  ``AR = std_w(F−C) / std_w(O−C)``，权重 ``w = cos(lat)``，标准差为
-  "减加权均值"的加权标准差；
+* **活跃度比**：口径同 ``ref/fdp/verify/verify/activity_spectrum_verifier.py``
+  ——距平（场 − 气候态）的纬度加权标准差之比 ``AR = std_w(F−C) / std_w(O−C)``，
+  权重 ``w = cos(lat)``，标准差为"减加权均值"的加权标准差；
 * **功率谱**：对**原始场**做二维 FFT 得到纬向波数谱
   ``P(k) = Σ_l [A_t(l,k)² + B_t(l,k)²]``（按参考实现的等效 FFT 推导），
-  单边谱取 k=0..N/2，缺测用全场均值填充。
+  单边谱取 k=0..N/2，缺测用全场均值填充；
+* **球谐带功率**：口径同老仓 ``vfc/metrics/spectrum.py::spherical_band_power``
+  （等价参考 xmetai ``SphericalBandPowerLoss.band_power``）——associated
+  Legendre 递推 + Clenshaw-Curtis 求积的球谐展开，按**总波数**区间分带，
+  只对全球含极网格有定义（区域网格在这里被拦下，不是静默算错）。
 """
 
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import xarray as xr
@@ -33,6 +37,23 @@ from xmetai_evaluation.metrics.base import (
 )
 
 DEFAULT_MAX_WAVENUMBER = 30
+
+
+def _lat_from_batch(batch: EvaluationBatch, metric_name: str) -> np.ndarray:
+    """从 forecast 的坐标里取纬度（度）。谱类指标的加权/校验都靠它。"""
+    src = batch.forecast
+    if hasattr(src, "payload"):
+        src = src.payload
+    if isinstance(src, (xr.DataArray, xr.Dataset)):
+        lat = src.coords.get("lat")
+        if lat is not None:
+            return np.asarray(
+                lat.values if hasattr(lat, "values") else lat, dtype="f8"
+            )
+    raise MetricError(
+        f"{metric_name} 需要 forecast 携带 lat 坐标（用于纬度加权/网格校验）",
+        variable=metric_name,
+    )
 
 
 def _values(data: Any) -> np.ndarray:
@@ -393,19 +414,7 @@ class ZonalSpectrum(Metric):
 
     @staticmethod
     def _lat(batch: EvaluationBatch) -> np.ndarray:
-        src = batch.forecast
-        if hasattr(src, "payload"):
-            src = src.payload
-        if isinstance(src, (xr.DataArray, xr.Dataset)):
-            lat = src.coords.get("lat")
-            if lat is not None:
-                return np.asarray(
-                    lat.values if hasattr(lat, "values") else lat, dtype="f8"
-                )
-        raise MetricError(
-            "纬向谱需要 forecast 携带 lat 坐标（用于 cos 纬度加权）",
-            variable="zonal_spectrum",
-        )
+        return _lat_from_batch(batch, "zonal_spectrum")
 
     def _spectra(self, batch: EvaluationBatch):
         forecast = _values(batch.forecast)
@@ -415,7 +424,7 @@ class ZonalSpectrum(Metric):
                 f"纬向谱需要 (..., lat, lon) 场，实际 ndim={forecast.ndim}",
                 variable=self.name,
             )
-        lat = self._lat(batch)
+        lat = _lat_from_batch(batch, self.name)
         f = forecast.reshape(-1, forecast.shape[-2], forecast.shape[-1])
         o = observation.reshape(-1, observation.shape[-2], observation.shape[-1])
         forecast_psd = zonal_spectrum(f, lat).sum(axis=0)
@@ -478,4 +487,318 @@ class ZonalSpectrum(Metric):
             unit="1",  # 进长表的是无量纲的 power_ratio
             product_kind=self.PRODUCT_KIND,
             curve=curve,
+        )
+
+
+# --------------------------------------------------------------------------
+# 球谐带功率（自老仓 vfc/metrics/spectrum.py 移植，口径逐位对齐）
+# --------------------------------------------------------------------------
+
+#: 与参考 xmetai ForecastFidelity 保持一致的球谐总阶数分段。
+DEFAULT_SPHERICAL_BANDS: Tuple[Tuple[int, int], ...] = (
+    (1, 4), (5, 20), (21, 40), (41, 64), (65, 128),
+)
+
+
+class _SphericalBandPower:
+    """球谐带功率计算器（等价于参考 SphericalBandPowerLoss.band_power）。
+
+    数值代码自老仓 ``vfc/metrics/spectrum.py::_SphericalBandPower`` 逐行移植：
+    Clenshaw-Curtis 求积权重、稳定的 associated Legendre 三阶递推、
+    float32 基函数缓存。**不要"顺手优化"这里的精度/类型**——任何一位的
+    差别都会破坏与老档案的逐位对拍。
+    """
+
+    def __init__(self, nlat: int, nlon: int, bands: Sequence[Tuple[int, int]]):
+        self.nlat = int(nlat)
+        self.nlon = int(nlon)
+        self.bands = tuple((int(lo), int(hi)) for lo, hi in bands)
+        if not self.bands:
+            raise ValueError("bands must not be empty")
+        if any(lo < 0 or hi < lo for lo, hi in self.bands):
+            raise ValueError("invalid spectral band: %r" % (self.bands,))
+        self.lmax = self.bands[-1][1]
+        n = self.nlat - 1
+        if n < 2 or 2 * self.lmax >= n or self.lmax >= self.nlon // 2:
+            raise ValueError(
+                "grid too small for lmax=%d: nlat=%d nlon=%d"
+                % (self.lmax, self.nlat, self.nlon)
+            )
+
+        # Clenshaw-Curtis 求积权重，与参考实现一致。
+        theta = np.arange(self.nlat, dtype=np.float64) * (np.pi / n)
+        weights = np.zeros(self.nlat, dtype=np.float64)
+        if n % 2 == 0:
+            weights[[0, -1]] = 1.0 / (n * n - 1)
+        else:
+            weights[[0, -1]] = 1.0 / (n * n)
+        interior = np.ones(n - 1, dtype=np.float64)
+        for k in range(1, (n + 1) // 2):
+            interior -= 2.0 * np.cos(2.0 * k * theta[1:-1]) / (4.0 * k * k - 1.0)
+        if n % 2 == 0:
+            interior -= np.cos(n * theta[1:-1]) / (n * n - 1.0)
+        weights[1:-1] = 2.0 * interior / n
+        self.latitude_weights = (weights / 2.0).astype(np.float32)
+
+        # 稳定的 associated Legendre 递推。
+        basis = np.zeros((self.lmax + 1, self.lmax + 1, self.nlat),
+                         dtype=np.float64)
+        basis[0, 0] = 1.0 / np.sqrt(4.0 * np.pi)
+        x = np.cos(theta)
+        sint = np.sin(theta)
+        for m in range(self.lmax + 1):
+            if m:
+                basis[m, m] = (
+                    -np.sqrt((2.0 * m + 1.0) / (2.0 * m))
+                    * sint * basis[m - 1, m - 1]
+                )
+            if m < self.lmax:
+                basis[m + 1, m] = np.sqrt(2.0 * m + 3.0) * x * basis[m, m]
+            for degree in range(m + 2, self.lmax + 1):
+                a = np.sqrt(
+                    (4.0 * degree * degree - 1.0)
+                    / (degree * degree - m * m)
+                )
+                b = np.sqrt(
+                    ((degree - 1) ** 2 - m * m)
+                    / (4.0 * (degree - 1) ** 2 - 1.0)
+                )
+                basis[degree, m] = a * (
+                    x * basis[degree - 1, m] - b * basis[degree - 2, m]
+                )
+        self.weighted_basis = (basis * weights).astype(np.float32)
+        multiplicity = np.full(self.lmax + 1, 2.0, dtype=np.float32)
+        multiplicity[0] = 1.0
+        self.multiplicity = multiplicity
+
+    def power(self, field, block: int = 16):
+        """(..., nlat, nlon) -> (..., nband) 球谐带能量。"""
+        arr = np.asarray(field, dtype=np.float32)
+        if arr.ndim < 2:
+            raise ValueError("field must have at least 2 dimensions")
+        if tuple(arr.shape[-2:]) != (self.nlat, self.nlon):
+            raise ValueError(
+                "expected field grid (%d, %d), got %r"
+                % (self.nlat, self.nlon, tuple(arr.shape[-2:]))
+            )
+        out_shape = tuple(arr.shape[:-2])
+        x = arr.reshape(-1, self.nlat, self.nlon)
+        nfield = x.shape[0]
+        chunks = []
+        blk = max(1, int(block))
+        for i0 in range(0, nfield, blk):
+            xb = x[i0:i0 + blk]
+            mean = (xb.mean(axis=-1) * self.latitude_weights).sum(axis=-1)
+            xb = xb - mean[:, None, None]
+            # np.fft 无 forward norm，除以 nlon 等价于 norm="forward"。
+            fft = np.fft.rfft(xb, axis=-1) / float(self.nlon)
+            fft = fft[..., :self.lmax + 1]
+            real = np.einsum(
+                "lmh,nhm->nlm", self.weighted_basis, fft.real,
+                optimize=True,
+            )
+            imag = np.einsum(
+                "lmh,nhm->nlm", self.weighted_basis, fft.imag,
+                optimize=True,
+            )
+            power = (
+                (real * real + imag * imag) * self.multiplicity[None, None, :]
+            ).sum(axis=-1) * (2.0 * np.pi) ** 2
+            bands = np.stack(
+                [power[:, lo:hi + 1].sum(axis=-1)
+                 for lo, hi in self.bands],
+                axis=-1,
+            )
+            chunks.append(bands)
+        result = np.concatenate(chunks, axis=0).reshape(
+            out_shape + (len(self.bands),)
+        )
+        return result
+
+
+#: (nlat, nlon, bands) -> 计算器缓存：基函数是网格形状的纯函数，整 run 复用。
+_SPH_CACHE: Dict[Tuple[int, int, Tuple[Tuple[int, int], ...]], _SphericalBandPower] = {}
+
+
+def validate_global_lat(lat, atol: float = 1e-6) -> None:
+    """校验「全球、等距、含南北极」的纬度网格，不满足则抛 ValueError。
+
+    球谐展开只对全球球面有定义：连带勒让德函数只在整个纬圈上正交，把
+    纬度截断成区域后 _SphericalBandPower 仍会把它当成"从极到极"的球面
+    来算，结果是错的且不会报错。因此这里显式拒绝区域/非等距/不含极点
+    的 lat（调用方应改用 zonal 谱）。
+
+    带功率对纬度「行序翻转」是恒等的
+    （P_lm(cos(pi-theta)) = (-1)^(l+m) P_lm(cos(theta))，模平方不变），
+    所以不限制纬度升序还是降序。
+    """
+    lat = np.asarray(lat, dtype=np.float64)
+    if lat.ndim != 1 or lat.size < 3 or not np.all(np.isfinite(lat)):
+        raise ValueError("lat 必须是长度>=3 的一维有限数组")
+    if np.max(np.abs(lat)) > 90.0 + atol:
+        raise ValueError(
+            "lat 必须是「度」且 |lat| <= 90；当前 max|lat|=%.6f（可能传了弧度？）"
+            % np.max(np.abs(lat)))
+    d = np.diff(lat)
+    if d.size < 2 or not np.allclose(d, d.mean(), rtol=1e-6, atol=atol):
+        raise ValueError("lat 必须是等距网格（dlat 不是常数）")
+    global_ends = (
+        (abs(lat[0] + 90.0) <= atol and abs(lat[-1] - 90.0) <= atol)
+        or (abs(lat[0] - 90.0) <= atol and abs(lat[-1] + 90.0) <= atol)
+    )
+    if not global_ends:
+        raise ValueError(
+            "球谐带功率要求全球含极网格（-90..+90）；当前 lat=[%.4f, %.4f]"
+            "（n=%d）。区域/bbox 检验请只用 zonal 谱。"
+            % (lat[0], lat[-1], lat.size))
+
+
+def spherical_band_power(field, lat=None, bands=DEFAULT_SPHERICAL_BANDS, block: int = 16):
+    """球谐带功率（spherical band power），返回 (..., nband)。
+
+    与 zonal_spectrum 不同：不是逐纬圈 1D FFT，而是球谐展开的带功率。
+    公式与老仓 ``vfc/metrics/spectrum.py::spherical_band_power``（即参考
+    xmetai ``SphericalBandPowerLoss.band_power``）逐位一致：去全球面积加权
+    平均、经向 rFFT、associated Legendre basis 展开、按球谐总阶数区间求和。
+
+    ``lat``（度）必传：既做全球网格校验，也防止把区域场喂进球谐展开。
+    """
+    arr = np.asarray(field)
+    if arr.ndim < 2:
+        raise ValueError("field must have at least 2 dimensions")
+    if lat is None:
+        raise ValueError(
+            "spherical_band_power 需要 lat（度）来校验全球网格；请传 lat=file.lat")
+    lat_arr = np.asarray(lat, dtype=np.float64)
+    if lat_arr.size != arr.shape[-2]:
+        raise ValueError(
+            "lat 长度 %d != field 纬度维 %d" % (lat_arr.size, arr.shape[-2]))
+    validate_global_lat(lat_arr)          # 区域/非全球 -> raise
+    bands0 = tuple((int(lo), int(hi)) for lo, hi in bands)
+    key = (int(arr.shape[-2]), int(arr.shape[-1]), bands0)
+    obj = _SPH_CACHE.get(key)
+    if obj is None:
+        obj = _SphericalBandPower(key[0], key[1], bands0)
+        _SPH_CACHE[key] = obj
+    return obj.power(arr, block=block)
+
+
+class SphericalBands(Metric):
+    """球谐带功率（总波数分带）：预报/观测两侧 + 带内功率比。
+
+    只对**全球含极网格**有定义（区域网格在装配期报错，不是静默算错——
+    球谐基函数只在全球球面上正交）。带边界是总波数的闭区间，缺省沿用
+    老仓分段 (1,4)/(5,20)/(21,40)/(41,64)/(65,128)。
+
+    输出走长表：每带一组 ``spherical_pred / spherical_obs / spherical_ratio``
+    行，带名（如 ``1_4``）落 ``group`` 列——对标老仓
+    ``spherical_bands_<date>_<var>.csv`` 的
+    ``spherical_{pred|obs|ratio}_{lo}_{hi}`` 列契约，透视即得。
+    """
+
+    PRODUCT_KIND = "specialized"
+
+    def __init__(self, bands=None, block: int = 16, params=None):
+        super().__init__(name="spherical_bands", version="1.0.0", params=params or {})
+        self.bands = tuple(
+            (int(lo), int(hi)) for lo, hi in (bands or DEFAULT_SPHERICAL_BANDS)
+        )
+        self.block = int(block)
+
+    def requirements(self) -> MetricRequirements:
+        return MetricRequirements(
+            product_type=ProductType.DETERMINISTIC_FIELD,
+            variables=["*"],
+        )
+
+    def _band_powers(self, batch: EvaluationBatch):
+        forecast = _values(batch.forecast)
+        observation = _values(batch.observation)
+        if forecast.ndim < 2 or observation.ndim < 2:
+            raise MetricError(
+                f"球谐带功率需要 (..., lat, lon) 场，实际 ndim={forecast.ndim}",
+                variable=self.name,
+            )
+        lat = _lat_from_batch(batch, self.name)
+        f = forecast.reshape(-1, forecast.shape[-2], forecast.shape[-1])
+        o = observation.reshape(-1, observation.shape[-2], observation.shape[-1])
+        try:
+            forecast_bands = spherical_band_power(
+                f, lat=lat, bands=self.bands, block=self.block
+            )
+            observation_bands = spherical_band_power(
+                o, lat=lat, bands=self.bands, block=self.block
+            )
+        except ValueError as exc:
+            # 区域/非全球网格：配置错误，必须立刻暴露（老仓批量路径是降级
+            # 只出 zonal，这里用户显式点名了球谐，静默降级等于丢结果）
+            raise MetricError(f"球谐带功率：{exc}", variable=self.name) from exc
+        return forecast_bands, observation_bands, int(f.shape[0])
+
+    def accumulate(self, batch: EvaluationBatch) -> MetricState:
+        forecast_bands, observation_bands, n_samples = self._band_powers(batch)
+        return MetricState(
+            metric_name=self.name,
+            metric_version=self.version,
+            data={
+                "forecast_bands": np.asarray(forecast_bands.sum(axis=0), dtype="f8"),
+                "observation_bands": np.asarray(observation_bands.sum(axis=0), dtype="f8"),
+                "n_samples": n_samples,
+            },
+            n_accumulated=1,
+        )
+
+    def merge(self, states: List[MetricState]) -> MetricState:
+        if not states:
+            raise MetricError("Cannot merge empty states list")
+        first = states[0]
+        forecast_total = np.array(first.data["forecast_bands"], dtype="f8")
+        observation_total = np.array(first.data["observation_bands"], dtype="f8")
+        for state in states[1:]:
+            if state.metric_name != first.metric_name:
+                raise MetricError(
+                    f"Cannot merge states from different metrics: "
+                    f"{first.metric_name} vs {state.metric_name}",
+                    variable=self.name,
+                )
+            forecast_total = forecast_total + state.data["forecast_bands"]
+            observation_total = observation_total + state.data["observation_bands"]
+        return MetricState(
+            metric_name=self.name,
+            metric_version=self.version,
+            data={
+                "forecast_bands": forecast_total,
+                "observation_bands": observation_total,
+                "n_samples": sum(state.data["n_samples"] for state in states),
+            },
+            n_accumulated=sum(state.n_accumulated for state in states),
+        )
+
+    def finalize(self, state: MetricState) -> MetricResult:
+        count = max(int(state.data["n_samples"]), 1)
+        forecast_bands = np.asarray(state.data["forecast_bands"], dtype="f8") / count
+        observation_bands = np.asarray(state.data["observation_bands"], dtype="f8") / count
+
+        value: Dict[str, Dict[str, float]] = {}
+        with np.errstate(divide="ignore", invalid="ignore"):
+            for (lo, hi), fp, op in zip(
+                self.bands, forecast_bands, observation_bands
+            ):
+                ratio = float(fp / op) if op > 0 else float("nan")
+                value[f"{lo}_{hi}"] = {
+                    "spherical_pred": float(fp),
+                    "spherical_obs": float(op),
+                    "spherical_ratio": ratio,
+                }
+
+        return MetricResult(
+            metric_name=self.name,
+            metric_version=self.version,
+            value=value,
+            status=ResultStatus.SUCCESS,
+            n_requested=count,
+            n_valid=count,
+            aggregation="spherical_band_power",
+            unit="1",  # 进长表的 ratio 无量纲；pred/obs 的功率单位随变量走
+            product_kind=self.PRODUCT_KIND,
         )

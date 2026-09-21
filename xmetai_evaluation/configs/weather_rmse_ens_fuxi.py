@@ -36,9 +36,11 @@ from xmetai_evaluation.configs.base import EvalConfig, metric_options_from_var_m
 
 VARS = ["z500"]
 
-# xu: --var-metrics（逐条转写；fa -> activity、spectrum -> zonal_spectrum）
+# xu: --var-metrics（逐条转写；fa -> activity、spectrum -> zonal_spectrum）。
+# spherical_bands 是 v2 补的球谐带功率（老仓 spherical_bands_<date>_<var>.csv
+# 契约），只对全球网格有定义，配了 regions 分带时它恒全球。
 VAR_METRICS = {
-    "z500": ["rmse", "crps", "acc", "activity", "zonal_spectrum"]
+    "z500": ["rmse", "crps", "acc", "activity", "zonal_spectrum", "spherical_bands"]
 }
 
 

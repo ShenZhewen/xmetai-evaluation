@@ -120,6 +120,11 @@ _SCORE_FIELDS: Dict[str, str] = {
     "obs_activity": "activity_observation",
     "fc_obs_bias": "activity_bias",
     "power_ratio": "spectrum_power_ratio",
+    # 球谐带功率（group 列带频带标签，如 "1_4"），列名对标老仓归档
+    # spherical_bands_*.csv 的 spherical_{pred|obs|ratio}_{lo}_{hi}
+    "spherical_pred": "spherical_band_power_forecast",
+    "spherical_obs": "spherical_band_power_observation",
+    "spherical_ratio": "spherical_band_power_ratio",
 }
 
 DETAIL_CELLS = ("hits", "misses", "false_alarms", "correct_negatives", "n_pairs")

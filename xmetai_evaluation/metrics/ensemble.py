@@ -156,12 +156,27 @@ class CRPS(Metric):
 
 
 class SpreadError(Metric):
-    """集合离散度-误差比（Spread / RMSE），同时给出 Spread 与集合平均 RMSE。"""
+    """集合离散度-误差比（Spread / RMSE），同时给出 Spread 与集合平均 RMSE。
+
+    spread 的归一口径（ddof）可配：老仓自己就不一致——vfc ``regr_ens.py``
+    用 ddof=0（除以成员数 N），FDP ``ensemble_verifier.py`` 用 ddof=1（除以
+    M−1，无偏）。默认 1（FDP 口径、与既有输出逐位一致）；要对拍 vfc 档案
+    的 spread 就在 metric_options 里写 ``"spread_error": {"ddof": 0}``。
+    两口径差 √((M−1)/M)，M=51 时约 1%。
+    """
 
     PRODUCT_KIND = "ensemble"
 
-    def __init__(self, params: Dict[str, Any] = None):
+    def __init__(self, ddof: int = 1, params: Dict[str, Any] = None):
         super().__init__(name="spread_error", version="1.0.0", params=params or {})
+        ddof = int(ddof)
+        if ddof not in (0, 1):
+            raise MetricError(
+                f"spread_error 的 ddof 只能取 0（除以 N，vfc 口径）或 "
+                f"1（除以 M-1，FDP 口径），收到 {ddof!r}",
+                variable="spread_error",
+            )
+        self.ddof = ddof
 
     def requirements(self) -> MetricRequirements:
         return MetricRequirements(
@@ -244,10 +259,9 @@ class SpreadError(Metric):
             )
 
         spread = float("nan")
-        if member_count > 1:
-            spread = float(
-                np.sqrt(state.data["weighted_spread"] / (weights_sum * (member_count - 1)))
-            )
+        denominator = weights_sum * (member_count - self.ddof)
+        if denominator > 0:
+            spread = float(np.sqrt(state.data["weighted_spread"] / denominator))
         rmse = float(np.sqrt(state.data["weighted_error"] / weights_sum))
         ratio = float(spread / rmse) if (np.isfinite(spread) and rmse > 0) else float("nan")
 

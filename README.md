@@ -141,7 +141,8 @@ options={
 每个 (起报, 时效) 样本除全球行外再逐带各出一行，长表里用 `region` 列区分
 （全球行该列为空）。实现口径：带边界是闭区间；数据不裁、只把 `valid_mask`
 收缩到带内，标量指标（RMSE/Bias/ACC/活跃度等按掩码加权或筛点的）逐带出分；
-谱类（`zonal_spectrum`）与 FSS 需要**完整空间场**，不分区、只出全球行。不写
+谱类（`zonal_spectrum`/`spherical_bands`/`spectrum`）与 FSS 需要**完整空间场**，
+不分区、只出全球行。不写
 `regions` 键则完全回到只有全球行的老行为。`weather_rmse_single_fuxi` 已启用
 经典三分带（热带 ±20° / 两半球中高纬），可作模板。
 
@@ -548,7 +549,7 @@ echo "已用: $(cat /sys/fs/cgroup/memory.current)"
 |---|---|
 | Reader | `fuxi`、`fuxi_ens`、`fengqing`（及 `fuxi_phys`/`fuxi_ens_phys`/`fengqing_phys` 单位变体）、`cra`、`era5_zarr`、`station`（`diamond_station` 别名）、`climatology`、`daily_climatology`、`ref_probability` |
 | Transform | `grid_to_station`、`time_window_accumulator`、`ensemble_mean` |
-| Metric | `rmse`、`bias`、`acc`、`acc_uncentered`、`ts_score`、`ensemble_probability`、`crps`、`spread_error`、`fss`、`activity`、`spectrum`、`zonal_spectrum` |
+| Metric | `rmse`、`bias`、`acc`、`acc_uncentered`、`ts_score`、`ensemble_probability`、`crps`、`spread_error`、`fss`、`activity`、`spectrum`、`zonal_spectrum`、`spherical_bands` |
 | Protocol | `station_valid_time`（插值到站点，按有效时刻配对）、`grid_valid_time`（插值到实况网格） |
 | Writer | `csv_long`（始终写出）、`coverage`、`details`、`json`、`categorical_wide`、`probability_wide` |
 
@@ -621,7 +622,7 @@ echo "已用: $(cat /sys/fs/cgroup/memory.current)"
 | `bias` | 平均误差（系统性偏差） | `Σw(f − o) / Σw` | 0 为无偏，>0 预报偏大 |
 | `acc` | 距平相关系数：预报距平场与实况距平场的（加权）相关 | 距平 = 场 − 气候态；默认 `centered`（距今平再减域加权均值，经典皮尔逊），FDP/WeatherBench2 的 uncentered 口径用 `acc_uncentered` | −1~1，越大越好；**缺气候态会用零场兜底、结果无意义**（行状态标 `partial`） |
 | `crps` | 连续排序概率评分：集合分布与实况的整体差异 | 闭式解，逐点只用有限成员，缺测成员不参与；不做非负截断 | 越小越好 |
-| `spread` | 集合离散度 | `sqrt(Σᵢ(mᵢ − m̄)² / (M − 1))` | 与 `rmse` 同量级才有意义 |
+| `spread` | 集合离散度 | `sqrt(Σᵢ(mᵢ − m̄)² / (M − ddof))`；`ddof` 可配（`metric_options["spread_error"]["ddof"]`）：1 = M−1 无偏（FDP 口径，默认），0 = 除以 N（vfc 口径，对拍 vfc 档案时用）——两口径差 √((M−1)/M)，M=51 时约 1% | 与 `rmse` 同量级才有意义 |
 | `spread_error_ratio` | 离散度-误差比 | `SPREAD / RMSE(集合平均场)` | ≈1 标定良好，<1 过度自信，>1 欠自信 |
 | `activity_ratio` | 活跃度比：预报的距平变化幅度相对实况 | `std(预报距平) / std(实况距平)`，面积加权 | <1 偏平滑（系统性偏弱），>1 偏噪；**缺气候态时无意义** |
 | `activity_forecast` | 预报距平标准差 | 同 `activity_ratio` 的分子 | 诊断用，与实况侧同看 |
@@ -629,6 +630,9 @@ echo "已用: $(cat /sys/fs/cgroup/memory.current)"
 | `activity_bias` | 活跃度偏差：预报距平标准差 − 实况距平标准差 | `std(预报距平) − std(实况距平)` | 0 为无偏，<0 预报偏平滑；单位同 `activity_forecast` |
 | `fss` | 邻域分数技巧评分：邻域平滑后再比「有/无」 | `1 − Σ(p_f − p_o)² / Σ(p_f² + p_o²)`，`p` 为邻域内超过阈值的格点占比 | 越大越好；窗口越大越接近随机基准，看技巧随尺度衰减 |
 | `spectrum_power_ratio` | 总功率比：预报能量相对实况 | 预报功率谱总量 / 实况功率谱总量；逐波数曲线由 `spectrum` writer 另出 | 1 表示总能量不偏；单看总量会掩盖分布失真，需与谱曲线同看 |
+| `spherical_band_power_forecast` | 球谐带功率（预报侧）：按**总波数**分带的球谐能量 | 老仓 `vfc/metrics/spectrum.py` 同口径（Legendre 递推 + Clenshaw-Curtis 积分，逐位移植）；带边界 `bands` 可配，默认 (1,4)/(5,20)/(21,40)/(41,64)/(65,128)，带名落 `group` 列 | 谱能量随尺度的分布，与实况侧同看 |
+| `spherical_band_power_observation` | 球谐带功率（实况侧） | 同上 | 同上 |
+| `spherical_band_power_ratio` | 球谐带功率比 | 预报带功率 / 实况带功率，逐带一行 | ≈1 标定良好；小波数带偏低 = 大尺度系统性衰减，大波数带偏高 = 噪声过剩 |
 
 几个读表要点：
 
@@ -638,6 +642,11 @@ echo "已用: $(cat /sys/fs/cgroup/memory.current)"
   且会被 `categorical_wide` / `probability_wide` 各自透视成表头列。
   活跃度的四个量（`activity_ratio`/`activity_forecast`/`activity_observation`/`activity_bias`）
   都是标量，**都在长表里**。
+- **球谐带功率直接进长表**（每样本每带 3 行，带名在 `group` 列，对标老仓
+  `spherical_bands_<date>_<var>.csv` 的列契约），不需要 `spectrum` writer；
+  分带边界在 `metric_options["spherical_bands"]["bands"]` 配（元组列表）。
+  它只对全球含极网格有定义——区域/非全球网格在指标层报 `MetricError`，
+  配了 `regions` 分带时它恒全球。
 - **逐波数谱曲线长表和明细表都不进**，由 `spectrum` writer 出成两张宽 CSV
   （对标参考实现 `det_summary_spectrum_{var}.csv` / `spectrum_{init}_{var}.csv`）：
   `diagnostics/spectrum_{var}.csv` 是全体样本均值曲线，

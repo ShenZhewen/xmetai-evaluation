@@ -298,10 +298,10 @@ def _metric_crps(**params):
     return CRPS(params)
 
 
-def _metric_spread_error(**params):
+def _metric_spread_error(ddof: int = 1, **params):
     from xmetai_evaluation.metrics.ensemble import SpreadError
 
-    return SpreadError(params)
+    return SpreadError(ddof=int(ddof), params=params)
 
 
 def _metric_fss(thresholds: Optional[List[Any]] = None, windows=None, **params):
@@ -330,6 +330,12 @@ def _metric_zonal_spectrum(max_wavenumber: int = 30, **params):
     from xmetai_evaluation.metrics.specialized import ZonalSpectrum
 
     return ZonalSpectrum(max_wavenumber=int(max_wavenumber), params=params)
+
+
+def _metric_spherical_bands(bands=None, block: int = 16, **params):
+    from xmetai_evaluation.metrics.specialized import SphericalBands
+
+    return SphericalBands(bands=bands, block=int(block), params=params)
 
 
 # --------------------------------------------------------------------------
@@ -626,7 +632,8 @@ def _register_all() -> None:
     )
     register_metric("crps", "1.0.0", _metric_crps, "集合 CRPS（纬度加权闭式解）")
     register_metric(
-        "spread_error", "1.0.0", _metric_spread_error, "集合离散度-误差比（含 Spread 与 RMSE）"
+        "spread_error", "1.0.0", _metric_spread_error,
+        "集合离散度-误差比（含 Spread 与 RMSE；ddof=0 vfc 口径 / 1 FDP 口径）",
     )
     register_metric(
         "fss", "1.0.0", _metric_fss, "邻域分数技巧评分（空间检验，需网格场）"
@@ -642,6 +649,12 @@ def _register_all() -> None:
         "1.0.0",
         _metric_zonal_spectrum,
         "纬向功率谱（去纬向均值 rfft，cos 纬度加权）",
+    )
+    register_metric(
+        "spherical_bands",
+        "1.0.0",
+        _metric_spherical_bands,
+        "球谐带功率（总波数分带，仅全球含极网格；bands 配带边界）",
     )
 
     register_protocol(

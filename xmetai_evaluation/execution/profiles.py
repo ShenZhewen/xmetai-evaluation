@@ -24,7 +24,9 @@ _HEAVY_METRICS = frozenset(
 )
 
 #: 需要完整空间场的指标（不能按站点子集 / 插值后再算）
-_FULL_FIELD_METRICS = frozenset({"spectrum", "zonal_spectrum", "fss"})
+_FULL_FIELD_METRICS = frozenset(
+    {"spectrum", "zonal_spectrum", "spherical_bands", "fss"}
+)
 
 
 @dataclass(frozen=True)
