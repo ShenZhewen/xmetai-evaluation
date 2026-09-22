@@ -16,10 +16,9 @@ from xmetai_evaluation.configs.base import EvalConfig, metric_options_from_var_m
 # ── 要素表 ────────────────────────────────────────────────────────────────
 # 逐个变量配对出分。可选值 = 两边 reader 布局里都有的名字（预报侧见
 # io/layouts.py 的 FUXI_ENS_PHYS_LAYOUT，观测侧见 ERA5_ZARR_LAYOUT）。
-VARS = ["z500"]
 
 # 全量表（正式跑用，替换上面一行）。ws200 现合成，见 docstring：
-# VARS = ["z500", "msl", "u200", "v200", "ws200"]
+VARS = ["z500", "msl", "u200", "v200", "ws200"]
 
 # ── 逐变量指标表 ──────────────────────────────────────────────────────────
 # 每个变量点名的指标各出一行分。可用指标（components.py 注册表，完整说明
@@ -40,20 +39,17 @@ VARS = ["z500"]
 # ⚠ 每个用到的指标都必须点到某组 variables 下（漏点名的会拿到整批多变量
 #   数据，single_variable 直接报错——这是框架故意的，防静默出假数）。
 # ⚠ crps 只路由给 z500（xu 也只对它算；spread 老仓是全变量出的）。
+
+
+# 全量表（正式跑用，替换上面一块）：
 VAR_METRICS = {
     "z500": ["rmse", "crps", "spread_error", "acc", "activity",
              "zonal_spectrum", "spherical_bands"],
+    "msl": ["rmse", "spread_error", "acc"],
+    "u200": ["rmse", "spread_error", "activity", "zonal_spectrum", "spherical_bands"],
+    "v200": ["rmse", "spread_error", "activity", "zonal_spectrum", "spherical_bands"],
+    "ws200": ["rmse", "spread_error", "activity", "zonal_spectrum", "spherical_bands"],
 }
-
-# 全量表（正式跑用，替换上面一块）：
-# VAR_METRICS = {
-#     "z500": ["rmse", "crps", "spread_error", "acc", "activity",
-#              "zonal_spectrum", "spherical_bands"],
-#     "msl": ["rmse", "spread_error", "acc"],
-#     "u200": ["rmse", "spread_error", "activity", "zonal_spectrum", "spherical_bands"],
-#     "v200": ["rmse", "spread_error", "activity", "zonal_spectrum", "spherical_bands"],
-#     "ws200": ["rmse", "spread_error", "activity", "zonal_spectrum", "spherical_bands"],
-# }
 
 METRIC_OPTIONS = metric_options_from_var_metrics(VAR_METRICS)
 # acc 用哪种口径：True = 经典皮尔逊（距平去均值再相关）；False = uncentered

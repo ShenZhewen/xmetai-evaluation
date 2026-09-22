@@ -15,16 +15,12 @@ import os
 
 from xmetai_evaluation.configs.base import EvalConfig, metric_options_from_var_metrics
 
-# ── 要素表 ────────────────────────────────────────────────────────────────
-# 逐个变量配对出分。可选值 = 两边 reader 布局里都有的名字（预报侧见
-# io/layouts.py 的 FUXI_PHYS_LAYOUT，观测侧见 ERA5_ZARR_LAYOUT）。
-VARS = ["z500"]
 
 # 全量表（正式跑用，替换上面一行）。ws850 现合成、ws10m 实况直取，见 docstring：
-# VARS = [
-#     "z500", "q700", "t700", "t2m", "t850", "msl",
-#     "u850", "v850", "u10m", "v10m", "ws10m", "ws850",
-# ]
+VARS = [
+    "z500", "q700", "t700", "t2m", "t850", "msl",
+    "u850", "v850", "u10m", "v10m", "ws10m", "ws850",
+]
 
 # ── 逐变量指标表 ──────────────────────────────────────────────────────────
 # 每个变量点名的指标各出一行分。可用指标（components.py 注册表，完整说明
@@ -40,23 +36,20 @@ VARS = ["z500"]
 #   ts_score / fss / ensemble_probability  分类/空间/概率族（本流程不用）
 # ⚠ 每个用到的指标都必须点到某组 variables 下（漏点名的会拿到整批多变量
 #   数据，single_variable 直接报错——这是框架故意的，防静默出假数）。
-VAR_METRICS = {
-    "z500": ["rmse", "zonal_spectrum", "spherical_bands", "acc", "activity"],
-}
 
 # 全量表（正式跑用，替换上面一块）：
-# VAR_METRICS = {
-#     "z500": ["rmse", "zonal_spectrum", "spherical_bands", "acc", "activity"],
-#     "q700": ["rmse"],
-#     "t700": ["rmse", "zonal_spectrum", "spherical_bands"],
-#     "t2m": ["rmse", "zonal_spectrum", "spherical_bands"],
-#     "t850": ["rmse"],
-#     "msl": ["rmse", "zonal_spectrum", "spherical_bands"],
-#     "u850": ["rmse", "activity", "zonal_spectrum", "spherical_bands"],
-#     "v850": ["rmse", "activity", "zonal_spectrum", "spherical_bands"],
-#     "u10m": ["rmse", "activity"],
-#     "v10m": ["rmse", "activity"],
-# }
+VAR_METRICS = {
+    "z500": ["rmse", "zonal_spectrum", "spherical_bands", "acc", "activity"],
+    "q700": ["rmse"],
+    "t700": ["rmse", "zonal_spectrum", "spherical_bands"],
+    "t2m": ["rmse", "zonal_spectrum", "spherical_bands"],
+    "t850": ["rmse"],
+    "msl": ["rmse", "zonal_spectrum", "spherical_bands"],
+    "u850": ["rmse", "activity", "zonal_spectrum", "spherical_bands"],
+    "v850": ["rmse", "activity", "zonal_spectrum", "spherical_bands"],
+    "u10m": ["rmse", "activity"],
+    "v10m": ["rmse", "activity"],
+}
 
 METRIC_OPTIONS = metric_options_from_var_metrics(VAR_METRICS)
 # acc 用哪种口径：True = 经典皮尔逊（距平去均值再相关）；False = uncentered
