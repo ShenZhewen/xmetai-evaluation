@@ -54,6 +54,8 @@ metadata:
 - "对比一下新模型和 FuXi 的 TS"
 - "连续场评测跑完了，看看 RMSE 随时效涨得怎么样"
 - "这个 ACC 衰减正常吗""活跃度比接近 1 吗""谱是不是失真了"
+- "**热带 春季 rmse 对比**""北半球夏季的 ACC 谁高"——从已出的长表里
+  切一个子集补进报告，**不重跑评测**，走 `references/rmse-batch-evaluation.md` §6
 
 ---
 
@@ -338,8 +340,9 @@ report/<模型>_<批次>/
 `REPORT.md` 按**论文实验章节**组织，每节都是「引导句 → 图表 → 小结」：
 
 ```
-评测对象与对比对象（模型 + 来源文件 + 可比性提示；有改动说明时一并写进报告头）
-一、结论摘要           带数值的规则化诊断 + 业务定性
+一、结论摘要           先交代评估对象与口径（模型 + 来源文件 + 可比性提示 + 记录条数 + 指标；
+                       有改动说明时一并写进这一节），再**一整段**带数值的规则化诊断，不列点，
+                       末尾业务定性与指标定义
 二、逐降水等级表现     表 1 + 图 1（阈值对比）→ 小结
 三、TS 随时效变化      图 2（曲线）图 3（热力图）+ 表 2 → 小结
 四、误差形态与偏差结构  图 4–7（POD / FAR / BIAS / 性能图）→ 小结
@@ -449,6 +452,8 @@ REPORT.md
 | 连续场里某变量没有某个指标 | 先看是不是**逐变量路由**没给它（`manifest` 的 `metric_options` 里每个指标带着自己的 `variables` 列表）；真缺数是结果里整行都没有，不是 `value` 为空 |
 | 连续场目录的 `scores.csv` 里 `level`/`region`/`threshold`/`window_h` 全空 | 这是 `grid_valid_time` 协议的默认口径（只有 `variable`/`sample_unit`/`unit`），**不是缺数据** |
 | 要判断谱是"总量正常但分布失真" | 只用 `spectrum_power_ratio` 看不出来（它是全波数求和后的比值）；用 `--spectrum-variable` / `--spectrum-lead` 出谱曲线看高波数段 |
+| 用户点名一个切片（"热带 春季 rmse 对比"） | 走 `references/rmse-batch-evaluation.md` **§6**：长表筛选 + 按既有口径重算，**不重跑评测**；季节按**起报时刻**切、DJF 按气象冬季归。渲染器不认这类请求，段落由智能体自己补 |
+| 用户要的季节/纬度带上，长表里没有现成一列 | 季节从 `init_time` 推（§6.2）；纬度带本来就有 `region` 列（空 = 全球）。两者都不需要改评测配置 |
 
 ---
 
@@ -474,6 +479,7 @@ REPORT.md
 - 降水诊断规则（样本量门槛、技巧分级、偏差/误差形态判读、建议触发条件）：`references/diagnostic-rules.md`
 - 连续场指标语义与判读：`references/field-evaluation.md`
 - RMSE 批次家族（`_single` / `_ens` / `_wave`）的归档形状、派生指标与判读：`references/rmse-batch-evaluation.md`
+  ——**§6 是「按需子集对比」**（用户点名「热带 春季 rmse 对比」这类切片时照它做）
 - **模型差异归因**（改动起没起作用、代价是什么、症状词典）：`references/model-diff-analysis.md`
 
 ---
