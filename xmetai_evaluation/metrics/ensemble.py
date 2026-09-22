@@ -52,6 +52,28 @@ def _weighted_sum(field: np.ndarray, weights: np.ndarray) -> float:
     return float(np.nansum(weights * field))
 
 
+def _mask_field(batch: EvaluationBatch, observation: np.ndarray) -> np.ndarray:
+    """``batch.valid_mask`` 的布尔数组形式，形状与观测场一致。
+
+    **分纬度带评估全靠这个掩码**：执行层的 ``restrict_to_latitude_band`` 一个格点
+    都不裁，只把带掩码叠进 ``valid_mask``（见其文档），指标必须自己尊重它。
+    集合类指标（CRPS / Spread-Error）以前整段没读这个掩码，于是全球标量被原样
+    复制进每一个纬度带行——长表上表现为四个区域的 ``spread`` / ``crps`` 数值与
+    ``n_valid`` 完全相同。**改这里就等于改分带口径**，别把它当成纯优化。
+    """
+    mask = getattr(batch, "valid_mask", None)
+    if mask is None:
+        return np.ones(np.shape(observation), dtype=bool)
+    values = _values(mask) != 0.0
+    if values.shape != np.shape(observation):
+        raise MetricError(
+            f"valid_mask 形状 {values.shape} 与观测场 {np.shape(observation)} 不一致，"
+            "集合指标无法叠加纬度带掩码",
+            variable="ensemble",
+        )
+    return values
+
+
 class CRPS(Metric):
     """连续分级概率评分（纬度加权，闭式解）。"""
 
@@ -95,8 +117,10 @@ class CRPS(Metric):
 
         # 闭式 CRPS 本就非负，不 clip（与参考实现/业界一致）；分母只统计有效点权重
         crps_field = term1 - term2
-        weight_field = weights if weights is not None else np.ones_like(observation)
-        okg = (m > 0) & np.isfinite(crps_field)
+        mask = _mask_field(batch, observation)
+        # 掩码外（纬度带之外）的格点权重记 0：分子分母一起退出统计
+        weight_field = (weights if weights is not None else np.ones_like(observation)) * mask
+        okg = (m > 0) & np.isfinite(crps_field) & mask
         return MetricState(
             metric_name=self.name,
             metric_version=self.version,
@@ -198,7 +222,9 @@ class SpreadError(Metric):
         mean = np.mean(members, axis=0)
         deviation = np.sum((members - mean[np.newaxis, ...]) ** 2, axis=0)
         error = (mean - observation) ** 2
-        weight_field = weights if weights is not None else np.ones_like(observation)
+        mask = _mask_field(batch, observation)
+        # 掩码外（纬度带之外）的格点权重记 0：分子分母一起退出统计
+        weight_field = (weights if weights is not None else np.ones_like(observation)) * mask
 
         return MetricState(
             metric_name=self.name,
@@ -209,7 +235,7 @@ class SpreadError(Metric):
                 "weighted_spread": _weighted_sum(deviation, weight_field),
                 "weighted_error": _weighted_sum(error, weight_field),
                 "weights_sum": float(np.nansum(weight_field)),
-                "n_valid": int((np.isfinite(deviation) & np.isfinite(error)).sum()),
+                "n_valid": int((np.isfinite(deviation) & np.isfinite(error) & mask).sum()),
                 # 单位随变量走（见 field_unit 的说明）
                 "unit": field_unit(batch.observation, batch.members),
             },
