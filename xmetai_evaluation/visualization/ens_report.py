@@ -33,7 +33,17 @@ from __future__ import annotations
 
 import math
 from pathlib import Path
-from typing import Any, Dict, List, Mapping, NamedTuple, Optional, Sequence, Tuple
+from typing import (
+    Any,
+    Callable,
+    Dict,
+    List,
+    Mapping,
+    NamedTuple,
+    Optional,
+    Sequence,
+    Tuple,
+)
 
 import matplotlib
 
@@ -62,11 +72,12 @@ from xmetai_evaluation.visualization.det_report import (
     analyze,
     by_date_frames,
     load_spectrum,
-    SPECTRUM_RATIO_ABSENT,
     metric_rows,
     paired_tests,
     region_display,
     region_table,
+    radar_scores,
+    report_date,
 )
 from xmetai_evaluation.visualization.wave_report import _save_figure, log_rms_ln
 
@@ -611,6 +622,22 @@ def _named(names: Sequence[str]) -> str:
     return "、".join(str(n) for n in names)
 
 
+def _extreme(series: pd.Series, mode: str, digits: int = 3, suffix: str = "") -> str:
+    """极值句里的「名字（数值）」——并列时逐个列出，与附表用同一套判据。
+
+    ``mode="min"`` 配「最低／最小／最好」，``"max"`` 配「最高／最大／最差」；
+    ``suffix`` 是单位（如 ACC 的 ``"%"``）。
+    两个模型数值相等时 ``idxmin`` 只挑一个，正文会写出「最好 A，最差 A」
+    这种自己跟自己比的话；这里按显示精度判并列，杜绝这种读法。
+    """
+    names = _best_names(series, digits, mode=mode)
+    if not names:
+        return "—"
+    finite = series.dropna()
+    value = finite.max() if mode == "max" else finite.min()
+    return f"{_named(names)}（{_fmt(value, digits)}{suffix}）"
+
+
 def _lead_bands(leads: Sequence[float]) -> List[Tuple[str, List[float]]]:
     """按 ``LEAD_BANDS`` 切实际存在的 lead，段名用段内首末值现写（空段不输出）。"""
     finite = [float(x) for x in leads if math.isfinite(float(x))]
@@ -636,7 +663,7 @@ def _band_values(frame: pd.DataFrame, subset: Sequence[float]) -> pd.DataFrame:
 def _band_relative(base: Bundle, subset: Sequence[float], names: Sequence[str]) -> pd.Series:
     """一个时效段的综合相对 RMSE（以段内各模型的几何均值为 100）。
 
-    §5 的表和 §5.1 的结论**必须**都走这个函数。曾经两处各算各的——表里重标成
+    §5 的表和它下面那段结论**必须**都走这个函数。曾经两处各算各的——表里重标成
     100 基线、结论里直接印原始值，同一段同一模型出现 97.242 与 97.518 两个数，
     而骨架那句「综合RMSE以{模型数}模型的几何均值为100」只对前者成立。
     """
@@ -657,30 +684,28 @@ def _failures_phrase(bundle: EnsBundle) -> str:
     return "；".join(f"{name} 有 {count} 个起报点失败" for name, count in broken.items())
 
 
-def _section_conclusion(bundle: EnsBundle) -> List[str]:
+def _section_conclusion(
+    bundle: EnsBundle, *, first: float, last: float, leads: int
+) -> List[str]:
     base = bundle.base
     names = bundle.names
-    best = base.relative_composite.idxmin()
     items = [
-        f"{_cn(len(names))}个集合产物完整性检查通过，共同日期 {len(bundle.dates)} 天"
-        f"（{_date_span(bundle.dates)}）；{_failures_phrase(bundle)}。",
-        f"综合相对 RMSE 最好 {best}（{_fmt(base.relative_composite[best])}），"
-        f"最差 {base.relative_composite.idxmax()}"
-        f"（{_fmt(base.relative_composite.max())}）；"
-        f"ACC 最高 {base.acc_mean.idxmax()}（{_fmt(base.acc_mean.max())}%）。",
-        f"CRPS 最低 {bundle.crps_mean.idxmin()}（{_fmt(bundle.crps_mean.min())}），"
-        f"最高 {bundle.crps_mean.idxmax()}（{_fmt(bundle.crps_mean.max())}）；"
-        f"离散度校准最好 {bundle.spread_log_deviation.idxmin()}"
-        f"（平均 |ln(Spread/RMSE)| = {_fmt(bundle.spread_log_deviation.min(), 4)}）。",
-        f"幅度真实性（全程 FA ratio 绝对偏差）最好 {base.fa_bias.idxmin()}"
-        f"（{_fmt(base.fa_bias.min(), 4)} pp），最差 {base.fa_bias.idxmax()}"
-        f"（{_fmt(base.fa_bias.max(), 4)} pp）。",
+        f"{_cn(len(names))}个集合产物完整性检查通过；{_failures_phrase(bundle)}。",
+        f"综合相对 RMSE 最好 {_extreme(base.relative_composite, 'min')}，"
+        f"最差 {_extreme(base.relative_composite, 'max')}；"
+        # 与 §4 表头同源：acc_mean 只是 acc_variable 一个变量，摘要里必须点名
+        f"{base.acc_variable} ACC 最高 {_extreme(base.acc_mean, 'max', 2, suffix='%')}。",
+        f"CRPS 最低 {_extreme(bundle.crps_mean, 'min')}，"
+        f"最高 {_extreme(bundle.crps_mean, 'max')}；"
+        f"离散度校准（平均 |ln(Spread/RMSE)|）最好 "
+        f"{_extreme(bundle.spread_log_deviation, 'min', 4)}。",
+        f"幅度真实性（全程 FA ratio 绝对偏差）最好 "
+        f"{_extreme(base.fa_bias, 'min', 4, suffix=' pp')}，"
+        f"最差 {_extreme(base.fa_bias, 'max', 4, suffix=' pp')}。",
         f"{SPECTRUM_DEVIATION_LABEL}（100×RMS[ln(pred/obs)]，"
         f"{len(base.spectrum_variables)}个谱变量平均）最小 "
-        f"{bundle.spectrum_deviation_scalar.idxmin()}"
-        f"（{_fmt(bundle.spectrum_deviation_scalar.min(), 2)}），最大 "
-        f"{bundle.spectrum_deviation_scalar.idxmax()}"
-        f"（{_fmt(bundle.spectrum_deviation_scalar.max(), 2)}）。",
+        f"{_extreme(bundle.spectrum_deviation_scalar, 'min', 2)}，最大 "
+        f"{_extreme(bundle.spectrum_deviation_scalar, 'max', 2)}。",
         f"集合配置：成员数 {bundle.member_label}；"
         f"逐日指标覆盖 RMSE（{len(base.common_variables)}个变量）、"
         f"CRPS（{_named(bundle.crps_variables)}）、"
@@ -689,12 +714,13 @@ def _section_conclusion(bundle: EnsBundle) -> List[str]:
         f"（{len(bundle.spread_variables)}个变量）。",
         f"异常变量检查：{base.anomaly_model} 的 {base.anomaly_variable} RMSE 为其余模型中位数的 "
         f"{_fmt(base.anomaly_ratio, 2)} 倍"
-        + ("，超出 3× 阈值，详见 4.2。" if base.anomaly_ratio >= 3.0 else "，未超 3× 阈值。"),
-        f"选型取向：整体精度看综合相对 RMSE（{best}），"
-        f"集合可靠性看 CRPS（{bundle.crps_mean.idxmin()}）与离散度"
-        f"（{bundle.spread_log_deviation.idxmin()}），"
-        f"幅度与谱真实性看 FA 偏差（{base.fa_bias.idxmin()}）与"
-        f"{SPECTRUM_DEVIATION_LABEL}（{bundle.spectrum_deviation_scalar.idxmin()}），"
+        + ("，超出 3× 阈值，详见 4.1。" if base.anomaly_ratio >= 3.0 else "，未超 3× 阈值。"),
+        f"选型取向：整体精度看综合相对 RMSE（{_named(_best_names(base.relative_composite))}），"
+        f"集合可靠性看 CRPS（{_named(_best_names(bundle.crps_mean))}）与离散度"
+        f"（{_named(_best_names(bundle.spread_log_deviation))}），"
+        f"幅度与谱真实性看 FA 偏差（{_named(_best_names(base.fa_bias))}）与"
+        f"{SPECTRUM_DEVIATION_LABEL}"
+        f"（{_named(_best_names(bundle.spectrum_deviation_scalar))}），"
         f"几者不一定指向同一模型。",
     ]
     if bundle.small_sample:
@@ -703,7 +729,24 @@ def _section_conclusion(bundle: EnsBundle) -> List[str]:
             f"配对 Wilcoxon 检验的检验力很低，「无显著差异」多半是样本不够、"
             f"而不是两者真的等价；本报告的排名只作方向性参考。"
         )
-    return ["# 1. 结论摘要", ""] + [f"• {item}" for item in items]
+    return [
+        "# 1. 结论摘要",
+        "",
+        # 先交代评估基本信息（评的是谁、多少天、什么指标），再给结论
+        f"本报告评估{'、'.join(sorted(names))}共{len(names)}个模型，"
+        f"覆盖{len(bundle.dates)}天（{_date_span(bundle.dates)}）；"
+        f"口径为集合平均场的RMSE、CRPS、ACC、FA与Spread/RMSE。"
+        f"正文与附录统一使用同一批共同日期，逐日结果按 lead 平均后比较，"
+        f"非共同日期不参与任何统计。确定性的单成员版本见 `weather_rmse_single` 报告，"
+        f"球谐带功率谱补充见 `weather_rmse_wave` 报告，三份报告口径不同、数字不可互相搬运。",
+        "",
+        # 结论并成一段而不是逐条列点：读起来是判断，不是清单
+        "".join(items),
+        "",
+        f"本报告中的FA指Forecast Activity，统一使用全程{first}–{last}h、"
+        f"{leads}个lead，不对FA做短中长时效分段。",
+        "",
+    ]
 
 
 def _section_samples(bundle: EnsBundle) -> List[str]:
@@ -897,15 +940,19 @@ def _section_overall(bundle: EnsBundle) -> List[str]:
             _fmt(bundle.spectrum_deviation_scalar[name], 2),
         ])
     lines += _table(
-        ["**模型（相对排序）**", "**综合相对RMSE**", "**CRPS**", "**ACC**",
+        # ACC 列**只代表 acc_variable 一个变量**（base.acc_mean 就是它），
+        # 所以列名必须带上变量名：分变量的 ACC 在 §4.2，不能拿这一列概括全部变量。
+        ["**模型（相对排序）**", "**综合相对RMSE**", "**CRPS**",
+         f"**ACC（{base.acc_variable}）**",
          "**Spread偏差(绝对对数)**", "**FA偏差(全程)**", "**纬向谱偏差**"],
         rows,
     )
 
-    lines += ["", "## 4.1 准确度与可靠性分项结论", ""]
+    # 此处原本是「## 4.1 准确度与可靠性分项结论」小标题，已去掉（只留结论内容）。
+    lines += [""]
     lines += _bullets(_overall_notes(bundle))
 
-    lines += ["", "## 4.2 逐变量RMSE", "", "**分变量集合均值RMSE**", ""]
+    lines += ["", "## 4.1 逐变量RMSE", "", "**分变量集合均值RMSE**", ""]
     rmse_rows = []
     for variable in base.common_variables:
         frame = base.per_variable_rmse[variable]
@@ -915,6 +962,23 @@ def _section_overall(bundle: EnsBundle) -> List[str]:
             + [_dominant(frame, names)]
         )
     lines += _table(["**变量**"] + list(names) + ["**显著优胜**"], rmse_rows)
+
+    # --- 分变量 ACC：表头的 ACC 列只有 acc_variable 一个变量，这里把 ACC 铺全 ---
+    if bundle.acc_variables:
+        lines += ["", "## 4.2 分变量ACC", "", "**分变量平均ACC（%）**", ""]
+        acc_rows = []
+        for variable in bundle.acc_variables:
+            frame = pd.DataFrame(
+                {name: bundle.acc_per_date[name][variable] for name in names}
+            )
+            acc_rows.append(
+                [variable]
+                + [_fmt(frame[name].mean(), 2) for name in names]
+                + [_dominant(frame, names, higher_is_better=True)]
+            )
+        lines += _table(["**变量**"] + list(names) + ["**显著优胜**"], acc_rows)
+        lines += [""]
+        lines += _bullets(_acc_notes(bundle))
 
     lines += ["", "## 4.3 离散度校准", "", "**分变量平均 Spread/RMSE 与距 1 偏差**", ""]
     spread_rows = []
@@ -928,7 +992,7 @@ def _section_overall(bundle: EnsBundle) -> List[str]:
             [variable]
             + [f"{name} {_fmt(mean[name], 4)}" for name in names]
             + [f"{name} {_fmt(linear[name], 4)}" for name in names]
-            + [str(linear.idxmin())]
+            + [_best_cell(linear)]
         )
     lines += _table(
         ["**变量**"]
@@ -956,7 +1020,7 @@ def _section_overall(bundle: EnsBundle) -> List[str]:
         fa_rows.append(
             [variable]
             + [f"{name} {_fmt(values[name], 4)}" for name in names]
-            + [min(values, key=lambda key: values[key])]
+            + [_best_cell(pd.Series(values))]
         )
     lines += _table(
         ["**变量**"]
@@ -972,7 +1036,7 @@ def _section_overall(bundle: EnsBundle) -> List[str]:
         spectrum_rows.append(
             [variable]
             + [f"{name} {_fmt(row[name], 2)}" for name in names]
-            + [str(row.idxmin())]
+            + [_best_cell(row)]
         )
     lines += _table(
         ["**谱变量**"]
@@ -985,43 +1049,90 @@ def _section_overall(bundle: EnsBundle) -> List[str]:
 
 def _overall_notes(bundle: EnsBundle) -> List[str]:
     base = bundle.base
-    best = base.relative_composite.idxmin()
-    worst = base.relative_composite.idxmax()
     items = [
         f"综合相对 RMSE 以{_cn(len(bundle.names))}模型的几何均值为 100："
-        f"{best} 最低（{_fmt(base.relative_composite[best])}），"
-        f"{worst} 最高（{_fmt(base.relative_composite[worst])}），"
-        f"两者相差 {_fmt(base.relative_composite[worst] - base.relative_composite[best])}。",
-        f"CRPS 最低 {bundle.crps_mean.idxmin()}（{_fmt(bundle.crps_mean.min())}），"
-        f"最高 {bundle.crps_mean.idxmax()}（{_fmt(bundle.crps_mean.max())}）；"
+        f"最低 {_extreme(base.relative_composite, 'min')}，"
+        f"最高 {_extreme(base.relative_composite, 'max')}，"
+        f"两者相差 {_fmt(base.relative_composite.max() - base.relative_composite.min())}。",
+        f"CRPS 最低 {_extreme(bundle.crps_mean, 'min')}，"
+        f"最高 {_extreme(bundle.crps_mean, 'max')}；"
         f"CRPS 同时惩罚偏差与离散度不足，是与 RMSE 相互印证的一条独立证据。",
-        f"ACC 最高 {base.acc_mean.idxmax()}（{_fmt(base.acc_mean.max())}%），"
-        f"最低 {base.acc_mean.idxmin()}（{_fmt(base.acc_mean.min())}%）。",
-        f"离散度平均绝对对数偏差最小 {bundle.spread_log_deviation.idxmin()}"
-        f"（{_fmt(bundle.spread_log_deviation.min(), 4)}），"
-        f"最大 {bundle.spread_log_deviation.idxmax()}"
-        f"（{_fmt(bundle.spread_log_deviation.max(), 4)}）；"
+        # 这里用的是单变量 acc_mean（= acc_variable），必须点名是哪个变量；
+        # 分变量的 ACC 在 §4.2，别把这一条读成全变量结论。
+        f"{base.acc_variable} ACC 最高 {_extreme(base.acc_mean, 'max', 2, suffix='%')}，"
+        f"最低 {_extreme(base.acc_mean, 'min', 2, suffix='%')}。",
+        f"离散度平均绝对对数偏差最小 {_extreme(bundle.spread_log_deviation, 'min', 4)}，"
+        f"最大 {_extreme(bundle.spread_log_deviation, 'max', 4)}；"
         f"越接近 0 表示集合离散度与自身误差越匹配。",
-        f"FA ratio 绝对偏差最小 {base.fa_bias.idxmin()}"
-        f"（{_fmt(base.fa_bias.min(), 4)} pp），最大 {base.fa_bias.idxmax()}"
-        f"（{_fmt(base.fa_bias.max(), 4)} pp）；FA 只反映活动幅度是否被系统性高估或低估，"
-        f"与 RMSE 好坏无关。",
-        f"{SPECTRUM_DEVIATION_LABEL}最小 {bundle.spectrum_deviation_scalar.idxmin()}"
-        f"（{_fmt(bundle.spectrum_deviation_scalar.min(), 2)}），"
-        f"最大 {bundle.spectrum_deviation_scalar.idxmax()}"
-        f"（{_fmt(bundle.spectrum_deviation_scalar.max(), 2)}）；"
+        f"FA ratio 绝对偏差最小 {_extreme(base.fa_bias, 'min', 4, suffix=' pp')}，"
+        f"最大 {_extreme(base.fa_bias, 'max', 4, suffix=' pp')}；"
+        f"FA 只反映活动幅度是否被系统性高估或低估，与 RMSE 好坏无关。",
+        f"{SPECTRUM_DEVIATION_LABEL}最小 {_extreme(bundle.spectrum_deviation_scalar, 'min', 2)}，"
+        f"最大 {_extreme(bundle.spectrum_deviation_scalar, 'max', 2)}；"
         f"数值越大表示预测谱的幅度结构偏离观测谱越多。",
     ]
-    if best != bundle.crps_mean.idxmin():
+    # 并列时按**集合**比，不按 idxmin 挑中的那一个：RMSE 并列冠军里只要有一个
+    # 不是 CRPS 冠军，就仍然构成「两个口径指向不同模型」，值得写出来。
+    rmse_best = sorted(_best_names(base.relative_composite))
+    crps_best = sorted(_best_names(bundle.crps_mean))
+    if not set(rmse_best) <= set(crps_best):
         items.append(
-            f"口径分歧：综合相对 RMSE 最好的是 {best}，而 CRPS 最低的是 "
-            f"{bundle.crps_mean.idxmin()}——集合平均场精度与集合分布质量不是同一件事，"
+            f"口径分歧：综合相对 RMSE 最好的是 {_named(rmse_best)}，而 CRPS 最低的是 "
+            f"{_named(crps_best)}——集合平均场精度与集合分布质量不是同一件事，"
             f"选型时要说明以哪一个为准。"
         )
     if bundle.small_sample:
         items.append(
             f"共同日期只有 {len(bundle.dates)} 天，上述排序的方向性高于显著性，不要当成定论。"
         )
+    return items
+
+
+def _acc_notes(bundle: EnsBundle) -> List[str]:
+    """§4.2 分变量 ACC 的判读句。
+
+    ACC 是**逐变量**的：``base.acc_mean`` 只代表 ``acc_variable`` 一个变量的
+    逐日平均，§4 表头那一列就是它。只写表头会把「某个变量上 ACC 高」读成
+    「所有变量都好」，所以这里逐变量摊开最高/最低/极差，并交代各 ACC 变量的
+    优胜者是否一致，以及本批 ACC 到底覆盖了哪些变量。
+    """
+    items: List[str] = []
+    best_sets: Dict[str, set] = {}
+    for variable in bundle.acc_variables:
+        mean = pd.DataFrame(
+            {name: bundle.acc_per_date[name][variable] for name in bundle.names}
+        ).mean(axis=0)
+        finite = mean.dropna()
+        if finite.empty:
+            continue
+        items.append(
+            f"{variable}：ACC 最高 {_extreme(finite, 'max', 2, suffix='%')}，"
+            f"最低 {_extreme(finite, 'min', 2, suffix='%')}，"
+            f"极差 {_fmt(finite.max() - finite.min(), 2)} pp。"
+        )
+        best_sets[variable] = set(_best_names(finite, 2, mode="max"))
+
+    if len(best_sets) > 1:
+        shared = set.intersection(*best_sets.values())
+        if shared:
+            items.append(
+                f"{_named(sorted(shared))} 在全部 {len(best_sets)} 个 ACC 变量上都是最高，"
+                f"ACC 侧的排序与看哪个变量无关。"
+            )
+        else:
+            detail = "；".join(
+                f"{variable} 是 {_named(sorted(winners))}"
+                for variable, winners in sorted(best_sets.items())
+            )
+            items.append(
+                f"ACC 侧的排序随变量变：{detail}——某个变量上 ACC 领先不代表整批变量领先。"
+            )
+
+    items.append(
+        f"本批次 ACC 只覆盖 {_named(bundle.acc_variables)} 共 "
+        f"{len(bundle.acc_variables)} 个变量，§4 表头的 ACC 列是其中 "
+        f"{bundle.base.acc_variable} 一个变量；其余变量的准确度以 §4.1 的分变量 RMSE 为准。"
+    )
     return items
 
 
@@ -1088,7 +1199,8 @@ def _section_lead(bundle: EnsBundle) -> List[str]:
          "**ACC**", "**Spread绝对对数偏差**"],
         rows,
     )
-    lines += ["", "## 5.1 时效结论", ""]
+    # 此处原本是「## 5.1 时效结论」小标题，已去掉（只留结论内容）。
+    lines += [""]
     lines += _bullets(_lead_notes(bundle, bands))
     return lines
 
@@ -1099,10 +1211,9 @@ def _lead_notes(bundle: EnsBundle, bands: Sequence[Tuple[str, List[float]]]) -> 
     items = []
     for label, subset in bands:
         values = _band_relative(base, subset, names)
-        best, worst = values.idxmin(), values.idxmax()
         items.append(
-            f"{label}：综合相对 RMSE 最低 {best}（{_fmt(values[best])}），"
-            f"最高 {worst}（{_fmt(values[worst])}）。"
+            f"{label}：综合相对 RMSE 最低 {_extreme(values, 'min')}，"
+            f"最高 {_extreme(values, 'max')}。"
         )
 
     finite = [float(x) for x in base.rmse_by_lead[names[0]].index if math.isfinite(float(x))]
@@ -1114,12 +1225,10 @@ def _lead_notes(bundle: EnsBundle, bands: Sequence[Tuple[str, List[float]]]) -> 
             early = float(acc[acc.index <= middle].mean(axis=1).mean())
             late = float(acc[acc.index > middle].mean(axis=1).mean())
             drop[name] = early - late
-        steepest = max(drop, key=lambda key: drop[key])
-        flattest = min(drop, key=lambda key: drop[key])
         items.append(
             f"以 {min(finite):g}–{max(finite):g}h 的中点为界，ACC 从短时效到长时效"
-            f"掉得最多的是 {steepest}（{_fmt(drop[steepest])} 个百分点），"
-            f"掉得最少的是 {flattest}（{_fmt(drop[flattest])} 个百分点）。"
+            f"掉得最多的是 {_extreme(pd.Series(drop), 'max', suffix=' 个百分点')}，"
+            f"掉得最少的是 {_extreme(pd.Series(drop), 'min', suffix=' 个百分点')}。"
         )
 
     saturated = [
@@ -1337,8 +1446,8 @@ def _appendix(bundle: EnsBundle, figures: Mapping[str, str]) -> List[str]:
         f"每条颜色曲线为一个模型的预测谱，黑色虚线为观测谱。",
         "",
     ] + _heatmap_block(bundle, figures) + [""] \
-      + _spectrum_ratio_block(bundle) + [""] \
       + _single_init_block(bundle, figures) + [""] \
+      + _capability_block(bundle, figures) + [""] \
       + _region_block(bundle, figures) + [""] + _season_block()
 
 
@@ -1362,7 +1471,7 @@ def _heatmap_block(bundle: EnsBundle, figures: Mapping[str, str]) -> List[str]:
         f"（{first}–{last}h）。格子里的数**不是 RMSE 本身，而是该模型在该变量、该 lead 上",
         f"相对自己首时效（{first}h）的 RMSE 倍数**——除以首时效就把变量的量纲与气候态差异",
         f"约掉了，{variables}个变量才能摆在同一根色标下横向比。这里的 RMSE 是**集合平均场**",
-        "口径，与正文第 4.2 节同源，不要和「附 2 的 Spread/RMSE」混读。",
+        "口径，与正文第 4.1 节同源，不要和「附 2 的 Spread/RMSE」混读。",
         "读法：同一行里颜色随列单调加深是正常的，**加深得慢**才说明这个变量扛得住长时效；",
         "同一行里某一段突然跳深，通常不是模式变差，而是该时效上成员数或变量路由变了，",
         "要回第 2 节核对样本。",
@@ -1374,30 +1483,13 @@ def _heatmap_block(bundle: EnsBundle, figures: Mapping[str, str]) -> List[str]:
     ]
 
 
-def _spectrum_ratio_block(bundle: EnsBundle) -> List[str]:
-    """「附 8 谱比随时效」（``图 8``）——产物给不出，见 :data:`SPECTRUM_RATIO_ABSENT`。"""
-    base = bundle.base
-    variable = _named(base.spectrum_variables)
-    return [
-        f"## 附 8 {variable} 谱比随时效",
-        "",
-        "横轴为波数（双对数），纵轴为 pred/obs，y=1 参考线画出；**每个 lead 一条曲线**，",
-        "颜色由浅到深对应 lead 由短到长。这一节回答的是「小尺度能量不足是随时间恶化，",
-        "还是一开始就缺」：曲线整体贴着 1、随 lead 一起下移，是误差累积；曲线从最短时效",
-        "就整体偏低、后续几乎不再下移，是模式本身的能量谱问题，调时效救不回来。",
-        f"附 6 是{len(base.dates)}个日期的平均谱，看不出这条随时间的变化，两张图要对着看。",
-        "",
-        SPECTRUM_RATIO_ABSENT,
-    ]
-
-
 def _single_init_block(bundle: EnsBundle, figures: Mapping[str, str]) -> List[str]:
-    """「附 9 单起报功率谱曲线」（``图 9``）。"""
+    """「附 8 单起报功率谱曲线」（``图 8``）。"""
     base = bundle.base
     variable = _named(base.spectrum_variables)
     init = str(base.dates[0]) if base.dates else ""
     lines = [
-        f"## 附 9 单起报 {variable} 功率谱曲线",
+        f"## 附 8 单起报 {variable} 功率谱曲线",
         "",
         f"附 6 是{len(base.dates)}个日期平均后的谱，平均会把个例差异抹平。这一节换成"
         f"**单个起报**（{init}）的谱，用来核对平均谱上的结论在个例上是否成立——平均谱上"
@@ -1409,7 +1501,7 @@ def _single_init_block(bundle: EnsBundle, figures: Mapping[str, str]) -> List[st
         lines += [
             f"![spectrum_curve]({figures['spectrum_curve']})",
             "",
-            f"图 9：{init} 单起报的 {variable} 纬向功率谱"
+            f"图 8：{init} 单起报的 {variable} 纬向功率谱"
             f"（双对数；黑色虚线为同时刻观测谱）",
         ]
     else:
@@ -1420,30 +1512,156 @@ def _single_init_block(bundle: EnsBundle, figures: Mapping[str, str]) -> List[st
     return lines
 
 
+def _pick(series: pd.Series, name: str) -> Optional[float]:
+    """从 ``模型 -> 值`` 的 Series 里取一个；整块没出数时给 ``None``。
+
+    判缺值走 ``None`` 而不是 0：雷达图那边把缺值当「没有这项能力」剔除，
+    与「这项能力得 0 分」是两回事。
+    """
+    return None if series is None else series.get(name)
+
+
+#: 能力雷达图的轴：``(轴名, 取 Series 的函数, 是否越高越好)``。
+#:
+#: 六根都是**综合评分**——单一标量、衡量一种能力、可跨模型比。逐变量 / 逐时效的
+#: 细粒度指标**不进雷达图**：雷达图一根轴只画一个顶点，细粒度指标要么先汇总
+#: （那已经变成另一个综合评分），要么把轴撑爆、读不出形状。
+#:
+#: 比确定性报告多两根，因为「集合」这件事本身要两样东西衡量：CRPS 管整体概率精度、
+#: 离散度管 spread 配不配得上误差。这两个数正文第 3 节各占一列，雷达图上各占一根轴。
+#:
+#: 取 Series 的函数而不是字段名：六个数四个挂在 ``bundle``、两个挂在 ``bundle.base``
+#: （确定性那套）上，``getattr`` 单个字段名取不全。
+CAPABILITY_AXES: Tuple[Tuple[str, Callable[[EnsBundle], pd.Series], bool], ...] = (
+    ("综合相对RMSE", lambda b: b.base.relative_composite, False),
+    ("CRPS", lambda b: b.crps_mean, False),
+    ("ACC (%)", lambda b: b.base.acc_mean, True),
+    ("离散度偏差", lambda b: b.spread_log_deviation, False),
+    ("FA偏差 (pp)", lambda b: b.base.fa_bias, False),
+    (SPECTRUM_DEVIATION_LABEL, lambda b: b.spectrum_deviation_scalar, False),
+)
+
+
+def capability_profile(
+    bundle: EnsBundle,
+) -> Tuple[List[str], Dict[str, Dict[str, float]], Dict[str, bool]]:
+    """组装雷达图要的三样东西：轴序、``{模型: {轴: 原始值}}``、各轴方向。"""
+    axes = [label for label, _, _ in CAPABILITY_AXES]
+    higher = {label: flag for label, _, flag in CAPABILITY_AXES}
+    raw = {
+        str(name): {
+            label: _pick(getter(bundle), name) for label, getter, _ in CAPABILITY_AXES
+        }
+        for name in bundle.names
+    }
+    return axes, raw, higher
+
+
+def _capability_block(bundle: EnsBundle, figures: Mapping[str, str]) -> List[str]:
+    """「附 9 模型能力雷达图」——综合评分的批内归一化对比（``图 9``）。"""
+    axes, raw, higher = capability_profile(bundle)
+    scores = radar_scores(raw, axes, higher)
+    names = [str(name) for name in bundle.names]
+    kept = [axis for axis in axes if names and axis in scores[names[0]]]
+    dropped = [axis for axis in axes if axis not in kept]
+    base = bundle.base
+
+    lines = [
+        "## 附 9 模型能力雷达图",
+        "",
+        "这一节把正文第 3 节那张总表的**综合评分**摆成多边形：每根轴一种能力，",
+        "每个模型一个多边形，**越靠外越好**。它不引入任何新算法，只是把总表的数",
+        "换个读法——看的是「能力形状」，不是「谁排第一」：两个模型综合分接近时，",
+        "雷达图能显出差距集中在哪几项上。",
+        "",
+        f"ACC 那根轴只代表 {base.acc_variable} 一个变量（`base.acc_mean` 就是它），",
+        f"其余五根都是跨变量的汇总；{SPECTRUM_DEVIATION_LABEL}取的也是集合平均谱，",
+        "与附 6 同源。",
+        "",
+        f"共 {len(kept)} 根轴，方向已在括号里标明（越高越好 / 越低越好）："
+        + "；".join(
+            f"{axis}（{'越高越好' if higher[axis] else '越低越好'}）" for axis in kept
+        )
+        + "。",
+        "",
+    ]
+
+    if dropped:
+        lines += [
+            f"**有 {len(dropped)} 根轴本批未画**：{'、'.join(dropped)}——"
+            "这些轴上有模型缺值（通常是该指标整块没出数）。雷达图没有断点，"
+            "少画一个顶点会把多边形拉歪，所以整根剔除，不拿 0 顶替"
+            "（那是「这项能力为零」，不是「没有这项能力」）。",
+            "",
+        ]
+
+    lines += [
+        "**读法**：纵轴 0–1 是**批内相对分**，每根轴上 1 = 本批最好、0 = 本批最差"
+        "（各轴方向先行统一）。"
+        f"这是{_model_count_word(len(names))}模型互比出来的相对位置，**不是绝对能力分**——"
+        "全批都差时每根轴照样有人拿 1；只有两个模型时必然是 1 和 0。"
+        "某一根轴上所有模型打平时，该轴一律画在满格 1.0（画成 0 会让多边形凭空凹进去），"
+        "所以**满格不代表领先**，要回正文看绝对数值。",
+        "",
+    ]
+
+    if "capability_radar" in figures:
+        lines += [
+            f"![capability_radar]({figures['capability_radar']})",
+            "",
+            f"图 9：{_model_count_word(len(names))}模型能力雷达图（{len(kept)} 根综合评分轴；"
+            f"各轴批内 min-max 归一化，1 = 本批最好；{_date_span(base.dates)} 共同日期）",
+        ]
+    else:
+        lines += [
+            "**本批未出。** 渲染器没拿到雷达图的落盘路径。这一节**不像别处那样"
+            "依赖可选数据**——六根轴里最多缺 CRPS / 离散度那两根（缺了整根剔除，"
+            "其余照画），正常跑 `generate_ens_report.py` 必然出图；缺了就是渲染器"
+            "或调用方出了问题，该回去查，不要当成「这批数据没跑到」。",
+        ]
+
+    if scores and names:
+        outer = max(names, key=lambda name: sum(scores[name].values()))
+        inner = min(names, key=lambda name: sum(scores[name].values()))
+        if outer != inner:
+            lines += [
+                "",
+                f"多边形面积最大的是 {outer}（各轴得分之和 "
+                f"{_fmt(sum(scores[outer].values()), 2)}），"
+                f"最小的是 {inner}（{_fmt(sum(scores[inner].values()), 2)}）。",
+            ]
+    return lines
+
+
 def _season_block() -> List[str]:
     """「附 S 分季节结果（可选）」：固定输出「本批未出」的静态说明。
 
-    与 ``assets/templates/weather_rmse_ens.md`` 的「附 S」逐字一致：纯静态文本、
-    不含占位符——这一块要等评测侧把季节口径定下来才会出数。
+    这一块**不预生成**：长表里没有季节列，季节要从 ``init_time`` 现推，而分季节
+    对比是按需的（用户点名要哪一季、哪个纬度带才切）。口径 2026-09-22 已定，
+    工序写在 ``references/rmse-batch-evaluation.md`` §6；这里只留节位与指路，
+    与 ``assets/templates/weather_rmse_ens.md`` 的「附 S」逐字一致。
     """
     return [
         "## 附 S 分季节结果（可选）",
         "",
-        "**本块本批未出。** 产物长表里目前没有季节维度，渲染器保留节位并标注「本批未出」，",
-        "不静默省略、也不留空表。",
+        "**本块本批未出。** 产物长表里没有季节维度（只有 `init_time`），季节要现推；",
+        "分季节对比是**按需补**的——用户点名要哪一季、哪个纬度带，就临时切一份出来，",
+        "**不需要重跑评测**。渲染器不预生成这一块，也不静默省略、不留空表。",
         "",
-        "要接上这一块，得先把两条口径定下来（两条都不难，选错会让数对不上）：",
+        "两条口径 2026-09-22 已定，照做即可（完整工序见",
+        "`references/rmse-batch-evaluation.md` §6「按需子集对比」）：",
         "",
-        "- 季节按**起报时刻**还是**有效时刻**切——同一份检验里两者会差一个时效的长度；",
-        "- DJF 跨年怎么归——12 月与次年 1、2 月要不要算同一个 DJF。",
+        "- 季节按**起报时刻**（`init_time`）切，**不按** `valid_time`——报告整套契约建立在",
+        "  「共同日期 = 共同 `init_date`」上，一组 `init_date` 必须干净地属于一个季节；",
+        "- DJF 按**气象冬季**归组（当年 12 月 + 次年 1、2 月）。不满整年的批次两个冬季",
+        "  **各只有一截**（实测 `20250102–20251215`：DJF(2024/25) 只有 1/2–2/28，",
+        "  DJF(2025/26) 只有 12/1–12/15），所以报 DJF 要说清是**哪一个冬季**，或者干脆",
+        "  只出 MAM/JJA/SON；**不要**把同一自然年的 12 月拼进去充数。",
         "",
-        "定了之后这一块的形态与「附 L」完全一致：一张分季节表（一行一个季节，按 DJF、MAM、",
-        "JJA、SON 升序，各模型各占一列，末列 `Best`），加两张图——`season_summary.png`",
-        "（分季节综合相对RMSE 柱状图，`图 S1`）与 `season_rmse_vs_lead.png`（各季节",
-        "综合相对RMSE 随预报时效的变化，`图 S2`）。数据同样出自长表，**不需要重跑评测**。",
-        "",
-        "`图 S1`/`图 S2` 两个号现在**留空**：这一块没出数就不出图，不指不存在的文件。",
-        "接上之后按「附 L」的写法补 `![…]` 与 `图 S*：{图注}` 即可。",
+        "补数之后这一块的形态与「附 L」一致：一张分季节表（一行一个季节，按 DJF、MAM、JJA、",
+        "SON 升序，各模型各占一列，末列 `Best`；基线在**子集内**重算并写在表下），加一条",
+        "带天数的判读句。`season_summary.png`（`图 S1`）与 `season_rmse_vs_lead.png`（`图 S2`）",
+        "是可选图——**没出图就别留号**，不指不存在的文件。",
     ]
 
 
@@ -1593,15 +1811,20 @@ def _region_reading_ens(
     return head
 
 
-def _check_figure_contract(text: str, count: int = 9, required: int = 6) -> None:
+def _check_figure_contract(
+    text: str, count: int = 9, required: int = 6, always: Sequence[int] = (9,)
+) -> None:
     """骨架的编号契约：``图 N：`` 的分布必须合法。
 
     - ``图 N：``（``N`` 在 ``1..count``）**最多出现一次**，且首现位置递增；
     - ``1..required`` 是**必出图**——产物里必然有对应数据，缺一个就报错；
-    - ``required+1..count`` 允许缺席：那几节的产物可能没出数（骨架对这种情况的
-      约定是保留节位、写明「本批未出」及原因，而不是画一张空图，更不是不指图却
-      把号占掉）。因此**号可以是不连续的**——比如图 7、图 9 在、图 8 缺，
-      对应的就是「谱比随时效」那一节本批没数据。
+    - ``required+1..count`` 里除了 ``always`` 也允许缺席：那几节的产物可能没出数
+      （骨架对这种情况的约定是保留节位、写明「本批未出」及原因，而不是画一张
+      空图，更不是不指图却把号占掉）。因此**号可以是不连续的**——比如图 6、
+      图 8 在、图 7 缺，对应的就是热力图那一节没有落盘路径。
+    - ``always`` 是**排在可选段之后、但不允许缺席**的号（现在是图 9 能力雷达图）。
+      它落在 ``required`` 之后只是排版上的「放最后」，数据可得性跟图 1–6 一样，
+      所以不能靠 ``required`` 那个前缀区间表达，单列出来。
 
     ``图 L1：``…``图 L3：`` 是**独立命名空间**（见骨架的编号契约）：可选块整块
     删掉时正文编号不受影响，正是把它单开一套号的目的，所以单独校验、且不参与
@@ -1617,6 +1840,11 @@ def _check_figure_contract(text: str, count: int = 9, required: int = 6) -> None
             if index <= required:
                 raise ValueError(
                     f"图注契约被破坏：{marker} 缺失（图 1..{required} 是必出图）"
+                )
+            if index in always:
+                raise ValueError(
+                    f"图注契约被破坏：{marker} 缺失"
+                    f"（图 {index} 不依赖可选数据，必然出图）"
                 )
             continue
         positions.append((index, text.index(marker)))
@@ -1647,28 +1875,17 @@ def render_ens(bundle: EnsBundle, figures: Mapping[str, str], *,
     first, last, leads = _lead_span(base.rmse_by_lead[names[0]].index)
 
     lines: List[str] = [
-        f"# XMETAI 集合预报{count}模型评估检验报告（{bundle.member_label}成员）",
+        f"# 集合预报{count}模型综合评估报告",
         "",
         f"**产物：{archive or _named(names)}**",
         "",
-        f"报告日期：{base.dates[-1]}    报告类型：集合预报（{bundle.member_label}成员）",
+        f"报告日期：{report_date()}    报告类型：集合预报（{bundle.member_label}成员）",
         "",
         f"**评估对象：{shown}**",
         "",
-        "## 报告定位与衔接",
-        "",
-        f"报告类型：集合预报（ensemble，{bundle.member_label}成员）。"
-        f"本报告覆盖 {len(base.dates)} 个共同日期（{_date_span(base.dates)}）上{shown}的"
-        f"集合平均场精度、集合分布质量（CRPS）与离散度校准；确定性的单成员版本见 "
-        f"`weather_rmse_single` 报告，球谐带功率谱补充见 `weather_rmse_wave` 报告，"
-        f"三份报告口径不同、数字不可互相搬运。",
-        "",
-        f"本报告中的FA指Forecast Activity，统一使用全程{first}–{last}h、{leads}个lead，"
-        f"不对FA做短中长时效分段；分时效分析用于RMSE、CRPS、ACC与Spread/RMSE。",
-        "",
     ]
     for section in (
-        _section_conclusion(bundle),
+        _section_conclusion(bundle, first=first, last=last, leads=leads),
         _section_samples(bundle),
         _section_metrics(bundle),
         _section_overall(bundle),
@@ -1787,18 +2004,20 @@ def build_ens_report(archives: Sequence[Archive], out_dir: Path, *,
         )
         plt.close("all")
 
-    # 图 9：单起报谱曲线。取共同日期里最早的那个起报，其余日期仍进平均谱（附 6）。
+    # 图 8：单起报谱曲线。取共同日期里最早的那个起报，其余日期仍进平均谱（附 6）。
     if base.dates:
         init = str(base.dates[0])
         single: Dict[str, pd.DataFrame] = {}
-        for archive in archives:
+        # 循环变量**不能**叫 archive——那是本函数的参数名（`--archive` 传进来的归档名），
+        # 遮蔽掉之后 render_ens 拿到的是 Archive 对象，抬头会打印整个 repr。
+        for item in archives:
             try:
-                pred, obs = load_spectrum(archive.root, [init], base.spectrum_variable,
-                                          archive.name)
+                pred, obs = load_spectrum(item.root, [init], base.spectrum_variable,
+                                          item.name)
             except (FileNotFoundError, ValueError):
                 continue
             if init in pred.columns:
-                single[archive.name] = pd.DataFrame({"pred": pred[init], "obs": obs[init]})
+                single[item.name] = pd.DataFrame({"pred": pred[init], "obs": obs[init]})
         if single:
             figures["spectrum_curve"] = f"spectrum_curve_{base.spectrum_variable}_{init}.png"
             _spectrum_panels(
@@ -1861,6 +2080,17 @@ def build_ens_report(archives: Sequence[Archive], out_dir: Path, *,
             # 一个带都取不到 spread 行：整段离散度（表 + 图 L3）都不出，不留空图名。
             # 「图 L1…Lk 必须是从 L1 起的连续段」由 _check_figure_contract 守。
             figures.pop("lat_band_spread_ratio")
+
+    # 图 9：能力雷达图。轴与归一化都在渲染器那边（`capability_profile` +
+    # `radar_scores`），这里只负责出图——两边各算一遍会把图与图注算出分歧。
+    figures["capability_radar"] = "capability_radar.png"
+    axes, raw, higher = capability_profile(bundle)
+    plotter.plot_capability_radar(
+        raw, axes, higher,
+        suptitle=f"{count}模型能力雷达图（批内相对分，1 = 本批最好）",
+        save_path=out_dir / figures["capability_radar"],
+    )
+    plt.close("all")
 
     text = render_ens(bundle, figures, archive=archive)
     report_path = out_dir / "REPORT.md"

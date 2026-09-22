@@ -11,8 +11,16 @@
 表上必有表题，每节末尾有一段**小结**——小结里的每个论断都带具体数值，由
 ``analysis_*`` 系列函数从已经算好的统计量里推出来，不是套话。
 
-章节：评测对象与对比对象 → 结论摘要 → 逐等级表现 → 随时效变化 → 误差形态与偏差结构 →
-跨时效分布（箱线图）→（可选）与对比模型的比较 → 改进建议 → 口径与注意事项。
+章节：结论摘要（含评估对象与口径）→ 逐等级表现 → 随时效变化 → 误差形态与偏差结构 →
+跨时效分布（箱线图）→（可选）与对比模型的比较 →（多模型）模型能力雷达图 →
+改进建议 → 口径与注意事项。
+
+雷达图那一节把前面几张表的**综合评分**摆成多边形（批内 min-max，1 = 本批最好），
+只在两个及以上模型时出现——一个多边形没有比较对象。「综合」是硬要求：
+POD / FAR 和 TS 是恒等式关系，不能各占一根轴。
+
+结论摘要**整段成文、不列点**：开头先把「评的是谁、多少天、什么指标」交代清楚，
+再接一整段判断，末尾是业务定性与指标定义。
 
 ``analysis_*`` 函数只吃 ``summarize()`` / ``box_stats()`` 已经算好的数字，
 不重新读表、不重新实现指标——口径只有一处，表、图、文字不可能各说各话。
@@ -23,7 +31,7 @@ from __future__ import annotations
 import argparse
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
@@ -1013,6 +1021,104 @@ def _figure_captions(
     }
 
 
+# ------------------------------------------------------------- 能力雷达图
+#
+# 选轴有一条硬约束：**恒等式的两端不能各占一根轴**。TS = f(POD, FAR)
+# （1/TS = 1/POD + 1/(1−FAR) − 1），三根同放是同一件事计三次分，多边形会被这组
+# 强相关的轴带偏——POD / FAR 的绝对水平回第四节那张表里看，不进雷达图。
+
+#: 雷达图至少两个模型才画：一个多边形没有比较对象。
+CAPABILITY_MIN_MODELS = 2
+
+#: 强降水那根轴取哪一档：不低于这个阈值（mm）的**最小**一档。
+HEAVY_RAIN_THRESHOLD = 25.0
+
+_CN_NUM = {1: "一", 2: "二", 3: "三", 4: "四", 5: "五", 6: "六", 7: "七", 8: "八", 9: "九", 10: "十"}
+
+
+def _model_count_word(count: int) -> str:
+    """模型数的中文写法——报告其余部分一律写「二模型」，这里不能冒出「2模型」。"""
+    return _CN_NUM.get(int(count), str(int(count)))
+
+
+def _heavy_grade_threshold(models: Dict[str, pd.DataFrame]) -> Optional[float]:
+    """强降水轴的档位门槛，**全批取同一个**。
+
+    逐模型各取各的会出现「甲模型比 ≥25mm、乙模型比 ≥50mm」——名次没法解释，
+    而且雷达图上完全看不出来。所以按全批的阈值集合定一档，缺这一档的模型
+    那条轴按缺值处理（整根剔除，见 ``radar_scores``）。
+    """
+    thresholds = set()
+    for frame in models.values():
+        if "threshold_mm" not in frame.columns:
+            continue
+        values = pd.to_numeric(frame["threshold_mm"], errors="coerce").dropna()
+        thresholds |= {float(value) for value in values if float(value) >= HEAVY_RAIN_THRESHOLD}
+    return min(thresholds) if thresholds else None
+
+
+def capability_profile(
+    models: Dict[str, pd.DataFrame],
+) -> Tuple[List[str], Dict[str, Dict[str, Optional[float]]], Dict[str, bool]]:
+    """雷达图的三样东西：轴序、``{模型: {轴: 原始值}}``、各轴方向。
+
+    四根轴都取自前面几节**已经算好的统计量**（``summarize`` 的总体 TS 与 BIAS、
+    ``box_stats`` 的跨时效 IQR），不另算一套指标——图、表、正文同源。
+
+    返回的取值**还没归一化**：归一化只有 ``det_plots.radar_scores`` 一处实现，
+    绘图和正文的判读句都从那里拿分。
+    """
+    heavy = _heavy_grade_threshold(models)
+    heavy_label = f"强降水 TS（≥{heavy:g}mm）" if heavy is not None else "强降水 TS"
+    labels = [
+        "TS（全等级等权平均）",
+        heavy_label,
+        "|BIAS−1|（全等级平均）",
+        "跨时效 TS 的 IQR（全等级平均）",
+    ]
+    higher = {
+        labels[0]: True,
+        labels[1]: True,
+        labels[2]: False,
+        labels[3]: False,
+    }
+
+    raw: Dict[str, Dict[str, Optional[float]]] = {}
+    for name, frame in models.items():
+        summary = summarize(frame)
+        grades = summary["grades"]
+        heavy_entry = None
+        if heavy is not None:
+            heavy_entry = next(
+                (
+                    item
+                    for item in grades
+                    if item["threshold"] is not None
+                    and np.isclose(float(item["threshold"]), heavy)
+                ),
+                None,
+            )
+        # BIAS 与 IQR 都按等级等权平均：各档样本量差几个量级，按样本数加权会让
+        # 小量级那几档把整根轴吃掉，而这根轴问的是「整体偏差/整体稳定性」。
+        bias = [
+            abs(float(item["BIAS"]) - 1.0)
+            for item in grades
+            if np.isfinite(item.get("BIAS", np.nan))
+        ]
+        iqr = [
+            float(box_stats(frame[frame["grade"] == item["grade"]], "TS")["iqr"])
+            for item in grades
+        ]
+        iqr = [value for value in iqr if np.isfinite(value)]
+        raw[str(name)] = {
+            labels[0]: float(summary["overall_ts"]),
+            labels[1]: None if heavy_entry is None else float(heavy_entry["TS_sum"]),
+            labels[2]: float(np.mean(bias)) if bias else None,
+            labels[3]: float(np.mean(iqr)) if iqr else None,
+        }
+    return labels, raw, higher
+
+
 def _section_grade(
     summary: Dict[str, object], artifacts, numbering: _Numbering, captions: Dict[str, str]
 ) -> List[str]:
@@ -1135,6 +1241,93 @@ def _table_body_of(
     return _multi_baseline_table(data, comparisons, lead)
 
 
+def _section_capability(
+    models: Dict[str, pd.DataFrame],
+    numbering: _Numbering,
+    *,
+    heading: str,
+    radar_path: Optional[Path],
+) -> List[str]:
+    """「模型能力雷达图」一节——综合评分的批内归一化对比。
+
+    轴与原始值来自 :func:`capability_profile`，归一化来自 ``det_plots.radar_scores``，
+    这一节只把结果写成文；判读句也读同一份 ``scores``，免得图和文字各算一遍。
+    """
+    # 延迟导入：``det_plots`` 在模块层 import 了 ``precipitation_plots``，后者又
+    # import 本模块——放模块层会绕成一个环，``import ts_report`` 直接失败。
+    from xmetai_evaluation.visualization.det_plots import radar_scores
+
+    axes, raw, higher = capability_profile(models)
+    scores = radar_scores(raw, axes, higher)
+    names = [str(name) for name in models]
+    kept = [axis for axis in axes if names and axis in scores[names[0]]]
+    dropped = [axis for axis in axes if axis not in kept]
+
+    lines = [heading, ""]
+    lines += [
+        "这一节把前面几张表的**综合评分**摆成多边形：每根轴一种能力，每个模型一个",
+        "多边形，**越靠外越好**。它不引入任何新算法，只是把前面的数换个读法——",
+        "看的是「能力形状」，不是「谁排第一」：两个模型综合分接近时，雷达图能显出",
+        "差距集中在哪几项上。",
+        "",
+        f"共 {len(kept)} 根轴，方向已在括号里标明（越高越好 / 越低越好）："
+        + "；".join(
+            f"{axis}（{'越高越好' if higher[axis] else '越低越好'}）" for axis in kept
+        )
+        + "。",
+        "",
+    ]
+    if dropped:
+        lines += [
+            f"**有 {len(dropped)} 根轴本批未画**：{'、'.join(dropped)}——"
+            "这些轴上有模型缺值。雷达图没有断点，少画一个顶点会把多边形拉歪，"
+            "所以整根剔除，不拿 0 顶替（那是「这项能力为零」，不是「没有这项能力」）。",
+            "",
+        ]
+    lines += [
+        "**读法**：纵轴 0–1 是**批内相对分**，每根轴上 1 = 本批最好、0 = 本批最差",
+        "（各轴方向先行统一）。"
+        f"这是{_model_count_word(len(names))}模型互比出来的相对位置，**不是绝对能力分**",
+        "——全批都差时每根轴照样有人拿 1；只有两个模型时必然是 1 和 0。某一根轴上所有",
+        "模型打平时，该轴一律画在满格 1.0（画成 0 会让多边形凭空凹进去），所以**满格",
+        "不代表领先**，要回前面几节看绝对数值。",
+        "",
+    ]
+
+    if radar_path is not None and Path(radar_path).exists():
+        caption = (
+            f"{_model_count_word(len(names))}模型能力雷达图（{len(kept)} 根综合评分轴；"
+            "各轴批内 min-max 归一化，1 = 本批最好）"
+        )
+        lines += [
+            f"![capability_radar]({Path(radar_path).name})",
+            "",
+            f"图 {numbering.figure('capability_radar')}：{caption}",
+            "",
+        ]
+    else:
+        # 走到这里说明图没落盘。轴有空缺本来就会整根剔除、不至于一根不剩，
+        # 所以这不是「这批数据没跑到」，是渲染器或调用方出了问题。
+        lines += [
+            "**本批未出。** 渲染器没拿到雷达图的落盘路径。这一节**不像别处那样"
+            "依赖可选数据**——综合评分几根轴每个批次都有，正常跑必然出图；"
+            "缺了就是渲染器或调用方出了问题，该回去查，不要当成「这批数据没跑到」。",
+            "",
+        ]
+
+    if names and kept:
+        outer = max(names, key=lambda name: sum(scores[name].values()))
+        inner = min(names, key=lambda name: sum(scores[name].values()))
+        if outer != inner:
+            lines += [
+                f"多边形面积最大的是 {outer}（各轴得分之和 "
+                f"{_fmt(sum(scores[outer].values()), 2)}），"
+                f"最小的是 {inner}（{_fmt(sum(scores[inner].values()), 2)}）。",
+                "",
+            ]
+    return lines
+
+
 def build_ts_report(
     data: pd.DataFrame,
     output_path: Path,
@@ -1185,48 +1378,70 @@ def build_ts_report(
     if baseline_df is not None:
         comparisons.setdefault(baseline_name or "基准", baseline_df)
 
+    # 雷达图：模型集合与第五节箱线图**用的是同一个 dict**（`models`），免得
+    # "图里少一个模型"这种错从后门溜回来。单模型不画——一个多边形没有比较对象。
+    prefix = f"{window:g}h_" if window else ""
+    radar = len(models) >= CAPABILITY_MIN_MODELS
+    radar_path: Optional[Path] = None
+    if radar:
+        radar_path = output_path.parent / f"{prefix}capability_radar.png"
+        axes, raw, higher = capability_profile(models)
+        # 延迟导入：``det_plots`` 在模块层 import 了 ``precipitation_plots``，
+        # 后者又 import 本模块——放模块层会绕成一个环。
+        from xmetai_evaluation.visualization.det_plots import DetPlotter
+
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        DetPlotter().plot_capability_radar(
+            raw, axes, higher,
+            suptitle=f"{_model_count_word(len(models))}模型能力雷达图"
+                     f"（批内相对分，1 = 本批最好）",
+            save_path=radar_path,
+        )
+        if artifacts is not None and radar_path.exists():
+            artifacts["capability_radar"] = radar_path
+
     numbering = _Numbering()
     captions = _figure_captions(summary, window=window, lead=lead, model_name=model_name)
 
     lines: List[str] = []
-    lines.append(f"# {model_name} 降水分类检验报告")
+    lines.append(f"# {model_name}降水评估报告")
     lines.append("")
 
-    lines.append("## 评测对象与对比对象")
-    lines.append("")
-    lines.append(f"- **评测对象**：{model_name}（来源：{_source_of(sources, model_name)}）")
+    # 评估对象/口径与结论合成同一节：先交代「评的是谁、多少天、什么指标」，
+    # 再一整段给结论，末尾两句固定口径声明。
     if comparisons:
-        joined = "、".join(
-            f"{name}（来源：{_source_of(sources, name)}）" for name in comparisons
-        )
-        lines.append(f"- **对比对象**：{joined}")
-        lines.append(
-            "- **可比性**：以上对象应使用同一时段、同一站点集、同一窗口与阈值口径；"
+        contrast = (
+            "对比对象为"
+            + "、".join(f"{name}（来源：{_source_of(sources, name)}）" for name in comparisons)
+            + "——两者应使用同一时段、同一站点集、同一窗口与阈值口径，"
             "若来源文件的口径不同，结论不可直接横向比较。"
         )
     else:
-        lines.append("- **对比对象**：无（单模型评估）")
-    if change_description:
-        lines.append(f"- **本次改动**：{change_description}")
-    lines.append(f"- **生成时间**：{datetime.now():%Y-%m-%d %H:%M}")
-    lines.append(
-        f"- 评估口径：站点分类检验（"
-        + (f"{window:g}h 累积窗口，" if window else "")
-        + f"时效 {leads[0]:g}–{leads[-1]:g}h 共 {len(leads)} 个，{summary['n_rows']} 条记录）"
-    )
-    lines.append(
-        "- 指标定义：TS = hits/(hits+misses+false_alarms)，POD = hits/(hits+misses)，"
-        "FAR = false_alarms/(hits+false_alarms)，漏报率 = 1−POD，"
-        "BIAS = (hits+false_alarms)/(hits+misses)（频率偏差）"
-    )
-    lines.append("")
+        contrast = "未设对比对象。"
 
     lines.append("## 一、结论摘要")
     lines.append("")
-    for index, finding in enumerate(findings, start=1):
-        lines.append(f"{index}. {finding}")
+    lines.append(
+        f"本报告评估{model_name}（来源：{_source_of(sources, model_name)}），"
+        + contrast
+        + "评估口径为站点分类检验（"
+        + (f"{window:g}h 累积窗口，" if window else "")
+        + f"时效 {leads[0]:g}–{leads[-1]:g}h 共 {len(leads)} 个，{summary['n_rows']} 条记录），"
+        + "指标为 TS、POD、FAR、漏报率与 BIAS。"
+        + (f"本次改动：{change_description}。" if change_description else "")
+        + f"报告生成时间：{datetime.now():%Y-%m-%d %H:%M}。"
+    )
+    lines.append("")
+    # 结论并成一段而不是逐条列点：读起来是判断，不是清单
+    lines.append("".join(findings))
     lines.append("")
     lines.append(f"**业务定性**：{business_conclusion(grades)}")
+    lines.append("")
+    lines.append(
+        "指标定义：TS = hits/(hits+misses+false_alarms)，POD = hits/(hits+misses)，"
+        "FAR = false_alarms/(hits+false_alarms)，漏报率 = 1−POD，"
+        "BIAS = (hits+false_alarms)/(hits+misses)（频率偏差）"
+    )
     lines.append("")
 
     lines += _section_grade(summary, artifacts, numbering, captions)
@@ -1251,14 +1466,23 @@ def build_ts_report(
             lead=lead, heading=heading, caption=caption, note=note,
         )
 
-    tail_section = "七" if comparisons else "六"
-    lines.append(f"## {tail_section}、改进建议")
+    # 章节号顺延：对比节占「六」，雷达图占「七」，改进建议与口径各再往后挪一位。
+    # 雷达图只在多模型（也就是必有对比对象）时出现，所以落点只有三种组合。
+    numerals = "六七八九"
+    step = (1 if comparisons else 0) + (1 if radar else 0)
+    if radar:
+        lines += _section_capability(
+            models, numbering,
+            heading=f"## {numerals[step - 1]}、模型能力雷达图",
+            radar_path=radar_path,
+        )
+
+    lines.append(f"## {numerals[step]}、改进建议")
     lines.append("")
     for index, item in enumerate(recommendations(grades), start=1):
         lines.append(f"{index}. {item}")
     lines.append("")
-    tail_section = "八" if comparisons else "七"
-    lines.append(f"## {tail_section}、口径与注意事项")
+    lines.append(f"## {numerals[step + 1]}、口径与注意事项")
     lines.append("")
     lines.append("- **值缺失的含义**：TS 为 “—” 表示该等级没有有效配对或无事件，与“评分为 0”不同；")
     lines.append("- **BIAS 不是平均误差**：它是频率偏差，>1 表示预报事件偏多，<1 表示偏少；")

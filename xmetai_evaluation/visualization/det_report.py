@@ -56,13 +56,14 @@ from __future__ import annotations
 import json
 import math
 import re
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, NamedTuple, Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
 
-from xmetai_evaluation.visualization.det_plots import DetPlotter
+from xmetai_evaluation.visualization.det_plots import DetPlotter, radar_scores
 
 try:
     from scipy.stats import wilcoxon as _scipy_wilcoxon
@@ -975,9 +976,15 @@ def _model_count_word(count: int) -> str:
 
 
 def _date_span(dates: Sequence[str]) -> str:
+    """日期跨度写成「集合」形式：``20250102，20251215``。
+
+    分隔符是**全角逗号**而不是连接号——起点终点是一组日期的两个端点，
+    读作集合比读作区间更贴合「这批共同日期」的含义。调用方大多已经套了括号，
+    所以这里**不带括号**，套两层会变成 ``（（20250102，20251215））``。
+    """
     if not dates:
         return "—"
-    return f"{dates[0]}–{dates[-1]}" if len(dates) > 1 else dates[0]
+    return f"{dates[0]}，{dates[-1]}" if len(dates) > 1 else dates[0]
 
 
 def _lead_span(leads: Sequence[float]) -> Tuple[str, str, int]:
@@ -1380,7 +1387,9 @@ def _section_comparison(bundle: Bundle) -> List[str]:
         rows,
     )
 
-    lines += ["", "## 8.1 逐模型结论", ""]
+    # 此处原本是「## 8.1 逐模型结论」小标题，已去掉（只留结论内容），
+    # 后面的「关键配对差异」顺势补位成 8.1。
+    lines += [""]
     items = []
     for name in order:
         strengths, weaknesses = _pros_cons(bundle, name, ranks, count)
@@ -1393,7 +1402,7 @@ def _section_comparison(bundle: Bundle) -> List[str]:
         )
     lines += _bullets(items)
 
-    lines += ["", "## 8.2 关键配对差异", "", "**关键配对差异**", ""]
+    lines += ["", "## 8.1 关键配对差异", "", "**关键配对差异**", ""]
     rows = []
     for test in bundle.overall_tests:
         record = bundle.win_counts[
@@ -1559,50 +1568,55 @@ def _section_selection(bundle: Bundle) -> List[str]:
 def _season_block() -> List[str]:
     """「附 S 分季节结果（可选）」：固定输出「本批未出」的静态说明。
 
-    这一块要等评测侧把季节口径定下来（按起报时刻还是有效时刻切、DJF 跨年怎么归），
-    定之前**不出数也不出图**。所以这里是**纯静态文本、不含任何占位符**，
-    与 ``assets/templates/weather_rmse_single.md`` 的「附 S」逐字一致。
+    这一块**不预生成**：长表里没有季节列，季节要从 ``init_time`` 现推，而分季节
+    对比是按需的（用户点名要哪一季、哪个纬度带才切）。口径 2026-09-22 已定，
+    工序写在 ``references/rmse-batch-evaluation.md`` §6；这里只留节位与指路，
+    **纯静态文本、不含任何占位符**，与 ``weather_rmse_single.md`` 的「附 S」逐字一致。
     """
     return [
         "## 附 S 分季节结果（可选）",
         "",
-        "**本块本批未出。** 产物长表里目前没有季节维度，渲染器保留节位并标注「本批未出」，",
-        "不静默省略、也不留空表。",
+        "**本块本批未出。** 产物长表里没有季节维度（只有 `init_time`），季节要现推；",
+        "分季节对比是**按需补**的——用户点名要哪一季、哪个纬度带，就临时切一份出来，",
+        "**不需要重跑评测**。渲染器不预生成这一块，也不静默省略、不留空表。",
         "",
-        "要接上这一块，得先把两条口径定下来（两条都不难，选错会让数对不上）：",
+        "两条口径 2026-09-22 已定，照做即可（完整工序见",
+        "`references/rmse-batch-evaluation.md` §6「按需子集对比」）：",
         "",
-        "- 季节按**起报时刻**还是**有效时刻**切——同一份检验里两者会差一个时效的长度；",
-        "- DJF 跨年怎么归——12 月与次年 1、2 月要不要算同一个 DJF。",
+        "- 季节按**起报时刻**（`init_time`）切，**不按** `valid_time`——报告整套契约建立在",
+        "  「共同日期 = 共同 `init_date`」上，一组 `init_date` 必须干净地属于一个季节；",
+        "- DJF 按**气象冬季**归组（当年 12 月 + 次年 1、2 月）。不满整年的批次两个冬季",
+        "  **各只有一截**（实测 `20250102–20251215`：DJF(2024/25) 只有 1/2–2/28，",
+        "  DJF(2025/26) 只有 12/1–12/15），所以报 DJF 要说清是**哪一个冬季**，或者干脆",
+        "  只出 MAM/JJA/SON；**不要**把同一自然年的 12 月拼进去充数。",
         "",
-        "定了之后这一块的形态与「附 L」完全一致：一张分季节表（一行一个季节，按 DJF、MAM、",
-        "JJA、SON 升序，各模型各占一列，末列 `Best`），加两张图——`season_summary.png`",
-        "（分季节综合相对RMSE 柱状图，`图 S1`）与 `season_rmse_vs_lead.png`（各季节",
-        "综合相对RMSE 随预报时效的变化，`图 S2`）。数据同样出自长表，**不需要重跑评测**。",
-        "",
-        "`图 S1`/`图 S2` 两个号现在**留空**：这一块没出数就不出图，不指不存在的文件。",
-        "接上之后按「附 L」的写法补 `![…]` 与 `图 S*：{图注}` 即可。",
+        "补数之后这一块的形态与「附 L」一致：一张分季节表（一行一个季节，按 DJF、MAM、JJA、",
+        "SON 升序，各模型各占一列，末列 `Best`；基线在**子集内**重算并写在表下），加一条",
+        "带天数的判读句。`season_summary.png`（`图 S1`）与 `season_rmse_vs_lead.png`（`图 S2`）",
+        "是可选图——**没出图就别留号**，不指不存在的文件。",
     ]
 
 
-def _best_names(series: pd.Series, digits: int = 3) -> List[str]:
-    """综合相对RMSE 并列第一的**全体**名字。
+def _best_names(series: pd.Series, digits: int = 3, *, mode: str = "min") -> List[str]:
+    """并列最优的**全体**名字（``mode="max"`` 改成取最大）。
 
-    两个模型出自同一批产物时相对值会精确相等，只取 ``idxmin`` 挑中的那一个，
-    报告读起来就是「A 全面领先」，而事实是分不出高下。按**显示精度**判并列，
-    保证表里印出来的数字和这一列说的是同一件事。
+    两个模型出自同一批产物时相对值会精确相等，只取 ``idxmin`` / ``idxmax``
+    挑中的那一个，报告读起来就是「A 全面领先」，而事实是分不出高下。按**显示精度**
+    判并列，保证表里印出来的数字和这一列说的是同一件事。
     """
     finite = series.dropna()
     if finite.empty:
         return []
-    key = f"{float(finite.min()):.{digits}f}"
+    target = finite.max() if mode == "max" else finite.min()
+    key = f"{float(target):.{digits}f}"
     return [
         str(name) for name, value in finite.items() if f"{float(value):.{digits}f}" == key
     ]
 
 
-def _best_cell(series: pd.Series, digits: int = 3) -> str:
-    """附表「Best」列：并列第一逐个列出，不只报 ``idxmin`` 挑中的那个。"""
-    names = _best_names(series, digits)
+def _best_cell(series: pd.Series, digits: int = 3, *, mode: str = "min") -> str:
+    """附表「Best」/「更接近1」/「更优」列：并列者逐个列出，不只报挑中的那个。"""
+    names = _best_names(series, digits, mode=mode)
     if not names:
         return "—"
     return " / ".join(names) + ("（并列）" if len(names) > 1 else "")
@@ -1763,20 +1777,6 @@ def _region_block(bundle: Bundle, figures: Mapping[str, str]) -> List[str]:
     return lines
 
 
-#: 「谱比随时效」没出数时写这句。产物里逐波数的谱**只有逐起报一张**
-#: （``spectrum_by_init.csv`` 的列是 ``variable / init_time / wavenumber / pred / obs``，
-#: 没有 lead）；长表里带 lead 的 ``spectrum_power_ratio`` 是个**标量**、没有波数轴。
-#: 两头都凑不出「同一批波数、随 lead 变化」的曲线，所以这一节只能标未出。
-SPECTRUM_RATIO_ABSENT = (
-    "这一节**本批未出**。产物里逐波数的谱只有**逐起报**一张"
-    "（`diagnostics/spectrum_by_init.csv`，列是 "
-    "`variable / init_time / wavenumber / pred / obs`，**没有 lead**）；"
-    "长表里带 lead 的 `spectrum_power_ratio` 是**一个标量**、没有波数轴。"
-    "两头都凑不出「同一批波数、谱比随 lead 变化」的曲线，所以这一节给不出图，"
-    "也不拿平均谱顶替。要补上得让谱诊断按（起报, 时效）逐条落谱。"
-)
-
-
 def _heatmap_block(bundle: Bundle, figures: Mapping[str, str]) -> List[str]:
     """「附 5 变量 × 时效 RMSE 热力图」（``图 5``）。"""
     if "rmse_heatmap" not in figures:
@@ -1807,27 +1807,12 @@ def _heatmap_block(bundle: Bundle, figures: Mapping[str, str]) -> List[str]:
     ]
 
 
-def _spectrum_ratio_block(bundle: Bundle) -> List[str]:
-    """「附 6 谱比随时效」（``图 6``）——产物给不出，见 :data:`SPECTRUM_RATIO_ABSENT`。"""
-    return [
-        f"## 附 6 {bundle.spectrum_variable} 谱比随时效",
-        "",
-        "横轴为波数（双对数），纵轴为 pred/obs，y=1 参考线画出；**每个 lead 一条曲线**，",
-        "颜色由浅到深对应 lead 由短到长。这一节回答的是「小尺度能量不足是随时间恶化，",
-        "还是一开始就缺」：曲线整体贴着 1、随 lead 一起下移，是误差累积，加长预报时长",
-        "可以缓解；曲线从最短时效就整体偏低、后续几乎不再下移，是模式本身的能量谱问题，",
-        "**不是**预报时长带来的，调时效救不回来。",
-        "",
-        SPECTRUM_RATIO_ABSENT,
-    ]
-
-
 def _single_init_block(bundle: Bundle, figures: Mapping[str, str]) -> List[str]:
-    """「附 7 单起报功率谱曲线」（``图 7``）。"""
+    """「附 6 单起报功率谱曲线」（``图 6``）。"""
     count = len(bundle.dates)
     init = str(bundle.dates[0]) if bundle.dates else ""
     lines = [
-        f"## 附 7 单起报 {bundle.spectrum_variable} 功率谱曲线",
+        f"## 附 6 单起报 {bundle.spectrum_variable} 功率谱曲线",
         "",
         f"附 4 是{count}个日期平均后的谱，平均会把个例差异抹平。这一节换成**单个起报**",
         f"（{init}）的谱，用来核对平均谱上的结论在个例上是否成立——平均谱上「小尺度偏低」",
@@ -1838,7 +1823,7 @@ def _single_init_block(bundle: Bundle, figures: Mapping[str, str]) -> List[str]:
         lines += [
             f"![spectrum_curve]({figures['spectrum_curve']})",
             "",
-            f"图 7：{init} 单起报的 {bundle.spectrum_variable} 纬向功率谱"
+            f"图 6：{init} 单起报的 {bundle.spectrum_variable} 纬向功率谱"
             f"（双对数；黑色虚线为同时刻观测谱）",
         ]
     else:
@@ -1897,9 +1882,9 @@ def _appendix(bundle: Bundle, figures: Mapping[str, str]) -> List[str]:
     ]
     lines += _heatmap_block(bundle, figures)
     lines += [""]
-    lines += _spectrum_ratio_block(bundle)
-    lines += [""]
     lines += _single_init_block(bundle, figures)
+    lines += [""]
+    lines += _capability_block(bundle, figures)
     lines += [""]
     lines += _region_block(bundle, figures)
     lines += [""]
@@ -1907,7 +1892,118 @@ def _appendix(bundle: Bundle, figures: Mapping[str, str]) -> List[str]:
     return lines
 
 
+#: 能力雷达图的轴：``(轴名, 取自 Bundle 的字段, 是否越高越好)``。
+#:
+#: 四根都是**综合评分**——单一标量、衡量一种能力、可跨模型比。逐变量 / 逐时效的
+#: 细粒度指标**不进雷达图**：雷达图一根轴只画一个顶点，细粒度指标要么先汇总
+#: （那已经变成另一个综合评分），要么把轴撑爆、读不出形状。
+CAPABILITY_AXES: Tuple[Tuple[str, str, bool], ...] = (
+    ("综合相对RMSE", "relative_composite", False),
+    ("ACC (%)", "acc_mean", True),
+    ("FA偏差 (pp)", "fa_bias", False),
+    ("频谱对数RMS", "spectrum_rms", False),
+)
+
+
+def capability_profile(
+    bundle: Bundle,
+) -> Tuple[List[str], Dict[str, Dict[str, float]], Dict[str, bool]]:
+    """组装雷达图要的三样东西：轴序、``{模型: {轴: 原始值}}``、各轴方向。"""
+    axes = [label for label, _, _ in CAPABILITY_AXES]
+    higher = {label: flag for label, _, flag in CAPABILITY_AXES}
+    raw = {
+        str(name): {
+            label: getattr(bundle, field)[name] for label, field, _ in CAPABILITY_AXES
+        }
+        for name in bundle.names
+    }
+    return axes, raw, higher
+
+
+def _capability_block(bundle: Bundle, figures: Mapping[str, str]) -> List[str]:
+    """「附 模型能力雷达图」——综合评分的批内归一化对比（``图 7``）。"""
+    axes, raw, higher = capability_profile(bundle)
+    scores = radar_scores(raw, axes, higher)
+    names = [str(name) for name in bundle.names]
+    kept = [axis for axis in axes if names and axis in scores[names[0]]]
+    dropped = [axis for axis in axes if axis not in kept]
+
+    lines = [
+        "## 附 7 模型能力雷达图",
+        "",
+        "这一节把正文第 3 节那张总表的**综合评分**摆成多边形：每根轴一种能力，",
+        "每个模型一个多边形，**越靠外越好**。它不引入任何新算法，只是把总表的数",
+        "换个读法——看的是「能力形状」，不是「谁排第一」：两个模型综合分接近时，",
+        "雷达图能显出差距集中在哪几项上。",
+        "",
+        f"共 {len(kept)} 根轴，方向已在括号里标明（越高越好 / 越低越好）："
+        + "；".join(
+            f"{axis}（{'越高越好' if higher[axis] else '越低越好'}）" for axis in kept
+        )
+        + "。",
+        "",
+    ]
+
+    if dropped:
+        lines += [
+            f"**有 {len(dropped)} 根轴本批未画**：{'、'.join(dropped)}——"
+            "这些轴上有模型缺值。雷达图没有断点，少画一个顶点会把多边形拉歪，"
+            "所以整根剔除，不拿 0 顶替（那是「这项能力为零」，不是「没有这项能力」）。",
+            "",
+        ]
+
+    lines += [
+        "**读法**：纵轴 0–1 是**批内相对分**，每根轴上 1 = 本批最好、0 = 本批最差"
+        "（各轴方向先行统一）。"
+        f"这是{_model_count_word(len(names))}模型互比出来的相对位置，**不是绝对能力分**——"
+        "全批都差时每根轴照样有人拿 1；只有两个模型时必然是 1 和 0。"
+        "某一根轴上所有模型打平时，该轴一律画在满格 1.0（画成 0 会让多边形凭空凹进去），"
+        "所以**满格不代表领先**，要回正文看绝对数值。",
+        "",
+    ]
+
+    if "capability_radar" in figures:
+        lines += [
+            f"![capability_radar]({figures['capability_radar']})",
+            "",
+            f"图 7：{_model_count_word(len(names))}模型能力雷达图（{len(kept)} 根综合评分轴；"
+            f"各轴批内 min-max 归一化，1 = 本批最好；{_date_span(bundle.dates)} 共同日期）",
+        ]
+    else:
+        lines += [
+            "**本批未出。** 渲染器没拿到雷达图的落盘路径。这一节**不像别处那样"
+            "依赖可选数据**——综合评分四根轴每个批次都有，正常跑 "
+            "`generate_det_report.py` 必然出图；缺了就是渲染器或调用方出了问题，"
+            "该回去查，不要当成「这批数据没跑到」。",
+        ]
+
+    if scores and names:
+        outer = max(names, key=lambda name: sum(scores[name].values()))
+        inner = min(names, key=lambda name: sum(scores[name].values()))
+        if outer != inner:
+            lines += [
+                "",
+                f"多边形面积最大的是 {outer}（各轴得分之和 "
+                f"{_fmt(sum(scores[outer].values()), 2)}），"
+                f"最小的是 {inner}（{_fmt(sum(scores[inner].values()), 2)}）。",
+            ]
+    return lines
+
+
 # ------------------------------------------------------------------ 装配
+
+
+def report_date() -> str:
+    """报告**生成**日期（``YYYYMMDD``）。
+
+    抬头那个「报告日期」是跑这份报告的当天，**不是数据末日期**——两者很容易
+    被看成一回事，但含义完全不同：数据覆盖到哪天，正文第 1/2 节已经写了
+    「覆盖 N 天（起，止）」，抬头再写一遍等于把同一个信息抄两处，还挤掉了
+    「这份报告是什么时候出的」这个只有抬头能承载的信息。
+
+    代价是产物**不再逐位可复现**：同一天跑两次一样，隔天跑就不同。
+    """
+    return datetime.now().strftime("%Y%m%d")
 
 
 def render(
@@ -1932,23 +2028,13 @@ def render(
     first, last, leads = _lead_span(bundle.rmse_by_lead[bundle.names[0]].index)
 
     lines: List[str] = []
-    lines.append(title or f"# XMETAI 确定性{_model_count_word(count)}模型评估检验报告（单成员）")
+    lines.append(title or f"# 确定性预报{_model_count_word(count)}模型综合评估报告")
     lines += ["", f"**产物：{archive or '、'.join(bundle.names)}**", ""]
     lines += [
-        f"报告日期：{bundle.dates[-1]}    评估层级：输出级复核",
-        "",
-        "## 报告定位与衔接",
-        "",
-        f"报告类型：确定性单成员预报（single/det）。本报告覆盖 {count} 个模型的评估产物目录，"
-        f"正文与附录统一使用 {len(bundle.dates)} 个共同日期（{_date_span(bundle.dates)}），"
-        f"逐日结果按 lead 平均后比较；非共同日期不参与任何统计。"
-        + (f"本次相对上一版的改动：{change}" if change else ""),
-        "",
-        f"本报告中的FA指Forecast Activity，统一使用全程{first}–{last}h、{leads}个lead，"
-        f"不对FA做短中长时效分段；分时效分析仅用于RMSE。",
+        f"报告日期：{report_date()}    评估层级：输出级复核",
         "",
     ]
-    lines += _conclusion_summary(bundle, change)
+    lines += _conclusion_summary(bundle, change, first=first, last=last, leads=leads)
     lines += [""]
     lines += _section_samples(bundle, declared)
     lines += [""]
@@ -1975,11 +2061,17 @@ def render(
     return "\n".join(lines)
 
 
-def _conclusion_summary(bundle: Bundle, change: Optional[str]) -> List[str]:
+def _conclusion_summary(
+    bundle: Bundle,
+    change: Optional[str],
+    *,
+    first: float,
+    last: float,
+    leads: int,
+) -> List[str]:
     order = bundle.relative_composite.sort_values().index.tolist()
     best, worst = order[0], order[-1]
     items = [
-        f"共同日期 {len(bundle.dates)} 天（{_date_span(bundle.dates)}）；"
         f"综合相对 RMSE 最好 {best}（{_fmt(bundle.relative_composite[best])}），"
         f"最差 {worst}（{_fmt(bundle.relative_composite[worst])}）。",
         f"ACC 最好 {bundle.acc_mean.idxmax()}（{_fmt(bundle.acc_mean.max())}%），"
@@ -2011,9 +2103,23 @@ def _conclusion_summary(bundle: Bundle, change: Optional[str]) -> List[str]:
         f"（{bundle.anomaly_model} 为其余模型中位数的 {_fmt(bundle.anomaly_ratio, 2)} 倍），"
         f"已在 6.1 与第 9 节单独分析。"
     )
-    if change:
-        items.append(f"本次改动：{change}")
-    return ["# 1. 结论摘要", ""] + _bullets(items)
+    return [
+        "# 1. 结论摘要",
+        "",
+        # 先交代评估基本信息（评的是谁、多少天、什么指标），再给结论
+        f"本报告评估{'、'.join(bundle.names)}共{len(bundle.names)}个模型，"
+        f"覆盖{len(bundle.dates)}天（{_date_span(bundle.dates)}）；"
+        f"口径为RMSE、ACC、FA与纬向谱。正文与附录统一使用同一批共同日期，"
+        f"逐日结果按 lead 平均后比较，非共同日期不参与任何统计。"
+        + (f"本次相对上一版的改动：{change}" if change else ""),
+        "",
+        # 结论并成一段而不是逐条列点：读起来是判断，不是清单
+        "".join(items),
+        "",
+        f"本报告中的FA指Forecast Activity，统一使用全程{first}–{last}h、"
+        f"{leads}个lead，不对FA做短中长时效分段。",
+        "",
+    ]
 
 
 # ------------------------------------------------------------------ 入口
@@ -2102,14 +2208,16 @@ def build_det_report(
     if bundle.dates:
         init = str(bundle.dates[0])
         single: Dict[str, pd.DataFrame] = {}
-        for archive in archives:
+        # 循环变量**不能**叫 archive——那是本函数的参数名（`--archive` 传进来的归档名），
+        # 遮蔽掉之后 render 拿到的是 Archive 对象，抬头会打印整个 repr。
+        for item in archives:
             try:
-                pred, obs = load_spectrum(archive.root, [init], bundle.spectrum_variable,
-                                          archive.name)
+                pred, obs = load_spectrum(item.root, [init], bundle.spectrum_variable,
+                                          item.name)
             except (FileNotFoundError, ValueError):
                 continue
             if init in pred.columns:
-                single[archive.name] = pd.DataFrame({"pred": pred[init], "obs": obs[init]})
+                single[item.name] = pd.DataFrame({"pred": pred[init], "obs": obs[init]})
         if single:
             figures["spectrum_curve"] = f"spectrum_curve_{bundle.spectrum_variable}_{init}.png"
             plotter.plot_model_spectrum(
@@ -2150,6 +2258,17 @@ def build_det_report(
             suptitle="分纬度带综合相对 RMSE",
             save_path=out_dir / figures["lat_band_summary"],
         )
+
+    # 图 7：能力雷达图。轴与归一化都在渲染器那边（`capability_profile` +
+    # `radar_scores`），这里只负责出图——两边各算一遍会把图与图注算出分歧。
+    figures["capability_radar"] = "capability_radar.png"
+    axes, raw, higher = capability_profile(bundle)
+    plotter.plot_capability_radar(
+        raw, axes, higher,
+        suptitle=f"{_model_count_word(len(bundle.names))}模型能力雷达图"
+                 f"（批内相对分，1 = 本批最好）",
+        save_path=out_dir / figures["capability_radar"],
+    )
 
     text = render(
         bundle, title=title, change=change, archive=archive,
