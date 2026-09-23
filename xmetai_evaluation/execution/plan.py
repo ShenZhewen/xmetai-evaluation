@@ -27,9 +27,11 @@ from xmetai_evaluation.execution.loader import RoleSpec, RunLoader
 from xmetai_evaluation.execution.profiles import ResourceProfile, union_profile
 from xmetai_evaluation.execution.strategy import ExecutionStrategy, derive_strategy
 from xmetai_evaluation.pipeline.protocols import (
+    babj_init_times,
     sample_leads,
     station_observation_span,
     select_observation_files,
+    typhoon_storm_filter,
 )
 from xmetai_evaluation.pipeline.spec import PipelineSpec, daily_times
 
@@ -99,6 +101,26 @@ def build_plan(
         raise EvaluationError(
             f"流程 {spec.pipeline or spec.name} 在评测时段内没有可用预报起报"
         )
+    if spec.protocol == "typhoon_track":
+        # 起报时刻由报文**反推**（旧链路同口径）：预报目录是逐日的，台风却不是
+        # 天天有——不筛的话空档期的每一天都会切出一个 0 样本的块，在 manifest
+        # 里堆成一片"工作块失败"。放在 limit 之前筛，limit=1 才真的是"第一个
+        # 有台风的起报日"。
+        #
+        # seed_min_offset_hours 与协议读的是同一个配置项：计划层与协议必须按同一
+        # 口径判断"这个起报能不能起链"，否则能跑的场次在切块前就被剔掉了。
+        init_times = babj_init_times(
+            observation,
+            init_times,
+            spec.local_utc_offset_hours,
+            typhoon_storm_filter(spec.options),
+            float(spec.options.get("seed_min_offset_hours", 6.0)),
+        )
+        if not init_times:
+            raise EvaluationError(
+                f"评测时段 {spec.start_date}–{spec.end_date} 内没有任何起报时刻"
+                f"对得上 BABJ 报文的分析场（报文里没有在评台风的分析记录？）"
+            )
     if spec.limit:
         init_times = init_times[: spec.limit]
 
@@ -508,7 +530,25 @@ def _build_roles(
         "observation", strategy, n_chunks, profile, leads, warmup_hours
     )
 
-    if spec.protocol == "grid_valid_time":
+    if spec.protocol == "typhoon_track":
+        # BABJ 报文一个文件就是一号台风的**整条路径**（跨越多天），没有"按跨度
+        # 挑文件"这回事；整包 KB 级，一次读完就是全部。角色必须是 slice：
+        # resident 命中缓存后要按请求跨度切时间轴，而报文时间轴是北京时、覆盖
+        # 各号台风的完整生命史，按预报起报时刻（UTC）去切会把实况切没。
+        if obs_policy != "slice":
+            raise ConfigError(
+                f"台风协议的观测角色只能是 slice，当前是 {obs_policy!r}："
+                f"驻留/分窗都会按请求跨度切 BABJ 的时间轴，而报文时间是北京时、"
+                f"跨度是台风的整条生命史，切完实况就对不上了。"
+            )
+        roles["observation"] = RoleSpec(
+            role="observation",
+            policy=obs_policy,
+            window_days=obs_window,
+            builder=partial(_babj_builder, observation),
+            times=[],
+        )
+    elif spec.protocol == "grid_valid_time":
         variables = _observation_variables(spec)
         valid_times = _grid_valid_times(init_times, leads)
         roles["observation"] = _grid_role(
@@ -603,6 +643,16 @@ def _station_builder(
     return observation.reader.read(
         request, DataIndex(source_id=observation.source_id, available=selected)
     )
+
+
+def _babj_builder(observation: Any, block_span):
+    """BABJ 观测角色：不看跨度，整个目录读一次（理由见 ``_build_roles``）。
+
+    模块级函数 + partial 绑参而不是闭包：闭包 pickle 不了，进程池模式下会让
+    整个 loader 无法序列化。
+    """
+    request = DataRequest(source_id=observation.source_id, variables=["storm"])
+    return observation.reader.read(request, observation.catalog.discover(request))
 
 
 def _station_role(

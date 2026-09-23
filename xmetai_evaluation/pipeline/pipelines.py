@@ -9,7 +9,7 @@
     python -m xmetai_evaluation --list-pipelines            # 看能力清单
     python -m xmetai_evaluation --config my_config.py       # 配置自己声明 pipeline
 
-11 条流程按三大业务块统一前缀：``fdp_``（业务天气评测）、``weather_``（天气模型
+12 条流程按三大业务块统一前缀：``fdp_``（业务天气评测）、``weather_``（天气模型
 验证）、``clim_``（气候，待落地）。每条模板的 ``description`` 就是
 ``--list-pipelines`` 打印的内容（含用途、输入数据、计算口径、指标阈值与产出文件），
 所以这里不再另抄一份流程清单。阈值之类的数字直接引用本文件的常量，改常量即生效。
@@ -274,6 +274,41 @@ PIPELINE_TEMPLATES: Dict[str, PipelineTemplate] = {
         ],
         writers=["csv_long"],
         options={"ensemble_reduction": "mean"},
+    ),
+    "weather_typhoon_det": PipelineTemplate(
+        name="weather_typhoon_det",
+        protocol="typhoon_track",
+        description=(
+            "台风路径与强度检验（确定性）：路径误差 / 沿-横分解 / 强度偏差\n"
+            "  用途  预报场里的台风中心报得准不准：位置偏多远、偏在路径前方\n"
+            "        还是侧向、中心气压与最大风速差多少\n"
+            "  数据  预报 格点预报（msl 必给；u10m/v10m 给不了就没有强度项）\n"
+            "        观测 babj（BABJ 台风路径报文 diamond7，一个文件一条路径）\n"
+            "        参考 无\n"
+            "  计算  typhoon_track：从**起报时刻的实况位置**起步，逐时效在经纬\n"
+            "        方框里搜最低气压中心当台风中心；下一时效的方框中心是这一\n"
+            "        时效的诊断结果（链式），不是实况位置——所以整段时效必须\n"
+            "        落在同一个工作块里，配置的 execution 里写 lead_chunk_days: 0\n"
+            "        强度 = 以当前诊断中心为中心的 ±5° 方框内最大 10m 风速\n"
+            "        实况按 起报时刻 + 时效 + 8h（北京时）取 BABJ 分析场；对不上\n"
+            "        的时效不外推不插值，留空\n"
+            "  指标  track_error\n"
+            "        逐场次给 track_err_km / at_km / ct_km / wind_err_ms /\n"
+            "        pmin_err_hpa 五个时效均值；首个配对时效的 at/ct 为空\n"
+            "        （没有前一个实况位置就无从定向）\n"
+            "        产出 scores.csv、typhoon/tc<编号>_<起报>.csv（逐时效 15 列）、\n"
+            "        typhoon/tc<编号>_<起报>_meta.json、typhoon/typhoon.csv（全场合拼）\n"
+            "  注意  搜索框参数（center_half_deg 等）在配置的 options 里覆盖"
+        ),
+        metrics=[MetricSpec("track_error")],
+        writers=["csv_long", "typhoon_cases"],
+        options={
+            "wind_variables": ["u10m", "v10m"],
+            "center_half_deg": 3.0,
+            "early_half_deg": 4.0,
+            "early_hours": 12.0,
+            "intensity_half_deg": 5.0,
+        },
     ),
     "fdp_activity_spectrum": PipelineTemplate(
         name="fdp_activity_spectrum",

@@ -17,7 +17,16 @@ import logging
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
-from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple
+from typing import (
+    Any,
+    Dict,
+    Iterable,
+    Iterator,
+    List,
+    Optional,
+    Sequence,
+    Tuple,
+)
 
 import numpy as np
 import xarray as xr
@@ -31,6 +40,7 @@ from xmetai_evaluation.pipeline.matcher import (
     align_to_grid,
 )
 from xmetai_evaluation.pipeline.spec import PipelineSpec, daily_times, hourly_times
+from xmetai_evaluation.pipeline.typhoon import diagnose_track, match_errors
 from xmetai_evaluation.transforms.temporal import window_sum_at
 
 log = logging.getLogger(__name__)
@@ -54,6 +64,111 @@ def station_observation_span(
         min(init_times) + offset + timedelta(hours=1 - window_hours),
         max(init_times) + offset + timedelta(hours=lead_max_hours),
     )
+
+
+def typhoon_storm_filter(options: Dict[str, Any]) -> Optional[List[str]]:
+    """要评哪几号台风：``storm_ids``（列表）或 ``tcid``（单号），都不写 = 全部。
+
+    协议和执行计划层共用这一份解析——两边各写一遍，迟早出现"计划层按全部
+    台风切块、协议只跑其中一号"这种不报错的白跑。
+    """
+    wanted = options.get("storm_ids")
+    if wanted is None and options.get("tcid") is not None:
+        wanted = [options.get("tcid")]
+    if not wanted:
+        return None
+    return [str(value) for value in wanted]
+
+
+def babj_seed_moment(
+    moments: Iterable[datetime],
+    init_bjt: datetime,
+    min_offset_hours: float = 6.0,
+) -> Optional[datetime]:
+    """链式诊断的起始中心该取哪一条实况（协议与执行计划层共用的唯一口径）。
+
+    取**起报后第一条不早于「起报 + min_offset_hours」的实况**；一条都没有就
+    返回 ``None``，调用方跳过这个场次。
+
+    为什么起点不是起报时刻本身，而是往后一个时效：链的种子要保证**第一条
+    时效能配上实况**。报文里的分析场是 6 小时一个（北京时 02/08/14/20），
+    台风当天的第一条定位常常落在 20:00（12 UTC）——拿 08:00 当种子的话，
+    那条实况永远不是任何时效的验证时刻（第一个时效 valid = 14:00），整条
+    曲线会一个实况都配不上，白出一个全空场次。从第一个时效的 valid 时刻起
+    找，就不会有这个问题。
+
+    默认 6.0 就是第一个时效的步长，与标准归档（``tc/fuxi``）同口径：那边
+    的 ``init_pos`` 实测恒等于"起报后第一条不早于 init+6h 的实况"。改用
+    起报时刻本身当种子会让绝大多数场次的种子前移约 6 小时（中位 ~100km），
+    虽然被 ±4° 的早期搜索框吸收、曲线多半仍然一致，但边界场次（台风刚生成
+    / 快消散、msl 场平缓）会静默对不上。
+
+    只往后找，不往前找：往前找等于用"预报还没起步"的位置当起点，时效与
+    实况对不上。
+
+    ``moments`` 可以是某号台风的 ``{北京时: 记录}`` 字典（协议侧），也可以是
+    几号台风实况时刻的并集（计划层切块前用它）。
+    """
+    if min_offset_hours <= 0:
+        # 0 = 种子就取起报时刻那条；等价于"起点不往后挪"
+        return init_bjt if init_bjt in moments else None
+    limit = init_bjt + timedelta(hours=min_offset_hours)
+    later = [moment for moment in moments if moment >= limit]
+    return min(later) if later else None
+
+
+def babj_init_times(
+    observation: Any,
+    init_times: List[datetime],
+    offset_hours: float,
+    storm_ids: Optional[List[str]] = None,
+    min_offset_hours: float = 6.0,
+) -> List[datetime]:
+    """从 BABJ 报文反推哪些起报时刻对得上实况（协议与执行计划层共用的唯一口径）。
+
+    报文只在北京时的整点上有分析场，而预报的起报时刻是 UTC：一个起报能用，
+    当且仅当 ``babj_seed_moment`` 给它找得到起始中心（不是"起报时刻正好有
+    实况"，见那个函数）。旧链路就是这么**反推**起报时刻的，而不是先跑一遍
+    再靠报错筛掉。
+
+    计划层用它在切块前把对不上的起报日剔出去。不剔的后果不是"少跑几场"：
+    台风空档期（生成前、消散后）那些起报日仍会各切出一个块，每块读到 0 个
+    样本、被判失败块，manifest 里堆一片「工作块失败」——看着像跑挂了，实际
+    只是那天没有台风。同时也白读一遍全部报文。
+
+    ``storm_ids`` 必须参与筛选，否则会漏掉一层：只跑 2501 时，7 月那些"有
+    别的台风、没有 2501"的日子照样会切出空块。所以这里按**在评的那几号
+    台风**的实况时刻取并集。
+
+    ``min_offset_hours`` 必须与协议侧同源（``plan.py`` 两处传的是同一个配置
+    项 ``seed_min_offset_hours``）。这里收窄了、协议没收窄，就会静默少场次
+    ——正是这个函数跟 ``babj_seed_moment`` 共用一份规则要避免的事。
+
+    报文是 KB 级、数量以十计，这里整目录读一次换准确的起报集，划算。
+    """
+    request = DataRequest(source_id=observation.source_id, variables=["storm"])
+    bundle = observation.reader.read(request, observation.catalog.discover(request))
+    payload = bundle.payload
+    names = [str(value) for value in payload["storm"].values]
+    scope = [
+        index
+        for index, name in enumerate(names)
+        if storm_ids is None or name in storm_ids
+    ]
+    moments = set()
+    for index in scope:
+        column = payload["lat"].values[:, index]
+        for k in range(column.size):
+            if np.isfinite(column[k]):
+                moments.add(
+                    payload["time"].values[k].astype("datetime64[us]").item()
+                )
+    offset = timedelta(hours=offset_hours)
+    return [
+        value
+        for value in init_times
+        if babj_seed_moment(moments, value + offset, min_offset_hours) is not None
+    ]
 
 
 def sample_leads(available_leads: Sequence[float], window_hours: float) -> List[float]:
@@ -92,6 +207,46 @@ def select_observation_files(
 def _never_requires_members() -> bool:
     """没有 needs_members() 的指标（如自定义实现）默认不需要成员。"""
     return False
+
+
+def parse_regions(raw: Any) -> List[Tuple[str, float, float]]:
+    """解析 ``options["regions"] = {带名: {"lat_min": 南界, "lat_max": 北界}}``。
+
+    带名进结果坐标（长表里现成的 ``region`` 列）、边界闭区间。只有显式
+    声明才分区——不提供任何"预设带"，要哪几条带写在配置里一目了然。
+
+    格点与站点两条协议共用：解析和校验只该有一份，复制出去的副本迟早
+    只在一边上修。**闭区间是刻意的**，闭区间下相邻带在公共边界上重叠
+    （如 ``±20`` 与 ``20-90`` 都含 20.0），改成一端开会让两类产物的分带
+    口径不一致。带怎么挡由各自的 ``restrict_to_latitude_band`` 决定。
+    """
+    if not raw:
+        return []
+    if not isinstance(raw, dict):
+        raise ConfigError(
+            "regions 必须是 {带名: {'lat_min': 南界, 'lat_max': 北界}} 字典，"
+            f"收到 {type(raw).__name__}"
+        )
+    parsed: List[Tuple[str, float, float]] = []
+    for name, bounds in raw.items():
+        try:
+            lat_min = float(bounds["lat_min"])  # type: ignore[index]
+            lat_max = float(bounds["lat_max"])  # type: ignore[index]
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ConfigError(
+                f"纬度带 {name!r} 需要数值 lat_min / lat_max，收到 {bounds!r}"
+            ) from exc
+        if lat_min >= lat_max:
+            raise ConfigError(
+                f"纬度带 {name!r} 的 lat_min({lat_min}) 必须小于 lat_max({lat_max})"
+            )
+        parsed.append((str(name), lat_min, lat_max))
+    return parsed
+
+
+def regions_summary(regions: Sequence[Tuple[str, float, float]]) -> List[str]:
+    """带列表 → manifest 里的 ``"tropics[-20, 20]"`` 形式（空就不写这个键）。"""
+    return [f"{name}[{lat_min:g}, {lat_max:g}]" for name, lat_min, lat_max in regions]
 
 
 @dataclass
@@ -191,6 +346,20 @@ class StationValidTimeProtocol(Protocol):
         #: 会出现在多个块里，跨块相加会把一个坏起报数成好几个。
         self.skipped_init_times: List[str] = []
         self.ref_reader = None
+        #: 分纬度带评估：[(带名, 南界, 北界)]，来自 options["regions"]；
+        #: 空 = 不分区，输出与没有这个能力之前逐行一致。与上面 ``prepare()``
+        #: 里那个单区域筛选 ``options["region"]`` 是**两回事**：那个把站点整体
+        #: 裁到 lat/lon 盒子里（永久改 ``observation_ds``），这个是在裁完的站点
+        #: 上再逐带出样本。同时配两种时注意：全球行的 ``region`` 会兜底成单区域
+        #: 的名字（见 ``defaults()``），于是按「region 为空 = 全球」取数的下游
+        #: 会取不到那行——要么只配 ``regions``，要么在配置里给单区域一个名字前
+        #: 想清楚这一点。
+        self.regions = parse_regions(spec.options.get("regions"))
+        #: ``build_batch`` 的单条缓存，键 ``(起报, 时效)``；见那里的注释。
+        #: 值可能是 ``None``（该 (起报, 时效) 一个有效站都没有），所以配一个
+        #: 独立的哨兵键而不是判空。
+        self._batch_cache_key: Any = None
+        self._batch_cache: Optional[EvaluationBatch] = None
         #: 每块前 N 个样本打一条"样本诊断"（形状 + 有效站数），用来定位"样本
         #: 出不来"。**它是块口径、不是 run 口径**：这个协议实例每个工作块重建
         #: 一次（``executor.collect_chunk``），所以实际条数是 N × 块数——全年那趟
@@ -367,21 +536,38 @@ class StationValidTimeProtocol(Protocol):
                     continue
                 emitted += 1
                 lead_key = int(lead) if float(lead).is_integer() else float(lead)
+                base_coordinates = {
+                    "lead_h": lead_key,
+                    "window_h": self.window_hours,
+                    "variable": self.observation_var,
+                    "sample_unit": self.sample_unit,
+                }
+                base_payload = {
+                    "init_time": init_time,
+                    "lead": lead,
+                    "windows": windows,
+                    "member_windows": member_windows,
+                }
+                # 全球行不带 region 坐标——不分区时的输出行和这个能力出现之前
+                # 逐行一致（同 GridValidTimeProtocol.samples）。
                 yield Sample(
                     key=("lead_h", lead_key),
-                    coordinates={
-                        "lead_h": lead_key,
-                        "window_h": self.window_hours,
-                        "variable": self.observation_var,
-                        "sample_unit": self.sample_unit,
-                    },
-                    payload={
-                        "init_time": init_time,
-                        "lead": lead,
-                        "windows": windows,
-                        "member_windows": member_windows,
-                    },
+                    coordinates=base_coordinates,
+                    payload=base_payload,
                 )
+                # 每个纬度带再各出一个样本：键尾追加带名，region 进结果坐标
+                # （长表现成的 region 列）。带掩码不在 build_batch 里叠——与
+                # 格点同口径，执行层统一按 payload 里的 region_bounds 挡：
+                # 站点批次的掩码维度是 station，由执行层按站点纬度切。
+                for name, lat_min, lat_max in self.regions:
+                    yield Sample(
+                        key=("lead_h", lead_key, name),
+                        coordinates={**base_coordinates, "region": name},
+                        payload={
+                            **base_payload,
+                            "region_bounds": (lat_min, lat_max),
+                        },
+                    )
 
         if emitted == 0:
             # 一个样本都没产出：块会记成「没有成功处理任何评测批次」。原因无非
@@ -416,6 +602,16 @@ class StationValidTimeProtocol(Protocol):
         init_time = sample.payload["init_time"]
         lead = sample.payload["lead"]
         windows = sample.payload["windows"]
+        # 分纬度带时同一个 (起报, 时效) 连着发 1 + N 个样本（全球 + 每带一个），
+        # 而这里每次都要重做「观测窗口求和 + 全场双线性插值到站」——全场插值
+        # 是这条流程最贵的一步，不缓存就是白算 N 倍。批次只装站点尺寸的数组
+        # （网格场留在 sample.payload 里、不进批次），所以只记上一个就够：
+        # ``samples()`` 按 (起报, 时效) 分组顺序发，同组的样本必然相邻，
+        # 内存 O(1)。协议实例是**每块重建**的（见 executor.collect_chunk），
+        # 这个缓存不跨块。
+        cache_key = (init_time, lead)
+        if self._batch_cache_key == cache_key:
+            return self._batch_cache
         valid_time = init_time + timedelta(
             hours=float(lead) + self.spec.local_utc_offset_hours
         )
@@ -465,6 +661,9 @@ class StationValidTimeProtocol(Protocol):
                 },
             )
         if int(valid_mask.sum()) == 0:
+            # 「这个 (起报, 时效) 没样本」同样要记进缓存，否则带样本会把这套
+            # 计算再白做 N 遍
+            self._batch_cache_key, self._batch_cache = cache_key, None
             return None
         if self._diagnostics_left > 0:
             self._diagnostics_left -= 1
@@ -477,7 +676,7 @@ class StationValidTimeProtocol(Protocol):
                 int(valid_mask.sum()),
             )
 
-        return EvaluationBatch(
+        batch = EvaluationBatch(
             forecast=forecast_at_station,
             observation=observation,
             sample_keys=[
@@ -497,6 +696,8 @@ class StationValidTimeProtocol(Protocol):
             },
             protocol_id=self.name,
         )
+        self._batch_cache_key, self._batch_cache = cache_key, batch
+        return batch
 
     def defaults(self, context: PipelineContext) -> Dict[str, Any]:
         return {
@@ -522,6 +723,8 @@ class StationValidTimeProtocol(Protocol):
             "skipped_init_times": list(self.skipped_init_times),
             "window_hours": self.window_hours,
         }
+        if self.regions:
+            summary["regions"] = regions_summary(self.regions)
         if self.forecast_index is not None:
             summary["forecast_input_files"] = self._forecast_input_files()
         if self.observation_bundle is not None:
@@ -587,37 +790,7 @@ class GridValidTimeProtocol(Protocol):
         self.batches: Dict[Any, EvaluationBatch] = {}
         #: 分纬度带评估：[(带名, 南界, 北界)]，来自 options["regions"]；
         #: 空 = 不分区，输出与没有这个能力之前逐行一致
-        self.regions = self._parse_regions(spec.options.get("regions"))
-
-    @staticmethod
-    def _parse_regions(raw: Any) -> List[Tuple[str, float, float]]:
-        """解析 ``options["regions"] = {带名: {"lat_min": 南界, "lat_max": 北界}}``。
-
-        带名进结果坐标（长表里现成的 ``region`` 列）、边界闭区间。只有显式
-        声明才分区——不提供任何"预设带"，要哪几条带写在配置里一目了然。
-        """
-        if not raw:
-            return []
-        if not isinstance(raw, dict):
-            raise ConfigError(
-                "regions 必须是 {带名: {'lat_min': 南界, 'lat_max': 北界}} 字典，"
-                f"收到 {type(raw).__name__}"
-            )
-        parsed: List[Tuple[str, float, float]] = []
-        for name, bounds in raw.items():
-            try:
-                lat_min = float(bounds["lat_min"])  # type: ignore[index]
-                lat_max = float(bounds["lat_max"])  # type: ignore[index]
-            except (KeyError, TypeError, ValueError) as exc:
-                raise ConfigError(
-                    f"纬度带 {name!r} 需要数值 lat_min / lat_max，收到 {bounds!r}"
-                ) from exc
-            if lat_min >= lat_max:
-                raise ConfigError(
-                    f"纬度带 {name!r} 的 lat_min({lat_min}) 必须小于 lat_max({lat_max})"
-                )
-            parsed.append((str(name), lat_min, lat_max))
-        return parsed
+        self.regions = parse_regions(spec.options.get("regions"))
 
     def prepare(self, context: PipelineContext) -> None:
         forecast = context.forecast
@@ -936,10 +1109,7 @@ class GridValidTimeProtocol(Protocol):
             valid_times = sorted(self.batches)
         summary: Dict[str, Any] = {"valid_times": valid_times}
         if self.regions:
-            summary["regions"] = [
-                f"{name}[{lat_min:g}, {lat_max:g}]"
-                for name, lat_min, lat_max in self.regions
-            ]
+            summary["regions"] = regions_summary(self.regions)
         for name, bundle in (
             ("forecast", self.forecast_bundle),
             ("observation", self.observation_bundle),
@@ -949,6 +1119,359 @@ class GridValidTimeProtocol(Protocol):
             provenance = bundle.provenance
             summary[f"{name}_input_files"] = list(provenance.input_files)
             summary[f"{name}_reader"] = f"{provenance.reader_id}@{provenance.reader_version}"
+        return summary
+
+
+class TyphoonTrackProtocol(Protocol):
+    """台风路径与强度检验：从全球场链式诊断中心，对 BABJ 报文配对。
+
+    - **样本空间**：每个起报 × 每号台风一个样本；
+    - **结果键**：``("init", ISO时刻, "storm", 编号)``；
+    - **预报侧**：整段时效的 MSL 场（+ u10/v10 派生的风速），从**起报时刻的
+      实况位置**起步，逐时效在方框里搜最低气压中心，下一时效的搜索框中心
+      是这一时效的诊断结果（链式，见 ``pipeline/typhoon.py``）；
+    - **观测侧**：BABJ 报文里 ``起报时刻 + 时效 + tz_shift``（北京时）的实况；
+    - **样本单位**：``storm``。
+
+    配对的口径按 ``valid_time`` 走：一对不上实况的时效，观测侧留空、
+    ``valid_mask`` 为假，指标据此外推——**不外推、不插值**。
+
+    **链式要求整段时效落在同一个工作块里**：时效被切开时，后一块的搜索起点
+    接不上前一块诊断出的中心（只能用实况位置重起），结果会静默偏掉。所以这里
+    显式校验 ``lead_chunk_days=0``，切了就报错，不出假数。
+    """
+
+    name = "typhoon_track"
+
+    def __init__(self, spec: PipelineSpec):
+        super().__init__(spec)
+        self.forecast_var = str(spec.variables.get("forecast") or "msl")
+        self.wind_vars = [
+            str(name)
+            for name in (spec.options.get("wind_variables") or ("u10m", "v10m"))
+        ]
+        self.tz_shift = float(spec.local_utc_offset_hours)
+        self.center_half = float(spec.options.get("center_half_deg", 3.0))
+        self.early_half = float(spec.options.get("early_half_deg", 4.0))
+        self.early_hours = float(spec.options.get("early_hours", 12.0))
+        self.intensity_half = float(spec.options.get("intensity_half_deg", 5.0))
+        # 链的种子最早取到"起报后多久"的实况，见 babj_seed_moment。6.0 = 第一个
+        # 时效的步长，与标准归档同口径；0 = 就取起报时刻那条（找不到就跳过）。
+        self.seed_min_offset = float(spec.options.get("seed_min_offset_hours", 6.0))
+        # 想只跑某几号台风就填 storm_ids（单号可写 tcid），留空跑报文目录下全部
+        self.storm_ids = typhoon_storm_filter(spec.options)
+        self.batches: Dict[Any, EvaluationBatch] = {}
+        self.sample_list: List[Sample] = []
+        self.skipped_no_analysis: List[str] = []
+        self.seed_gaps: List[str] = []
+        self.forecast_bundle = None
+        self.observation_bundle = None
+
+    # ------------------------------------------------------------ 准备
+
+    def prepare(self, context: PipelineContext) -> None:
+        forecast = context.forecast
+        observation = context.observation
+        init_times = [
+            datetime.fromisoformat(str(value))
+            for value in self.spec.forecast.params.get("init_times", [])
+        ]
+        if not init_times:
+            start, end = self.spec.period()
+            discovered = forecast.catalog.discover(
+                DataRequest(
+                    source_id=forecast.source_id,
+                    variables=[self.forecast_var],
+                    init_times=daily_times(start, end),
+                )
+            )
+            init_times = forecast.reader.available_init_times(discovered)
+            if not init_times:
+                raise ValueError(f"时间范围 {start} 到 {end} 内没有可用预报起报时间")
+        if self.spec.limit:
+            init_times = init_times[: self.spec.limit]
+        self.init_times = init_times
+
+        lead_times = [
+            float(value) for value in self.spec.forecast.params.get("lead_times") or []
+        ]
+        probe = forecast.catalog.discover(
+            DataRequest(
+                source_id=forecast.source_id,
+                variables=[self.forecast_var],
+                init_times=init_times,
+            )
+        )
+        lead_max = float(forecast.reader.max_lead_hours(probe))
+        if lead_times and max(lead_times) < lead_max:
+            raise ConfigError(
+                f"台风链路要求整段时效落在同一个工作块里，但这一块只拿到 "
+                f"0–{max(lead_times):g}h（数据里有 {lead_max:g}h）。链式诊断的搜索"
+                f"起点是上一时效的诊断中心，时效被切开后后一块只能退回实况位置重起，"
+                f"结果会偏而看不出来。请在配置的 execution 里写 lead_chunk_days: 0。"
+            )
+
+        forecast_request = DataRequest(
+            source_id=forecast.source_id,
+            variables=[self.forecast_var, *self.wind_vars],
+            init_times=init_times,
+            lead_times=lead_times or None,
+        )
+        self.forecast_bundle = forecast.reader.read(
+            forecast_request, forecast.catalog.discover(forecast_request)
+        )
+        log.debug("台风预报场读取完成: %s", self.forecast_bundle.payload.dims)
+
+        # BABJ：一条报文一条路径，整个目录一次读完（理由见 io/babj_reader.py）
+        if context.loader is not None:
+            self.observation_bundle = context.loader.materialize(
+                "observation",
+                DataRequest(
+                    source_id=observation.source_id,
+                    variables=["storm"],
+                    init_times=init_times,
+                ),
+            )
+        else:
+            obs_request = DataRequest(source_id=observation.source_id, variables=["storm"])
+            self.observation_bundle = observation.reader.read(
+                obs_request, observation.catalog.discover(obs_request)
+            )
+        self.babj = self.observation_bundle.payload
+        log.debug("BABJ 报文读取完成: %s", self.babj.sizes)
+
+        self._diagnose_all(init_times, lead_times)
+
+    def _diagnose_all(self, init_times: List[datetime], lead_times: List[float]) -> None:
+        """逐 (起报, 台风) 链式诊断 + 配对，把结果打包成批次。"""
+        ds = self.forecast_bundle.payload
+        glat = np.asarray(ds["lat"].values, dtype="f8")
+        glon = np.asarray(ds["lon"].values, dtype="f8")
+        # lead 轴按数值升序对齐：文件名序号推出来的时效天然有序，但显式排序
+        # 之后，链式诊断的推进顺序与 ``leads_hours`` 才一定一致。
+        order = np.argsort(np.asarray(ds["lead_time"].values, dtype="f8"))
+        leads = np.asarray(ds["lead_time"].values, dtype="f8")[order]
+
+        have_wind = all(name in ds for name in self.wind_vars)
+        if not have_wind:
+            log.warning(
+                "预报场缺 %s，强度项（fcst_vmax / wind_err）将全为空", "/".join(self.wind_vars)
+            )
+
+        storm_ids = [str(value) for value in np.asarray(self.babj["storm"].values)]
+        for tcid in storm_ids:
+            if self.storm_ids and tcid not in self.storm_ids:
+                continue
+            index = storm_ids.index(tcid)
+            analyses = self._storm_analyses(index)
+            for init_time in init_times:
+                init_bjt = init_time + timedelta(hours=self.tz_shift)
+                origin, seed_offset_h = self._seed(analyses, init_bjt)
+                if origin is None:
+                    self.skipped_no_analysis.append(f"{tcid}@{init_bjt}")
+                    continue
+                # 种子比下限还晚 = 第一个时效那条分析场缺了（台风当天刚编号，
+                # 或者刚消散）。正常场次不记，否则每个场次都要刷一行。
+                if seed_offset_h > self.seed_min_offset + 1e-6:
+                    self.seed_gaps.append(f"{tcid}@{init_bjt}+{seed_offset_h:g}h")
+                field = self._series(ds, self.forecast_var, init_time, order)
+                wind = None
+                if have_wind:
+                    u = np.asarray(self._series(ds, self.wind_vars[0], init_time, order), dtype="f8")
+                    v = np.asarray(self._series(ds, self.wind_vars[1], init_time, order), dtype="f8")
+                    wind = np.sqrt(u**2 + v**2)
+                track = diagnose_track(
+                    np.asarray(field),
+                    glat,
+                    glon,
+                    origin["lat"],
+                    origin["lon"],
+                    leads,
+                    wind=wind,
+                    center_half=self.center_half,
+                    early_half=self.early_half,
+                    early_hours=self.early_hours,
+                    intensity_half=self.intensity_half,
+                )
+                rows = match_errors(track, leads, init_time, analyses, tz_shift=self.tz_shift)
+                key = ("init", init_time.isoformat(), "storm", tcid)
+                tcname = str(self.babj["tcname"].values[index])
+                self.batches[key] = self._build_batch(
+                    key, init_time, tcid, tcname, leads, rows, origin, seed_offset_h
+                )
+                self.sample_list.append(
+                    Sample(
+                        key=key,
+                        coordinates={
+                            "storm": tcid,
+                            "init_time": init_time.isoformat(),
+                            "sample_unit": "storm",
+                        },
+                        payload={"batch_key": key},
+                    )
+                )
+        if self.seed_gaps:
+            head = "、".join(self.seed_gaps[:5])
+            log.info(
+                "台风链式诊断：%d 个场次起报后第一个时效那条没有实况，种子落到了更晚的"
+                "一条（%s%s）——这些场次的 meta 里 seed 不是 init+%gh。台风当天的第一条"
+                "定位常在 20:00（12 UTC），落在这一类的多是生成首日与消散收尾。",
+                len(self.seed_gaps),
+                head,
+                "…" if len(self.seed_gaps) > 5 else "",
+                self.seed_min_offset,
+            )
+
+    @staticmethod
+    def _series(ds, name: str, init_time: datetime, order) -> np.ndarray:
+        """取某个起报下单个变量的整条时效序列，按 lead 升序。"""
+        selected = ds[name].sel(init_time=np.datetime64(init_time))
+        return np.asarray(selected.values)[order]
+
+    def _storm_analyses(self, index: int) -> Dict[datetime, Dict[str, float]]:
+        """把第 index 号台风的实况列拆成 ``{北京时: {lat, lon, pmin_hpa, vmax_ms}}``。
+
+        形状与旧链路的 ``read_babj_analyses`` 返回值一致——``match_errors``
+        直接吃这个字典。
+        """
+        lat = self.babj["lat"].values[:, index]
+        analyses: Dict[datetime, Dict[str, float]] = {}
+        for k in range(lat.size):
+            if not np.isfinite(lat[k]):
+                continue
+            moment = self.babj["time"].values[k].astype("datetime64[us]").item()
+            analyses[moment] = {
+                "lat": float(lat[k]),
+                "lon": float(self.babj["lon"].values[k, index]),
+                "pmin_hpa": float(self.babj["pmin"].values[k, index]),
+                "vmax_ms": float(self.babj["vmax"].values[k, index]),
+            }
+        return analyses
+
+    def _seed(
+        self, analyses: Dict[datetime, Dict[str, float]], init_bjt: datetime
+    ) -> Tuple[Optional[Dict[str, float]], float]:
+        """取链式诊断的起始中心，返回 ``(实况记录, 相对起报时刻的偏移小时)``。
+
+        取哪一条由 ``babj_seed_moment`` 说了算——**计划层切块前筛起报日用的是
+        同一个函数**，两边口径必须是一份，否则会出现"计划层剔了某天、协议其实
+        能跑"的静默缺场次。这里只负责把时刻翻成记录。
+        """
+        moment = babj_seed_moment(analyses, init_bjt, self.seed_min_offset)
+        if moment is None:
+            return None, 0.0
+        return analyses[moment], (moment - init_bjt).total_seconds() / 3600.0
+
+    def _build_batch(
+        self,
+        key: Tuple,
+        init_time: datetime,
+        tcid: str,
+        tcname: str,
+        leads: np.ndarray,
+        rows: List[Dict[str, Any]],
+        origin: Dict[str, float],
+        seed_offset_h: float = 0.0,
+    ) -> EvaluationBatch:
+        """把一条诊断路径 + 对应实况打包成 ``(lead_time, storm)`` 的批次。
+
+        预报侧给**诊断出来的路径**（lat/lon/pmin/vmax），观测侧给**配对上的
+        实况**；两者的差就是路径误差，由 ``track_error`` 指标算——协议只管
+        配对，不算分。对不上实况的时效观测侧为 NaN，``valid_mask`` 为假。
+        """
+        def column(name: str) -> np.ndarray:
+            return np.array([row[name] for row in rows], dtype="f8")[:, None]
+
+        coords = {"lead_time": leads, "storm": [tcid]}
+        forecast_ds = xr.Dataset(
+            {
+                "lat": (("lead_time", "storm"), column("fcst_lat")),
+                "lon": (("lead_time", "storm"), column("fcst_lon")),
+                "pmin": (("lead_time", "storm"), column("fcst_pmin_hpa")),
+                "vmax": (("lead_time", "storm"), column("fcst_vmax_ms")),
+            },
+            coords=coords,
+        )
+        obs_ds = xr.Dataset(
+            {
+                "lat": (("lead_time", "storm"), column("obs_lat")),
+                "lon": (("lead_time", "storm"), column("obs_lon")),
+                "pmin": (("lead_time", "storm"), column("obs_pmin_hpa")),
+                "vmax": (("lead_time", "storm"), column("obs_vmax_ms")),
+            },
+            coords=coords,
+        )
+        matched = np.isfinite(column("obs_lat"))
+        valid_mask = xr.DataArray(
+            matched, dims=("lead_time", "storm"), coords=coords, name="valid_mask"
+        )
+        return EvaluationBatch(
+            forecast=forecast_ds,
+            observation=obs_ds,
+            sample_keys=[{"init": init_time.isoformat(), "storm": tcid}],
+            valid_mask=valid_mask,
+            sample_dim="storm",
+            alignment={
+                "method": "storm_track",
+                # 台风中文名只走 alignment：它不进长表（不在 _COORD_FIELDS 里），
+                # 但 typhoon_cases writer 拼 typhoon.csv 时要写进 tcname 列。
+                "tcname": tcname,
+                "tz_shift_hours": self.tz_shift,
+                "init_bjt": (init_time + timedelta(hours=self.tz_shift)).isoformat(),
+                "init_position": [origin["lat"], origin["lon"]],
+                # 起始中心相对起报时刻的偏移小时（见 babj_seed_moment）：正常是
+                # seed_min_offset（6h），更大说明那一条分析场缺了。只在 meta 里
+                # 标出来，不参与任何计算。
+                "seed_offset_hours": seed_offset_h,
+                "search": {
+                    "center_half_deg": self.center_half,
+                    "early_half_deg": self.early_half,
+                    "early_hours": self.early_hours,
+                    "intensity_half_deg": self.intensity_half,
+                },
+            },
+            protocol_id=self.name,
+        )
+
+    # ------------------------------------------------------------ 遍历
+
+    def samples(self, context: PipelineContext) -> Iterator[Sample]:
+        yield from self.sample_list
+
+    def build_batch(
+        self, context: PipelineContext, sample: Sample
+    ) -> Optional[EvaluationBatch]:
+        return self.batches.get(sample.payload["batch_key"])
+
+    def defaults(self, context: PipelineContext) -> Dict[str, Any]:
+        return {"sample_unit": "storm", "variable": self.forecast_var, "unit": "km"}
+
+    def summary(self) -> Dict[str, Any]:
+        summary: Dict[str, Any] = {
+            "init_times": [value.isoformat() for value in getattr(self, "init_times", [])],
+            "tz_shift_hours": self.tz_shift,
+            "search": {
+                "center_half_deg": self.center_half,
+                "early_half_deg": self.early_half,
+                "early_hours": self.early_hours,
+                "intensity_half_deg": self.intensity_half,
+            },
+            "n_sessions": len(self.sample_list),
+        }
+        if self.skipped_no_analysis:
+            # 起报时刻对不上实况（报文里没有那一刻的分析场）——常见于预报从 +6h
+            # 起编、而报文的分析场只到 00/12 UTC，报出来免得看着像少跑了。
+            summary["skipped_no_analysis"] = list(self.skipped_no_analysis)
+        for name, bundle in (
+            ("forecast", self.forecast_bundle),
+            ("observation", self.observation_bundle),
+        ):
+            if bundle is None:
+                continue
+            summary[f"{name}_input_files"] = list(bundle.provenance.input_files)
+            summary[f"{name}_reader"] = (
+                f"{bundle.provenance.reader_id}@{bundle.provenance.reader_version}"
+            )
         return summary
 
 

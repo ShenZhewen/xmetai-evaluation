@@ -42,6 +42,9 @@ SCORE_COLUMNS: List[str] = [
     "init_time",
     "valid_time",
     "sample_unit",
+    # 台风编号。sample_unit 那一列放的是样本单位**维度名**（"storm"），
+    # 不带是哪一号；路径类结果要认人，必须有自己的列。
+    "storm",
     "value",
     "unit",
     "status",
@@ -64,6 +67,9 @@ DETAIL_COLUMNS: List[str] = [
     "lead_h",
     "init_time",
     "valid_time",
+    # 分纬度带评估下这一列是必需的：列联表计数（hits/misses/false_alarms）
+    # 逐带各不相同，没有它不同带的同名诊断量会在宽表里互相覆盖，且不报错
+    "region",
     "group",
     "field",
     "value",
@@ -96,6 +102,7 @@ _COORD_FIELDS: Sequence[str] = (
     "init_time",
     "valid_time",
     "sample_unit",
+    "storm",
     "weights_id",
 )
 
@@ -228,6 +235,7 @@ def _detail_row(base: Dict[str, Any], group: Any, field_name: Any, field_value: 
         "lead_h": base.get("lead_h", ""),
         "init_time": base.get("init_time", ""),
         "valid_time": base.get("valid_time", ""),
+        "region": base.get("region", ""),
         "group": _clean(group),
         "field": _clean(field_name),
         "value": _clean(field_value),
@@ -377,6 +385,9 @@ WIDE_COLUMNS: List[str] = [
     "run_id",
     "window_h",
     "lead_h",
+    # 分纬度带评估：全球行为空，其余是带名。**必须进透视键**（见
+    # ``categorical_wide``），否则各带的同名 (时效, 等级) 会互相覆盖。
+    "region",
     "grade",
     "threshold_mm",
     "hits",
@@ -412,7 +423,9 @@ def categorical_wide(tables: ResultTables) -> pd.DataFrame:
     if categorical.empty:
         return pd.DataFrame(columns=WIDE_COLUMNS)
 
-    keys = ["run_id", "window_h", "lead_h", "group"]
+    # region 进键：分纬度带时同一个 (时效, 等级) 在每条带上各有一份，
+    # 不进键就是后写的带覆盖前面的带，且一声不响
+    keys = ["run_id", "window_h", "lead_h", "region", "group"]
     records: Dict[tuple, Dict[str, Any]] = {}
 
     def _record_for(row: Any) -> Dict[str, Any]:
@@ -448,6 +461,8 @@ PROBABILITY_WIDE_COLUMNS: List[str] = [
     "run_id",
     "window_h",
     "lead_h",
+    # 同分类宽表：分纬度带时全球行为空、其余是带名，且必须进透视键
+    "region",
     "grade",
     "threshold_mm",
     "AROC",
@@ -476,8 +491,8 @@ def probability_wide(tables: ResultTables) -> pd.DataFrame:
     if probabilistic.empty:
         return pd.DataFrame(columns=PROBABILITY_WIDE_COLUMNS)
 
-    keys = ["run_id", "window_h", "lead_h", "group"]
-    merge_keys = ["run_id", "window_h", "lead_h", "grade"]
+    keys = ["run_id", "window_h", "lead_h", "region", "group"]
+    merge_keys = ["run_id", "window_h", "lead_h", "region", "grade"]
     wide = (
         probabilistic.drop_duplicates(subset=keys)[keys + ["threshold"]]
         .rename(columns={"group": "grade", "threshold": "threshold_mm"})
