@@ -166,32 +166,68 @@ def narrow_batch(batch: EvaluationBatch, variable: str) -> Optional[EvaluationBa
     )
 
 
+def _station_latitudes(mask: xr.DataArray) -> np.ndarray:
+    """一维站点掩码上逐点的纬度。
+
+    站点纬度是 ``grid_to_station`` 变换挂在插值结果上的 ``station_lat``
+    （见 ``transforms/interpolation.py``，那里有测试守着这个约定）。
+    ``lat`` 是备选：观测侧读进来的站点纬度就叫这个名字，收窄后两个都有。
+    """
+    for name in ("station_lat", "lat"):
+        coord = mask.coords.get(name)
+        if coord is not None and coord.dims == mask.dims:
+            return np.asarray(coord.values, dtype="f8")
+    raise AlignmentError(
+        "站点分纬度带评估需要掩码上带站点纬度坐标（station_lat），"
+        f"当前掩码维度 {tuple(mask.dims)}、可用坐标 {sorted(mask.coords)}"
+    )
+
+
 def restrict_to_latitude_band(
     batch: EvaluationBatch, lat_min: float, lat_max: float
 ) -> EvaluationBatch:
     """把批次的 valid_mask 收缩到 [lat_min, lat_max] 内（闭区间）。
 
-    分纬度带评估用。数据一个格点不裁、只挡掩码：标量指标（rmse/bias/
-    acc/activity）全部按 valid_mask 加权或筛点，带外的格点自然不进任何
-    统计量。要完整场的指标（谱/FSS）在执行层就被跳过 region 样本，
-    不会走到这里。
+    分纬度带评估用。数据一个点不裁、只挡掩码：标量指标（rmse/bias/
+    acc/activity/ts_score）全部按 valid_mask 加权或筛点，带外的点自然
+    不进任何统计量。要完整场的指标（谱/FSS）在执行层就被跳过 region
+    样本，不会走到这里。
+
+    两种掩码各走一条：
+    - 格点批次 ``("lat", "lon")``：按掩码自己的 ``lat`` 坐标挡；
+    - 站点批次一维 ``("station",)``：按站点纬度挡（见
+      :func:`_station_latitudes`）。站点点位是离散的，闭区间下带外的站
+      整站在掩码里被挡掉，站上的预报/观测值一个不裁。
+
+    **闭区间**是刻意的：与 :func:`protocols.parse_regions` 的带定义一致，
+    改成一端开会让格点与站点两类产物的分带口径不一致。
 
     必须在 ``narrow_batch`` **之后**调用：收窄会按单变量重算 valid_mask，
     先叠的带掩码会被重算覆盖掉。
     """
     mask = batch.valid_mask
-    if mask is None or mask.dims[-2:] != ("lat", "lon") or "lat" not in mask.coords:
-        raise AlignmentError(
-            "分纬度带评估需要带 lat/lon 坐标的格点有效掩码，"
-            f"当前掩码维度是 {tuple(mask.dims) if mask is not None else None}"
+    if mask is None:
+        raise AlignmentError("分纬度带评估需要有效掩码，当前批次没有 valid_mask")
+
+    if mask.dims[-2:] == ("lat", "lon") and "lat" in mask.coords:
+        lat = mask.coords["lat"].values
+        inside = (lat >= lat_min) & (lat <= lat_max)
+        band = xr.DataArray(
+            np.broadcast_to(inside[:, None], mask.shape[-2:]),
+            coords={"lat": lat, "lon": mask.coords["lon"].values},
+            dims=["lat", "lon"],
         )
-    lat = mask.coords["lat"].values
-    inside = (lat >= lat_min) & (lat <= lat_max)
-    band = xr.DataArray(
-        np.broadcast_to(inside[:, None], mask.shape[-2:]),
-        coords={"lat": lat, "lon": mask.coords["lon"].values},
-        dims=["lat", "lon"],
-    )
+    elif mask.ndim == 1:
+        lats = _station_latitudes(mask)
+        band = xr.DataArray(
+            np.asarray((lats >= lat_min) & (lats <= lat_max)),
+            dims=list(mask.dims),
+        )
+    else:
+        raise AlignmentError(
+            "分纬度带评估的掩码只能是格点 (lat, lon) 或一维站点 (station,)，"
+            f"当前掩码维度是 {tuple(mask.dims)}"
+        )
     return replace(batch, valid_mask=mask & band)
 
 

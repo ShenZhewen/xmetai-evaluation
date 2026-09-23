@@ -62,16 +62,24 @@ def _mask_field(batch: EvaluationBatch, observation: np.ndarray) -> np.ndarray:
     ``n_valid`` 完全相同。**改这里就等于改分带口径**，别把它当成纯优化。
     """
     mask = getattr(batch, "valid_mask", None)
+    shape = np.shape(observation)
     if mask is None:
-        return np.ones(np.shape(observation), dtype=bool)
+        return np.ones(shape, dtype=bool)
     values = _values(mask) != 0.0
-    if values.shape != np.shape(observation):
-        raise MetricError(
-            f"valid_mask 形状 {values.shape} 与观测场 {np.shape(observation)} 不一致，"
-            "集合指标无法叠加纬度带掩码",
-            variable="ensemble",
-        )
-    return values
+    if values.shape == shape:
+        return values
+    # 集合批次可能多挂一条**前导 member 轴**：掩码是「预报 ∩ 观测」，预报没被
+    # 降成集合平均时（``Matcher(ensemble_reduction="none")``）就带上这一维。
+    # 纬度带掩码只由经纬度决定，沿成员轴各成员一致；成员各自的缺测另有 ``m``
+    # （有效成员数）管着。所以这里沿多余的前导轴取「任一成员有效」——取「全部
+    # 有效」会把只有个别成员缺测的格点在全球口径下也一并剔掉，那是另一回事。
+    if values.ndim == len(shape) + 1 and values.shape[1:] == shape:
+        return values.any(axis=0)
+    raise MetricError(
+        f"valid_mask 形状 {values.shape} 与观测场 {shape} 不一致，"
+        "集合指标无法叠加纬度带掩码",
+        variable="ensemble",
+    )
 
 
 class CRPS(Metric):
