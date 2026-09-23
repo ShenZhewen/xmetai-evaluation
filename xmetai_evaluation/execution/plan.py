@@ -27,6 +27,7 @@ from xmetai_evaluation.execution.loader import RoleSpec, RunLoader
 from xmetai_evaluation.execution.profiles import ResourceProfile, union_profile
 from xmetai_evaluation.execution.strategy import ExecutionStrategy, derive_strategy
 from xmetai_evaluation.pipeline.protocols import (
+    TYPHOON_PROTOCOLS,
     babj_init_times,
     sample_leads,
     station_observation_span,
@@ -101,7 +102,7 @@ def build_plan(
         raise EvaluationError(
             f"流程 {spec.pipeline or spec.name} 在评测时段内没有可用预报起报"
         )
-    if spec.protocol == "typhoon_track":
+    if spec.protocol in TYPHOON_PROTOCOLS:
         # 起报时刻由报文**反推**（旧链路同口径）：预报目录是逐日的，台风却不是
         # 天天有——不筛的话空档期的每一天都会切出一个 0 样本的块，在 manifest
         # 里堆成一片"工作块失败"。放在 limit 之前筛，limit=1 才真的是"第一个
@@ -530,7 +531,7 @@ def _build_roles(
         "observation", strategy, n_chunks, profile, leads, warmup_hours
     )
 
-    if spec.protocol == "typhoon_track":
+    if spec.protocol in TYPHOON_PROTOCOLS:
         # BABJ 报文一个文件就是一号台风的**整条路径**（跨越多天），没有"按跨度
         # 挑文件"这回事；整包 KB 级，一次读完就是全部。角色必须是 slice：
         # resident 命中缓存后要按请求跨度切时间轴，而报文时间轴是北京时、覆盖

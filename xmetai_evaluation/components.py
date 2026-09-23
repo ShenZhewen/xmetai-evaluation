@@ -275,6 +275,12 @@ def _metric_track_error(**params):
     return TrackError(params)
 
 
+def _metric_track_error_ens(**params):
+    from xmetai_evaluation.metrics.track_error import TrackErrorEns
+
+    return TrackErrorEns(params)
+
+
 def _metric_acc(climatology_path: Optional[str] = None, **params):
     from xmetai_evaluation.metrics.acc import ACC
 
@@ -579,7 +585,7 @@ def _writer_typhoon_cases(tables, context, output_dir: Path) -> Path:
     曲线从 ``tables.curves`` 取（``kind == "typhoon_track"``），不走 ``value``：
     15 字段 × 60 时效 × 全年场次会把长表撑爆，而曲线本来就有专门的出口。
     """
-    from xmetai_evaluation.metrics.track_error import CURVE_FIELDS
+    from xmetai_evaluation.metrics.track_error import CURVE_FIELDS, ENS_EXTRA_FIELDS
 
     cases = [
         entry
@@ -590,9 +596,15 @@ def _writer_typhoon_cases(tables, context, output_dir: Path) -> Path:
     cases_dir.mkdir(parents=True, exist_ok=True)
 
     combined_rows: List[List[Any]] = []
+    combined_fields: List[str] = list(CURVE_FIELDS)
     written: List[Path] = []
     for entry in cases:
         curve = entry["curve"]
+        # 集合曲线比确定性多 5 列（方案 A 的三项 + 逐时效成员数），**确定性那条
+        # 路径一列不加**：加列会让已有归档的对拍整个错位。
+        is_ens = str(curve.get("forecast_type") or "") == "ens"
+        fields = list(CURVE_FIELDS) + (list(ENS_EXTRA_FIELDS) if is_ens else [])
+        combined_fields = fields
         tcid = str(curve.get("storm") or "")
         tcname = str(curve.get("tcname") or "")
         # 曲线里的 init_utc 是 isoformat（带 T），旧归档写的是空格分隔
@@ -607,12 +619,12 @@ def _writer_typhoon_cases(tables, context, output_dir: Path) -> Path:
             # lineterminator 必须显式给：csv 模块默认 '\r\n'，旧归档是 '\n'。
             # 不写这一行，逐字节对拍时会看到"整个文件每一行都不同"。
             out = csv.writer(stream, lineterminator="\n")
-            out.writerow(list(CURVE_FIELDS))
+            out.writerow(fields)
             for row_index in range(len(leads)):
                 out.writerow(
                     [
                         _typhoon_number(curve.get(field, [None] * len(leads))[row_index])
-                        for field in CURVE_FIELDS
+                        for field in fields
                     ]
                 )
         written.append(path)
@@ -631,7 +643,7 @@ def _writer_typhoon_cases(tables, context, output_dir: Path) -> Path:
             # 20:00，就会是 "init+12h"。和别家归档对不上 init_pos 的场次先看这个
             # 字段——曲线可以完全一样，种子取的时刻不同。
             "seed": _seed_label(curve.get("seed_offset_h")),
-            "forecast_type": "det",
+            "forecast_type": "ens" if is_ens else "det",
             "lead_step": _lead_step(leads),
             "tz_shift_h": curve.get("tz_shift", 8.0),
             "search": curve.get("search") or {},
@@ -641,6 +653,21 @@ def _writer_typhoon_cases(tables, context, output_dir: Path) -> Path:
             "n_leads": len(leads),
             "n_matched": len(matched),
         }
+        if is_ens:
+            # 集合口径：曲线里的 fcst_* 与 track_err_km / at_km / ct_km 是**方案 B**
+            # （集合平均位置 vs 实况），*_a 三列是**方案 A**（成员误差平均）。
+            # 强度类两项两方案代数恒等，只有一列。
+            meta.update(
+                {
+                    "n_members": len(curve.get("members") or []),
+                    "members": list(curve.get("members") or []),
+                    "aggregation": {
+                        "B": "集合平均位置 vs 实况"
+                        "（fcst_* / track_err_km / at_km / ct_km）",
+                        "A": "成员误差平均（track_err_km_a / at_km_a / ct_km_a）",
+                    },
+                }
+            )
         with (cases_dir / f"{stem}_meta.json").open("w", encoding="utf-8") as stream:
             json.dump(meta, stream, ensure_ascii=False, indent=2)
             stream.write("\n")
@@ -650,14 +677,14 @@ def _writer_typhoon_cases(tables, context, output_dir: Path) -> Path:
                 [tcid, tcname, init_utc]
                 + [
                     _typhoon_repr(curve.get(field, [None] * len(leads))[row_index])
-                    for field in CURVE_FIELDS
+                    for field in fields
                 ]
             )
 
     combined = cases_dir / "typhoon.csv"
     with combined.open("w", encoding="utf-8", newline="") as stream:
         out = csv.writer(stream, lineterminator="\n")
-        out.writerow(["tcid", "tcname", "init_utc", *CURVE_FIELDS])
+        out.writerow(["tcid", "tcname", "init_utc", *combined_fields])
         out.writerows(combined_rows)
     return combined
 
@@ -738,6 +765,12 @@ def _protocol_typhoon_track(spec):
     from xmetai_evaluation.pipeline.protocols import TyphoonTrackProtocol
 
     return TyphoonTrackProtocol(spec)
+
+
+def _protocol_typhoon_track_ens(spec):
+    from xmetai_evaluation.pipeline.protocols import TyphoonTrackEnsProtocol
+
+    return TyphoonTrackEnsProtocol(spec)
 
 
 _REGISTERED = False
@@ -838,6 +871,13 @@ def _register_all() -> None:
         _metric_track_error,
         "台风路径误差：大圆距离 + 沿/横分解 + 强度偏差（配合 typhoon_track 协议）",
     )
+    register_metric(
+        "track_error_ens",
+        "1.0.0",
+        _metric_track_error_ens,
+        "集合台风的路径误差：方案 B（平均位置）与方案 A（成员误差平均）两种口径"
+        "（配合 typhoon_track_ens 协议）",
+    )
     register_metric("acc", "1.0.0", _metric_acc, "距平相关系数")
     register_metric(
         "acc_uncentered",
@@ -896,6 +936,13 @@ def _register_all() -> None:
         "1.0.0",
         _protocol_typhoon_track,
         "台风路径：从实况位置链式诊断预报中心，对 BABJ 报文配对；样本键为 storm",
+    )
+    register_protocol(
+        "typhoon_track_ens",
+        "1.0.0",
+        _protocol_typhoon_track_ens,
+        "集合台风路径：逐成员链式诊断（成员串行读，峰值内存与确定性链同级），"
+        "批次带成员轴；样本键为 storm",
     )
 
     register_writer("csv_long", "1.0.0", lambda **kw: _writer_csv_long, "统一长表 scores.csv")

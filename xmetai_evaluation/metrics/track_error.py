@@ -57,6 +57,28 @@ CURVE_FIELDS = (
 #: 落进长表的场次级标量（"value 键 -> 中文说明"，键名同时是 curve 里的字段名）
 SUMMARY_FIELDS = ("track_err_km", "at_km", "ct_km", "wind_err_ms", "pmin_err_hpa")
 
+#: 集合曲线在确定性 15 列之外多出来的列（顺序即写盘顺序）
+ENS_EXTRA_FIELDS = (
+    "n_members",
+    "n_valid_members",
+    "track_err_km_a",
+    "at_km_a",
+    "ct_km_a",
+)
+
+#: 集合口径落进长表的场次级标量。强度类（wind/pmin）两方案代数恒等，只出一行；
+#: 路径类三项方案 A / B 各出一行，键名里的 ``_a`` 就是口径标记。
+ENS_SUMMARY_FIELDS = (
+    "track_err_km",
+    "at_km",
+    "ct_km",
+    "wind_err_ms",
+    "pmin_err_hpa",
+    "track_err_km_a",
+    "at_km_a",
+    "ct_km_a",
+)
+
 
 def _nanmean(values: np.ndarray) -> float:
     """全 NaN 时返回 NaN，不报警告（全 NaN 是"这条路径一个时效都没配上"）。"""
@@ -68,6 +90,11 @@ def _nanmean(values: np.ndarray) -> float:
 
 class TrackError(Metric):
     """路径误差（大圆距离）+ 沿/横路径分解 + 强度偏差。"""
+
+    #: ``merge`` 时要跟着 lead 一起重排的列。集合那条链的曲线比确定性多几列
+    #: （方案 A 与逐时效成员数），不一起重排的话那几列会留在第一个状态的顺序上
+    #: ——看着有值，其实已经错位了。
+    MERGE_FIELDS = CURVE_FIELDS
 
     def __init__(self, params: Dict[str, Any] = None):
         super().__init__(name="track_error", version="1.0.0", params=params or {})
@@ -229,7 +256,7 @@ class TrackError(Metric):
             )
         order = sorted(range(len(leads)), key=lambda index: leads[index])
         merged = dict(curves[0])
-        for field in CURVE_FIELDS:
+        for field in self.MERGE_FIELDS:
             if field in ("lead_h", "valid_bjt"):
                 continue
             if field not in merged:
@@ -258,6 +285,211 @@ class TrackError(Metric):
         n_matched = int(curve["n_matched"])
         values = {
             field: _nanmean(np.asarray(curve[field], dtype="f8")) for field in SUMMARY_FIELDS
+        }
+        status = ResultStatus.SUCCESS if n_matched else ResultStatus.NO_VALID_DATA
+        return MetricResult(
+            metric_name=self.name,
+            metric_version=self.version,
+            value=values,
+            status=status,
+            n_requested=n_leads,
+            n_valid=n_matched,
+            unit="km",
+            aggregation="mean_over_leads",
+            product_kind=self.PRODUCT_KIND,
+            curve=curve,
+            warnings=[] if n_matched else ["这条路径没有任何时效配上实况"],
+        )
+
+
+def _row_nanmean(values: np.ndarray) -> np.ndarray:
+    """按行取均值（跳过 NaN）；整行全 NaN 时给 NaN，且不触发 RuntimeWarning。
+
+    集合平均位置对"这个时效能诊断出中心的成员"求平均，与旧链路
+    （``g["fcst_lat"].mean()``）同口径：成员的链在个别时效搜不到中心是正常的，
+    那片 NaN 不该把整个时效的集合平均也变成 NaN。
+    """
+    values = np.asarray(values, dtype="f8")
+    if values.ndim == 1:
+        values = values[:, None]
+    finite = np.isfinite(values)
+    counts = finite.sum(axis=1)
+    totals = np.where(finite, values, 0.0).sum(axis=1)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        means = totals / counts
+    return np.where(counts > 0, means, np.nan)
+
+
+class TrackErrorEns(TrackError):
+    """集合台风的路径与强度误差：方案 A / B 两种口径一次算清。
+
+    与 ``TrackError`` 的差别只在**批次带成员轴**时怎么算：
+
+    - 曲线的 15 个确定性列里，``fcst_*`` 给的是**集合平均位置**，所以
+      ``track_err_km`` / ``at_km`` / ``ct_km`` 就是**方案 B**；
+    - 方案 A 的三项另开 ``*_a`` 列（逐成员先算误差、再对成员平均）；
+    - 强度类两项两方案代数恒等，只出一列——
+      ``mean_m(pmin_m − obs) ≡ mean_m(pmin_m) − obs``，实况对成员是常数。
+
+    逐时效仍走标量循环；方案 A 只是在成员维上多一层循环，**每个成员算误差的调用
+    顺序与确定性链完全一致**——对拍要的是逐位一致，不是"数学上等价"。
+
+    集合平均位置用朴素算术平均（不处理环绕）——与旧链路
+    ``recompute_ens_track_error.py`` 一致；一条路径横跨换日线的情况不存在。
+    """
+
+    MERGE_FIELDS = CURVE_FIELDS + ENS_EXTRA_FIELDS
+
+    def __init__(self, params: Dict[str, Any] = None):
+        super().__init__(params)
+        # TrackError.__init__ 把名字定成了 "track_error"，这里改回集合的这个
+        self.name = "track_error_ens"
+
+    def validate(self, batch: EvaluationBatch) -> None:
+        super().validate(batch)
+        data = self._side(batch, "forecast")
+        if "member" not in data.dims:
+            raise MetricError(
+                f"track_error_ens 要的是带成员轴的批次（预报 (lead_time, storm, "
+                f"member)），这一批的维是 {tuple(data.dims)}。确定性链路请用 "
+                f"track_error。",
+                variable=self.name,
+            )
+
+    def _compute(self, batch: EvaluationBatch) -> Dict[str, Any]:
+        forecast = self._side(batch, "forecast")
+        observation = self._side(batch, "observation")
+
+        leads = np.asarray(forecast["lead_time"].values, dtype="f8")
+        members = [str(value) for value in np.asarray(forecast["member"].values)]
+        # (lead, member)：预报侧保留着成员轴，这里整条取出来
+        f_lat = np.asarray(forecast["lat"].values, dtype="f8")[:, 0, :]
+        f_lon = np.asarray(forecast["lon"].values, dtype="f8")[:, 0, :]
+        f_pmin = np.asarray(forecast["pmin"].values, dtype="f8")[:, 0, :]
+        f_vmax = np.asarray(forecast["vmax"].values, dtype="f8")[:, 0, :]
+        # (lead,)：实况对成员是同一份
+        o_lat = np.asarray(observation["lat"].values, dtype="f8")[:, 0]
+        o_lon = np.asarray(observation["lon"].values, dtype="f8")[:, 0]
+        o_pmin = np.asarray(observation["pmin"].values, dtype="f8")[:, 0]
+        o_vmax = np.asarray(observation["vmax"].values, dtype="f8")[:, 0]
+
+        m_lat = _row_nanmean(f_lat)
+        m_lon = _row_nanmean(f_lon)
+        m_pmin = _row_nanmean(f_pmin)
+        m_vmax = _row_nanmean(f_vmax)
+
+        n_lead = leads.size
+        n_member = len(members)
+        nan = float("nan")
+        err_b = np.full(n_lead, nan)
+        at_b = np.full(n_lead, nan)
+        ct_b = np.full(n_lead, nan)
+        err_a = np.full(n_lead, nan)
+        at_a = np.full(n_lead, nan)
+        ct_a = np.full(n_lead, nan)
+        wind = np.full(n_lead, nan)
+        pmin = np.full(n_lead, nan)
+        n_valid = np.zeros(n_lead, dtype=int)
+
+        # 逐时效标量推进：prev 只在**配对成功**的时效上更新，与确定性链同款。
+        prev = None
+        for k in range(n_lead):
+            if not np.isfinite(o_lat[k]):
+                continue
+            # 方案 B：集合平均位置 vs 实况
+            err_b[k] = float(great_circle_km(m_lat[k], m_lon[k], o_lat[k], o_lon[k]))
+            if prev is not None:
+                at_b[k], ct_b[k] = along_cross_track(
+                    prev[0], prev[1], o_lat[k], o_lon[k], m_lat[k], m_lon[k]
+                )
+            # 方案 A：逐成员算误差，再对"能诊断出中心"的成员平均
+            member_err: List[float] = []
+            member_at: List[float] = []
+            member_ct: List[float] = []
+            for j in range(n_member):
+                if not np.isfinite(f_lat[k, j]):
+                    continue
+                member_err.append(
+                    float(great_circle_km(f_lat[k, j], f_lon[k, j], o_lat[k], o_lon[k]))
+                )
+                if prev is not None:
+                    along, cross = along_cross_track(
+                        prev[0], prev[1], o_lat[k], o_lon[k], f_lat[k, j], f_lon[k, j]
+                    )
+                    member_at.append(float(along))
+                    member_ct.append(float(cross))
+            if member_err:
+                err_a[k] = float(np.mean(member_err))
+            if member_at:
+                at_a[k] = float(np.mean(member_at))
+            if member_ct:
+                ct_a[k] = float(np.mean(member_ct))
+            n_valid[k] = len(member_err)
+            # 强度类：两方案代数恒等（实况对成员是常数），但按**"成员误差再平均"**
+            # 算，而不是"平均后再求差"——两者数学上相等，浮点上差最后几位，而旧
+            # 链路是对逐成员的 pmin_err_hpa 取 .mean()（前者）。对拍要的是逐位一致。
+            member_wind = [
+                f_vmax[k, j] - o_vmax[k]
+                for j in range(n_member)
+                if np.isfinite(f_vmax[k, j])
+            ]
+            if member_wind:
+                wind[k] = float(np.mean(member_wind))
+            member_pmin = [
+                f_pmin[k, j] - o_pmin[k]
+                for j in range(n_member)
+                if np.isfinite(f_pmin[k, j])
+            ]
+            if member_pmin:
+                pmin[k] = float(np.mean(member_pmin))
+            prev = (o_lat[k], o_lon[k])
+
+        context = self._session_context(batch)
+        base = _parse_iso(context["init_utc"])
+        valid = [
+            str(base + _hours(float(lead) + context["tz_shift"])) if base else ""
+            for lead in leads
+        ]
+        return {
+            "kind": "typhoon_track",
+            **context,
+            # 曲线级标记：writer 据它决定要不要多写集合那几列
+            "forecast_type": "ens",
+            "members": list(members),
+            "lead_h": [float(value) for value in leads],
+            "valid_bjt": valid,
+            "fcst_lat": m_lat.tolist(),
+            "fcst_lon": m_lon.tolist(),
+            "fcst_pmin_hpa": m_pmin.tolist(),
+            "fcst_vmax_ms": m_vmax.tolist(),
+            "obs_lat": o_lat.tolist(),
+            "obs_lon": o_lon.tolist(),
+            "obs_pmin_hpa": o_pmin.tolist(),
+            "obs_vmax_ms": o_vmax.tolist(),
+            "track_err_km": err_b.tolist(),
+            "at_km": at_b.tolist(),
+            "ct_km": ct_b.tolist(),
+            "wind_err_ms": wind.tolist(),
+            "pmin_err_hpa": pmin.tolist(),
+            # 逐时效的成员数：``n_members`` 是参与了这批的成员总数（每个时效都
+            # 一样），``n_valid_members`` 是真的诊断出中心的那几个。旧链路的
+            # ``_ensemble.csv`` 就是这么两列。
+            "n_members": [n_member] * n_lead,
+            "n_valid_members": [int(value) for value in n_valid],
+            "track_err_km_a": err_a.tolist(),
+            "at_km_a": at_a.tolist(),
+            "ct_km_a": ct_a.tolist(),
+            "n_leads": int(n_lead),
+            "n_matched": int(np.isfinite(err_b).sum()),
+        }
+
+    def finalize(self, state: MetricState) -> MetricResult:
+        curve = state.data["curve"]
+        n_leads = int(curve["n_leads"])
+        n_matched = int(curve["n_matched"])
+        values = {
+            field: _nanmean(np.asarray(curve[field], dtype="f8"))
+            for field in ENS_SUMMARY_FIELDS
         }
         status = ResultStatus.SUCCESS if n_matched else ResultStatus.NO_VALID_DATA
         return MetricResult(

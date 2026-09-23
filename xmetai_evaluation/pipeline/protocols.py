@@ -117,6 +117,12 @@ def babj_seed_moment(
     return min(later) if later else None
 
 
+#: 台风链路的协议名（确定性 + 集合）。执行计划层有两处按协议形态分支——起报
+#: 时刻由报文反推（``typhoon_track`` 那一支）、观测角色必须是 slice——判的是
+#: 名字不是类，所以加新协议时这份清单要跟着一起加，漏了会静默走成站点协议。
+TYPHOON_PROTOCOLS = ("typhoon_track", "typhoon_track_ens")
+
+
 def babj_init_times(
     observation: Any,
     init_times: List[datetime],
@@ -1127,9 +1133,10 @@ class TyphoonTrackProtocol(Protocol):
 
     - **样本空间**：每个起报 × 每号台风一个样本；
     - **结果键**：``("init", ISO时刻, "storm", 编号)``；
-    - **预报侧**：整段时效的 MSL 场（+ u10/v10 派生的风速），从**起报时刻的
-      实况位置**起步，逐时效在方框里搜最低气压中心，下一时效的搜索框中心
-      是这一时效的诊断结果（链式，见 ``pipeline/typhoon.py``）；
+    - **预报侧**：整段时效的 MSL 场（+ u10/v10 派生的风速），从**起报后第一条
+      不早于「起报 + ``seed_min_offset_hours``」的实况位置**起步（默认 6h，见
+      ``babj_seed_moment``），逐时效在方框里搜最低气压中心，下一时效的搜索框
+      中心是这一时效的诊断结果（链式，见 ``pipeline/typhoon.py``）；
     - **观测侧**：BABJ 报文里 ``起报时刻 + 时效 + tz_shift``（北京时）的实况；
     - **样本单位**：``storm``。
 
@@ -1170,8 +1177,35 @@ class TyphoonTrackProtocol(Protocol):
     # ------------------------------------------------------------ 准备
 
     def prepare(self, context: PipelineContext) -> None:
+        self._prepare_common(context)
+        forecast = self.forecast
+        forecast_request = self._forecast_request(self.init_times, self.lead_times)
+        self.forecast_bundle = forecast.reader.read(
+            forecast_request, forecast.catalog.discover(forecast_request)
+        )
+        log.debug("台风预报场读取完成: %s", self.forecast_bundle.payload.dims)
+        self._diagnose_all(self.init_times, self.lead_times)
+
+    def _forecast_request(
+        self, init_times: List[datetime], lead_times: List[float]
+    ) -> DataRequest:
+        """预报场的请求：定中心要 msl，定强度要两个风分量。"""
+        return DataRequest(
+            source_id=self.forecast.source_id,
+            variables=[self.forecast_var, *self.wind_vars],
+            init_times=init_times,
+            lead_times=lead_times or None,
+        )
+
+    def _prepare_common(self, context: PipelineContext) -> None:
+        """起报时刻、时效切分校验、BABJ 报文——确定性链与集合链共用的前段。
+
+        预报场怎么读留给各自的 ``prepare``：确定性一次读完；集合按成员逐个读
+        （见 ``TyphoonTrackEnsProtocol``），一次只驻留一个成员的场。
+        """
         forecast = context.forecast
         observation = context.observation
+        self.forecast = forecast
         init_times = [
             datetime.fromisoformat(str(value))
             for value in self.spec.forecast.params.get("init_times", [])
@@ -1195,6 +1229,7 @@ class TyphoonTrackProtocol(Protocol):
         lead_times = [
             float(value) for value in self.spec.forecast.params.get("lead_times") or []
         ]
+        self.lead_times = lead_times
         probe = forecast.catalog.discover(
             DataRequest(
                 source_id=forecast.source_id,
@@ -1210,17 +1245,6 @@ class TyphoonTrackProtocol(Protocol):
                 f"起点是上一时效的诊断中心，时效被切开后后一块只能退回实况位置重起，"
                 f"结果会偏而看不出来。请在配置的 execution 里写 lead_chunk_days: 0。"
             )
-
-        forecast_request = DataRequest(
-            source_id=forecast.source_id,
-            variables=[self.forecast_var, *self.wind_vars],
-            init_times=init_times,
-            lead_times=lead_times or None,
-        )
-        self.forecast_bundle = forecast.reader.read(
-            forecast_request, forecast.catalog.discover(forecast_request)
-        )
-        log.debug("台风预报场读取完成: %s", self.forecast_bundle.payload.dims)
 
         # BABJ：一条报文一条路径，整个目录一次读完（理由见 io/babj_reader.py）
         if context.loader is not None:
@@ -1240,17 +1264,65 @@ class TyphoonTrackProtocol(Protocol):
         self.babj = self.observation_bundle.payload
         log.debug("BABJ 报文读取完成: %s", self.babj.sizes)
 
-        self._diagnose_all(init_times, lead_times)
+    @staticmethod
+    def _lead_axes(ds):
+        """预报场的 (lead 排序索引, 排序后的时效, 纬, 经)。
+
+        lead 轴按数值升序对齐：文件名序号推出来的时效天然有序，但显式排序之后，
+        链式诊断的推进顺序与 ``leads_hours`` 才一定一致。
+        """
+        order = np.argsort(np.asarray(ds["lead_time"].values, dtype="f8"))
+        leads = np.asarray(ds["lead_time"].values, dtype="f8")[order]
+        glat = np.asarray(ds["lat"].values, dtype="f8")
+        glon = np.asarray(ds["lon"].values, dtype="f8")
+        return order, leads, glat, glon
+
+    def _chain_rows(
+        self,
+        ds,
+        glat: np.ndarray,
+        glon: np.ndarray,
+        order: np.ndarray,
+        leads: np.ndarray,
+        analyses: Dict[datetime, Dict[str, float]],
+        init_time: datetime,
+        origin: Dict[str, float],
+        have_wind: bool,
+    ) -> List[Dict[str, Any]]:
+        """一个 (成员, 起报, 台风) 跑一次链式诊断并对 BABJ 实况配对。
+
+        确定性链走一遍，集合链的**每个成员各走一遍**，走的是同一段代码——
+        两条链的逐位同源靠这个保证，别把某一侧单独改掉。
+        """
+        field = np.asarray(self._series(ds, self.forecast_var, init_time, order))
+        wind = None
+        if have_wind:
+            u = np.asarray(
+                self._series(ds, self.wind_vars[0], init_time, order), dtype="f8"
+            )
+            v = np.asarray(
+                self._series(ds, self.wind_vars[1], init_time, order), dtype="f8"
+            )
+            wind = np.sqrt(u**2 + v**2)
+        track = diagnose_track(
+            field,
+            glat,
+            glon,
+            origin["lat"],
+            origin["lon"],
+            leads,
+            wind=wind,
+            center_half=self.center_half,
+            early_half=self.early_half,
+            early_hours=self.early_hours,
+            intensity_half=self.intensity_half,
+        )
+        return match_errors(track, leads, init_time, analyses, tz_shift=self.tz_shift)
 
     def _diagnose_all(self, init_times: List[datetime], lead_times: List[float]) -> None:
         """逐 (起报, 台风) 链式诊断 + 配对，把结果打包成批次。"""
         ds = self.forecast_bundle.payload
-        glat = np.asarray(ds["lat"].values, dtype="f8")
-        glon = np.asarray(ds["lon"].values, dtype="f8")
-        # lead 轴按数值升序对齐：文件名序号推出来的时效天然有序，但显式排序
-        # 之后，链式诊断的推进顺序与 ``leads_hours`` 才一定一致。
-        order = np.argsort(np.asarray(ds["lead_time"].values, dtype="f8"))
-        leads = np.asarray(ds["lead_time"].values, dtype="f8")[order]
+        order, leads, glat, glon = self._lead_axes(ds)
 
         have_wind = all(name in ds for name in self.wind_vars)
         if not have_wind:
@@ -1274,26 +1346,9 @@ class TyphoonTrackProtocol(Protocol):
                 # 或者刚消散）。正常场次不记，否则每个场次都要刷一行。
                 if seed_offset_h > self.seed_min_offset + 1e-6:
                     self.seed_gaps.append(f"{tcid}@{init_bjt}+{seed_offset_h:g}h")
-                field = self._series(ds, self.forecast_var, init_time, order)
-                wind = None
-                if have_wind:
-                    u = np.asarray(self._series(ds, self.wind_vars[0], init_time, order), dtype="f8")
-                    v = np.asarray(self._series(ds, self.wind_vars[1], init_time, order), dtype="f8")
-                    wind = np.sqrt(u**2 + v**2)
-                track = diagnose_track(
-                    np.asarray(field),
-                    glat,
-                    glon,
-                    origin["lat"],
-                    origin["lon"],
-                    leads,
-                    wind=wind,
-                    center_half=self.center_half,
-                    early_half=self.early_half,
-                    early_hours=self.early_hours,
-                    intensity_half=self.intensity_half,
+                rows = self._chain_rows(
+                    ds, glat, glon, order, leads, analyses, init_time, origin, have_wind
                 )
-                rows = match_errors(track, leads, init_time, analyses, tz_shift=self.tz_shift)
                 key = ("init", init_time.isoformat(), "storm", tcid)
                 tcname = str(self.babj["tcname"].values[index])
                 self.batches[key] = self._build_batch(
@@ -1472,6 +1527,317 @@ class TyphoonTrackProtocol(Protocol):
             summary[f"{name}_reader"] = (
                 f"{bundle.provenance.reader_id}@{bundle.provenance.reader_version}"
             )
+        return summary
+
+
+class TyphoonTrackEnsProtocol(TyphoonTrackProtocol):
+    """集合台风的路径与强度检验：逐成员链式诊断，再按两种口径聚合。
+
+    与确定性的 ``TyphoonTrackProtocol`` 只在**预报怎么读、批次怎么攒**上不同：
+    起报时刻、时效切分校验、BABJ 配对、起链种子口径全部继承，链式诊断本身也走
+    同一个 ``_chain_rows``——两条链的逐位同源靠这个保证。
+
+    **成员在协议内串行。** 每个成员单独读一次预报场（把索引字典筛成单成员再读，
+    见 ``_read_member``），诊断完就丢掉，峰值内存与确定性链同级（单成员一个起报
+    ≈0.75G）。全部成员一次读进来是这个数的成员数倍，放不下。代价是每个工作块
+    耗时 ×成员数；要更快只能把成员并进工作块，那要动 execution 的分块与合并。
+
+    **两种聚合口径**（与旧链路 ``core/tc_ref.py`` 的 ``ens_agg`` 对齐）：
+
+    - 方案 A：先算各成员自己的误差，再对成员平均；
+    - 方案 B：先把各成员位置平均成集合平均位置，再与实况求误差。
+
+    两者只在**路径类**三项（track_err / at / ct）上不同——三角不等式使然。
+    强度类两项代数上恒等：``mean_m(pmin_m − obs) ≡ mean_m(pmin_m) − obs``，
+    实况对成员是常数。批次里预报侧保留成员轴，聚合全在 ``track_error_ens`` 里做。
+    """
+
+    name = "typhoon_track_ens"
+
+    def __init__(self, spec: PipelineSpec):
+        super().__init__(spec)
+        self.members_found: List[str] = []
+        self.members_completed: List[str] = []
+        self.failed_members: Dict[str, str] = {}
+        self.forecast_input_files: List[str] = []
+        self.forecast_reader_id = ""
+
+    # ------------------------------------------------------------ 准备
+
+    def prepare(self, context: PipelineContext) -> None:
+        self._prepare_common(context)
+        self._diagnose_all_ens(self.init_times, self.lead_times)
+
+    def _read_member(self, request: DataRequest, index: DataIndex, member: str):
+        """只读一个成员的预报场，返回挤压掉成员轴之后的 payload。
+
+        ``GriddedReader.read`` 是从 ``index.available[0]`` 那个
+        ``{(起报, 成员, 时效): 路径}`` 字典还原记录的，所以**把字典筛成单成员再读
+        就等于只读这个成员**——io 层一行不用改，也不必把全部成员同时读进来。
+
+        读回来带一条长度 1 的成员轴（布局声明了 ``member_dim``），这里挤掉：后面
+        整条确定性代码路径（``_series`` 按 lead 取序列、``diagnose_track``）原样
+        能用，不必处处判成员轴在不在。
+        """
+        entries = index.available[0]
+        subset = {key: path for key, path in entries.items() if key[1] == member}
+        if not subset:
+            raise ConfigError(f"集合成员 {member} 在预报索引里没有任何文件")
+        bundle = self.forecast.reader.read(
+            request, DataIndex(source_id=index.source_id, available=[subset])
+        )
+        if not self.forecast_reader_id:
+            self.forecast_reader_id = (
+                f"{bundle.provenance.reader_id}@{bundle.provenance.reader_version}"
+            )
+        self.forecast_input_files.extend(bundle.provenance.input_files)
+        payload = bundle.payload
+        if "member" in payload.dims:
+            payload = payload.isel(member=0, drop=True)
+        return payload
+
+    def _diagnose_all_ens(
+        self, init_times: List[datetime], lead_times: List[float]
+    ) -> None:
+        """逐成员读 + 逐成员链式诊断，再按 (起报, 台风) 聚合成批次。"""
+        request = self._forecast_request(init_times, lead_times)
+        index = self.forecast.catalog.discover(request)
+        if not index.available:
+            raise ConfigError("集合预报索引为空，一个文件都没发现")
+        members = sorted({key[1] for key in index.available[0]})
+        if not members:
+            raise ConfigError(
+                "预报索引里一个集合成员都没有。集合链要求预报根目录下按起报分目录、"
+                "每个起报目录下再放 member_*/；指到确定性目录（没有 member_ 子目录）"
+                "会走到这里。"
+            )
+        self.members_found = list(members)
+
+        # 与成员无关的东西先算一遍：实况与起链种子。种子只由报文和起报时刻决定，
+        # 每个成员都一样，放进成员循环里重算是浪费。
+        storm_ids = [str(value) for value in np.asarray(self.babj["storm"].values)]
+        sessions: Dict[Tuple[str, datetime], Dict[str, Any]] = {}
+        for tcid in storm_ids:
+            if self.storm_ids and tcid not in self.storm_ids:
+                continue
+            storm_position = storm_ids.index(tcid)
+            analyses = self._storm_analyses(storm_position)
+            for init_time in init_times:
+                init_bjt = init_time + timedelta(hours=self.tz_shift)
+                origin, seed_offset_h = self._seed(analyses, init_bjt)
+                if origin is None:
+                    self.skipped_no_analysis.append(f"{tcid}@{init_bjt}")
+                    continue
+                # 种子比下限还晚 = 第一个时效那条分析场缺了（判断与确定性链同款）
+                if seed_offset_h > self.seed_min_offset + 1e-6:
+                    self.seed_gaps.append(f"{tcid}@{init_bjt}+{seed_offset_h:g}h")
+                sessions[(tcid, init_time)] = {
+                    "origin": origin,
+                    "seed_offset_h": seed_offset_h,
+                    "analyses": analyses,
+                    "tcname": str(self.babj["tcname"].values[storm_position]),
+                }
+
+        # {(台风, 起报): {成员: 该成员的逐时效行}}
+        collected: Dict[Tuple[str, datetime], Dict[str, List[Dict[str, Any]]]] = {
+            key: {} for key in sessions
+        }
+        for done, member in enumerate(members, start=1):
+            try:
+                payload = self._read_member(request, index, member)
+            except Exception as error:  # 单个成员坏掉不该毁掉整个场次
+                self.failed_members[member] = str(error)
+                log.warning("集合成员 %s 读取失败，跳过: %s", member, error)
+                continue
+            order, leads, glat, glon = self._lead_axes(payload)
+            have_wind = all(name in payload for name in self.wind_vars)
+            if not have_wind and done == 1:
+                log.warning(
+                    "预报场缺 %s，强度项（fcst_vmax / wind_err）将全为空",
+                    "/".join(self.wind_vars),
+                )
+            for (tcid, init_time), session in sessions.items():
+                collected[(tcid, init_time)][member] = self._chain_rows(
+                    payload,
+                    glat,
+                    glon,
+                    order,
+                    leads,
+                    session["analyses"],
+                    init_time,
+                    session["origin"],
+                    have_wind,
+                )
+            self.members_completed.append(member)
+            log.info("集合台风诊断：成员 %d/%d 完成（%s）", done, len(members), member)
+
+        if not self.members_completed:
+            detail = next(iter(self.failed_members.values()), "没有可用成员")
+            raise ConfigError(f"集合预报没有一个成员读成功，无法出结果: {detail}")
+
+        for (tcid, init_time), per_member in collected.items():
+            if not per_member:
+                continue
+            session = sessions[(tcid, init_time)]
+            key = ("init", init_time.isoformat(), "storm", tcid)
+            self.batches[key] = self._build_batch_ens(
+                key,
+                init_time,
+                tcid,
+                session["tcname"],
+                sorted(per_member),
+                per_member,
+                session["origin"],
+                session["seed_offset_h"],
+            )
+            self.sample_list.append(
+                Sample(
+                    key=key,
+                    coordinates={
+                        "storm": tcid,
+                        "init_time": init_time.isoformat(),
+                        "sample_unit": "storm",
+                    },
+                    payload={"batch_key": key},
+                )
+            )
+
+        if self.seed_gaps:
+            log.info(
+                "台风链式诊断：%d 个场次起报后第一个时效那条没有实况，种子落到了更晚的"
+                "一条（%s%s）——这些场次的 meta 里 seed 不是 init+%gh。",
+                len(self.seed_gaps),
+                "、".join(self.seed_gaps[:5]),
+                "…" if len(self.seed_gaps) > 5 else "",
+                self.seed_min_offset,
+            )
+        if self.failed_members:
+            log.warning(
+                "集合台风：%d/%d 个成员失败，已从聚合里剔除（%s）",
+                len(self.failed_members),
+                len(self.members_found),
+                "、".join(sorted(self.failed_members)[:5]),
+            )
+
+    def _build_batch_ens(
+        self,
+        key: Tuple,
+        init_time: datetime,
+        tcid: str,
+        tcname: str,
+        members: List[str],
+        per_member: Dict[str, List[Dict[str, Any]]],
+        origin: Dict[str, float],
+        seed_offset_h: float,
+    ) -> EvaluationBatch:
+        """打包成 ``(lead_time, storm, member)`` 的批次。
+
+        预报侧保留**成员轴**：成员各自的诊断位置是原始数据，集合平均位置与两种
+        误差口径都由 ``track_error_ens`` 去算，协议不预先聚合。观测侧给
+        ``(lead_time, storm)``——实况对成员是同一份，由指标自己广播。
+        """
+        def member_rows(field: str) -> np.ndarray:
+            """(lead, member)：各成员在该字段上的整条时效序列。"""
+            return np.stack(
+                [
+                    np.array([row[field] for row in per_member[member]], dtype="f8")
+                    for member in members
+                ],
+                axis=1,
+            )
+
+        def obs_column(field: str) -> np.ndarray:
+            """(lead, storm)：实况。取第一个成员的行——实况不随成员变。"""
+            return np.array(
+                [row[field] for row in per_member[members[0]]], dtype="f8"
+            )[:, None]
+
+        leads = np.array(
+            [row["lead_h"] for row in per_member[members[0]]], dtype="f8"
+        )
+        shared = {"lead_time": leads, "storm": [tcid]}
+        forecast_ds = xr.Dataset(
+            {
+                name: (("lead_time", "storm", "member"), member_rows(field)[:, None, :])
+                for name, field in (
+                    ("lat", "fcst_lat"),
+                    ("lon", "fcst_lon"),
+                    ("pmin", "fcst_pmin_hpa"),
+                    ("vmax", "fcst_vmax_ms"),
+                )
+            },
+            coords={**shared, "member": list(members)},
+        )
+        observation_ds = xr.Dataset(
+            {
+                name: (("lead_time", "storm"), obs_column(field))
+                for name, field in (
+                    ("lat", "obs_lat"),
+                    ("lon", "obs_lon"),
+                    ("pmin", "obs_pmin_hpa"),
+                    ("vmax", "obs_vmax_ms"),
+                )
+            },
+            coords=dict(shared),
+        )
+        valid_mask = xr.DataArray(
+            np.isfinite(obs_column("obs_lat")),
+            dims=("lead_time", "storm"),
+            coords=dict(shared),
+            name="valid_mask",
+        )
+        return EvaluationBatch(
+            forecast=forecast_ds,
+            observation=observation_ds,
+            sample_keys=[{"init": init_time.isoformat(), "storm": tcid}],
+            valid_mask=valid_mask,
+            sample_dim="storm",
+            alignment={
+                "method": "storm_track_ensemble",
+                # 台风中文名只走 alignment：它不进长表（不在 _COORD_FIELDS 里），
+                # 但 typhoon_cases writer 拼 typhoon.csv 时要写进 tcname 列。
+                "tcname": tcname,
+                "tz_shift_hours": self.tz_shift,
+                "init_bjt": (init_time + timedelta(hours=self.tz_shift)).isoformat(),
+                "init_position": [origin["lat"], origin["lon"]],
+                # 起始中心相对起报时刻的偏移小时（见 babj_seed_moment）：正常是
+                # seed_min_offset（6h），更大说明那一条分析场缺了。只写进 meta。
+                "seed_offset_hours": seed_offset_h,
+                "members": list(members),
+                "n_members": len(members),
+                "search": {
+                    "center_half_deg": self.center_half,
+                    "early_half_deg": self.early_half,
+                    "early_hours": self.early_hours,
+                    "intensity_half_deg": self.intensity_half,
+                },
+            },
+            protocol_id=self.name,
+        )
+
+    # ------------------------------------------------------------ 报告
+
+    def summary(self) -> Dict[str, Any]:
+        summary = super().summary()
+        summary.update(
+            {
+                "aggregation": {
+                    "A": "先算各成员自己的误差再对成员平均（mean member error by lead）",
+                    "B": "先把成员位置平均成集合平均位置再求误差"
+                    "（ensemble mean position error by lead）",
+                },
+                "n_members_found": len(self.members_found),
+                "n_members_completed": len(self.members_completed),
+                "members": list(self.members_found),
+                "failed_members": dict(self.failed_members),
+                "forecast_reader": self.forecast_reader_id,
+                # 输入文件数是一个成员的 51 倍（51 成员 × 60 时效 ≈ 三千条），
+                # 全量写进 summary 会跟着 ChunkOutcome 一起 pickle 到磁盘，每个
+                # 工作块平白多几百 KB。这里只取样前若干条，**总数照样写**。
+                "forecast_input_files": list(self.forecast_input_files[:20]),
+                "n_forecast_input_files": len(self.forecast_input_files),
+            }
+        )
         return summary
 
 

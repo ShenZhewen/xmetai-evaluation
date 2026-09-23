@@ -285,10 +285,11 @@ PIPELINE_TEMPLATES: Dict[str, PipelineTemplate] = {
             "  数据  预报 格点预报（msl 必给；u10m/v10m 给不了就没有强度项）\n"
             "        观测 babj（BABJ 台风路径报文 diamond7，一个文件一条路径）\n"
             "        参考 无\n"
-            "  计算  typhoon_track：从**起报时刻的实况位置**起步，逐时效在经纬\n"
-            "        方框里搜最低气压中心当台风中心；下一时效的方框中心是这一\n"
-            "        时效的诊断结果（链式），不是实况位置——所以整段时效必须\n"
-            "        落在同一个工作块里，配置的 execution 里写 lead_chunk_days: 0\n"
+            "  计算  typhoon_track：从**起报后第一条不早于 init+6h 的实况位置**\n"
+            "        起步（seed_min_offset_hours，默认 6.0），逐时效在经纬方框里\n"
+            "        搜最低气压中心当台风中心；下一时效的方框中心是这一时效的\n"
+            "        诊断结果（链式），不是实况位置——所以整段时效必须落在同一个\n"
+            "        工作块里，配置的 execution 里写 lead_chunk_days: 0\n"
             "        强度 = 以当前诊断中心为中心的 ±5° 方框内最大 10m 风速\n"
             "        实况按 起报时刻 + 时效 + 8h（北京时）取 BABJ 分析场；对不上\n"
             "        的时效不外推不插值，留空\n"
@@ -301,6 +302,42 @@ PIPELINE_TEMPLATES: Dict[str, PipelineTemplate] = {
             "  注意  搜索框参数（center_half_deg 等）在配置的 options 里覆盖"
         ),
         metrics=[MetricSpec("track_error")],
+        writers=["csv_long", "typhoon_cases"],
+        options={
+            "wind_variables": ["u10m", "v10m"],
+            "center_half_deg": 3.0,
+            "early_half_deg": 4.0,
+            "early_hours": 12.0,
+            "intensity_half_deg": 5.0,
+        },
+    ),
+    "weather_typhoon_ens": PipelineTemplate(
+        name="weather_typhoon_ens",
+        protocol="typhoon_track_ens",
+        description=(
+            "台风路径与强度检验（集合）：逐成员链式诊断 + 两种集合口径\n"
+            "  用途  集合预报里的台风中心报得准不准。除路径误差本身，逐时效的\n"
+            "        n_valid_members 还能看出成员是不是都跟住了同一个中心\n"
+            "  数据  预报 集合格点预报（按起报分目录，每个起报目录下放 member_*/；\n"
+            "              msl 必给，u10m/v10m 给不了就没有强度项）\n"
+            "        观测 babj（BABJ 台风路径报文 diamond7，一个文件一条路径）\n"
+            "        参考 无\n"
+            "  计算  typhoon_track_ens：**每个成员各跑一遍确定性的链式诊断**\n"
+            "        （与确定性链同一段代码），再按两种口径聚合——\n"
+            "          B（曲线主口径）各成员位置先平均成集合平均位置，再与实况求误差\n"
+            "          A（*_a 三列）  各成员先各算误差，再对成员平均\n"
+            "        两者只在路径三项（track_err / at / ct）上有差别——三角不等式\n"
+            "        使然；强度类两项代数恒等。成员**串行读**（一次只驻留一个成员\n"
+            "        的场），峰值内存与确定性链同级，代价是每块耗时 ×成员数\n"
+            "        整段时效仍必须落在同一个工作块里（lead_chunk_days: 0）\n"
+            "  指标  track_error_ens\n"
+            "        产出 scores.csv、typhoon/tc<编号>_<起报>.csv（确定性 15 列 +\n"
+            "        n_members / n_valid_members / track_err_km_a / at_km_a /\n"
+            "        ct_km_a）、_meta.json（含成员名与成员数）、typhoon/typhoon.csv\n"
+            "  注意  搜索框参数与确定性链共用；单个成员读失败会跳过并把名字记进产物，\n"
+            "        全部成员都失败才报错"
+        ),
+        metrics=[MetricSpec("track_error_ens")],
         writers=["csv_long", "typhoon_cases"],
         options={
             "wind_variables": ["u10m", "v10m"],
