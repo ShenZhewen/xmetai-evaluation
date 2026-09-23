@@ -358,7 +358,7 @@ LEAD_BANDS = ((0,120], (120,240], (240,360)]   单位 h，左开右闭
    （球谐带的 `1_4` / `5_20` …，见 `output/table.py:37`），**共 24 列**；
    但现存归档的 `scores.csv` 只有 **23 列、没有 `group`**——那是修 `group`
    之前跑出来的产物。此时 5 个频带的行混在一起无法区分，
-   `wave_report` 会走 `SPHERICAL_ABSENT`、§5.1–5.3 标「本批未出」。
+   `wave_report` 会走 `SPHERICAL_ABSENT`、§4.1–4.3 标「本批未出」。
    **修法是重跑评测**（配置里带 `spherical_bands` 指标即可），不是改报告端。
 
 ---

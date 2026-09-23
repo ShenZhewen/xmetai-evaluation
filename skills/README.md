@@ -384,7 +384,7 @@ skills/
     `weather_field_scores`。RMSE 家族单开入口的原因是**多模型对比**，不是形状不同
   - **实拍发现、写进文档让下次不用重新发现**：
     (a) 长表契约 **24 列**（含 `group`），而现存归档的 `scores.csv` 只有 **23 列**、
-    没有 `group` —— 球谐带 5 个频带的行因此认不出来，`wave_report` §5.1–5.3
+    没有 `group` —— 球谐带 5 个频带的行因此认不出来，`wave_report` §4.1–4.3
     会标「本批未出」，**重跑评测即可**；
     (b) `manifest.json` 的 `artifacts` 存的是**写盘时的绝对路径**，
     产物目录拷走后即失效，别拿它定位文件；
@@ -600,7 +600,90 @@ skills/
   - **本轮的 ts 渲染器改动尚未实跑**（手上没有 ts 产物目录），
     验证命令见下：`pytest tests/unit/visualization/test_ts_report.py`
 
+- **2026-09-22（续五）**: TS 系列接通分纬度带（协议 → 执行 → 宽表 → 报告）
+  - **起因**：用户要求「weather_ts 系列也要有像 RMSE 那样的分纬度带评估」。
+    与 RMSE 那份最大的不同在**切分对象**：RMSE 切的是格点，TS 切的是站点，
+    所以走的是 `station_valid_time` 协议、按**站点纬度整站归带**（读 `station_lat`，
+    退而求其次 `lat`；都取不到直接 `AlignmentError`，**不静默回退成全球分**
+    ——那会把全球分复制成每个带的分，比报错危险）
+  - **协议层**：`grid_valid_time` 早就有的 `options["regions"]`，站点那条现在
+    同样支持（`test_protocols.py` 新增三个用例，含闭区间与取不到纬度报错）
+  - **执行层**：带掩码必须在 `narrow_batch` **之后**叠（它按变量重算 `valid_mask`，
+    先叠会被冲掉）；`ensemble.py::_mask_field` 原本对 `valid_mask` 的形状卡得很死，
+    而 `ensemble_reduction="none"` 的批次会多挂一条前导 `member` 轴
+    ——现在容忍这一维（沿成员轴取「任一成员有效」），并在注释里写明为什么
+  - **宽表**：`region` 列终于有值了（带名，全球行为空）——`references/precipitation-evaluation.md`
+    里「降水检验里始终为空」那句据此订正
+  - **报告**：末尾新增 **「附 L 分纬度带结果（可选）」**。正文只留全球行、附 L 只留
+    带行（**两者永不合并**，各带平均再平均 ≠ 全球平均），图走独立编号 `图 L1`
+    不动正文图号；表按**南界从低到高**排（按带名排中文是乱序），并列按显示精度
+    判定并写明头名是否随时效翻转；没配分带的产物照样保留节位、写「本块本批未出」
+    （骨架契约要求章节数**严格相等**，条件性出节会让契约无解）
+  - **骨架**：`weather_ts_single.md` / `weather_ts_ens.md` 各三个分支同步（共 6 处）
+  - **配置**：`weather_ts_single_fgvp.py` 启用中国四带（南方 / 长江中下游 / 华北 /
+    东北），带名就用中文——**报告不翻译、不写死任何带名**，配置里叫什么就显示什么。
+    `weather_ts_ens_fuxi.py` **本轮没动**（先把 single 跑通、看过分带结果再决定）
+  - 验证：`pytest tests/unit/visualization/test_ts_report.py`（44 passed）与全量
+    `pytest`（353 passed / 2 skipped）
+
+- **2026-09-22（续六）**: `weather_ts_ens_fuxi.py` 也启用分纬度带，并订正 execution 注释
+  - **配置**：`weather_ts_ens_fuxi.py` 启用与中国四带**同一套**带定义（续五里留的
+    「先把 single 跑通再决定」到此收口）。`options` 是**两段共用**的，所以 24h 的 TS 段
+    与 6h 的概率段都会出带行；带样本与全球样本共用 `build_batch` 缓存的那个批次
+    （全场插值只做一次），代价是**计算量 ×5 而非读盘量 ×5**
+  - **报告侧的已知缺口**：附 L 只汇总 24h 那段的 TS。概率段的带行照常落进
+    `scores.csv` 与 `diagnostics/probability_wide.csv`（两个宽表的 `region` 都在透视
+    键里），但报告不出——第六节（AROC / BSS）本来就没有渲染器，缺口写在
+    `assets/templates/weather_ts_ens.md` 顶部
+  - **注释订正（只动注释，`execution` 的键一个没碰）**：
+    - `mode: processes` 原来的理由是「threads 并发读 nc 撞 HDF5 race」——那是
+      `hdf5_guard`（commit `8e45685`）**之前**的说法。配置改进程在 `8b15a23`，两者
+      中间隔了 11 个 commit，守卫已经把这条读路径串行化了。**结论不变、理由要换**：
+      `hdf5_guard` 是一把全局锁，threads 下所有 netCDF 打开都排队，而本配置一个 run
+      要开约 106 万个 nc，读盘正是大头，并发收益会被吃光；进程形态各读各的
+    - `n_workers` 补上单块内存算式：读取集 = 采样时效 ∪ 预热时效，24h 段
+      `{6,12,18,24}`×51 成员 = 204 场 ≈ 1.7 GB、6h 段 `{0,6,12,18,24}`×51 = 255 场
+      ≈ 2.1 GB（单场 8.2 MB / 0.25° 全球 float64，锚点是 `plan.py` 里「15 天 × 51
+      成员约 25GB」反推）。**n_workers × ~2 GB 即申请内存下限**：24 进程要 ~50 GB
+  - **文档**：`README.md` 与 `references/precipitation-evaluation.md` §9 补上这份配置
+
+- **2026-09-22（续七）**: `weather_rmse_wave` 降成**补充报告**：7 章 12 图 → 4 章 6 图
+  - **起因**：用户问「两份报告是互补的吗」，逐章对完发现**约一半是重复的**——
+    样本完整性、总体表、逐变量 RMSE、msl 量级检查、复算不足、ACC 风险、选型建议、
+    附 L、附 S 全在主报告里，12 张图里有 5 张（热力图 / 单起报谱曲线 / 雷达图 /
+    两张分纬度带）是**主报告附 5–7、附 L 的同一张图**。这份报告真正独有的只有
+    **球谐带 + 纬向 FFT** 那条链。用户随即要求「简化骨架，变成一份补充」
+  - **删掉的**：原 §3.1 排序随目标变化、原 §4 RMSE 与时效表现（含 §4.1）、
+    原 §5.5 热力图 / §5.6 单起报谱曲线 / §5.7 雷达图、原 §6 异常与数据质量风险、
+    原 §7 验收结论与选型建议、附 L 分纬度带。**`图 L*` 这个命名空间整个消失**
+  - **留下的**：`# 1.` 结论摘要（只讲谱）/ `# 2.` 数据范围与检验口径 /
+    `# 3.` 总体结果（`图 1`）/ `# 4.` 功率谱检验（§4.1–4.7，`图 2`–`图 6`）/
+    附录 + 附 S。第 3 节的综合相对 RMSE / ACC / FA **留着不是再判一次优劣**，
+    是给「相对」口径当 100 的基线；判读句一律落在两套谱上
+  - **图少了一张不是契约改口径**：原计划的 7 张里 `rmse_by_lead_range` 是
+    `_section_rmse` 删掉后**没人引用的孤儿图**，与其出一张正文不指的文件，
+    不如连生成块一起删——所以是 **6 张**，编号 `图 1`–`图 6` 连续
+  - **雷达图本来就是退化形状**（不是没出图）：用户问「雷达图似乎没放入报告里」，
+    实测文件在（原 §5.7 图 10 / 主报告 附 7），但这份产物**两个模型槽喂的是同一份
+    归档**，5 根轴全打平，而渲染器对打平的轴一律钳到 1.0（防除零），
+    于是两个多边形与单位圆重合、互相盖住，画出来就是个灰五边形。**零信息量**，
+    这是删掉它的直接理由。同一次对账还查出同名指标两个值——
+    `det_report` 的「频谱对数 RMS×100」= 113.83 与这份的 `log_rms_ln` = 214.09
+    差 **×2.3026（log10→ln）再叠加变量数**（前者用 `_pick_variable` 只取 z500，
+    后者对 6 个变量先平均）；`det_report.py:47` 的 docstring 写了个 `mean_v`
+    而实现并没有做，属文档与代码不符，**尚未处理**
+  - **文档同步**：`SKILL.md` / `README.md` / `references/evaluation-metrics.md` /
+    `references/rmse-batch-evaluation.md` / `scripts/generate_wave_report.py` /
+    `wave_report.py` 六处「球谐带 §5.1–5.3」全部改成 **§4.1–4.3**
+  - 骨架与渲染器**一起改**（`assets/templates/weather_rmse_wave.md` +
+    `visualization/wave_report.py` 的 `render_wave` / `build_wave_report`），
+    删掉 `_spectrum_inclusive_rank` / `_section_rmse` / `_heatmap_block` /
+    `_single_init_block` / `capability_profile` / `_capability_block` /
+    `_section_risks` / `_section_acceptance` / `_region_block` 九个函数
+  - **另一件没解决的事**：这份骨架**没有测试守着**（`test_weather_rmse_wave.py`
+    不存在，且 `tests/` 本身没进版本库），改动只能靠实跑对拍
+
 ---
 
 **维护者**: 沈哲文 (szw)
-**最后更新**: 2026-09-22（续四）
+**最后更新**: 2026-09-22（续七）

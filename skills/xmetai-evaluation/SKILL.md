@@ -507,7 +507,7 @@ REPORT.md
      **三方交集为 0**，目前只能出 FuXi↔AIFS 那份（27 天，低于 30 天样本下限，
      报告自己会标「方向性参考」）；
   3. 概率评分（AROC / BSS）取数与绘图那一层还没做，`weather_ts_ens_prob` 标着 `[BLOCKED]`；
-  4. 球谐带功率**已经有渲染器**（`wave_report` 的 §5.1–5.3），数据取自长表里
+  4. 球谐带功率**已经有渲染器**（`wave_report` 的 §4.1–4.3），数据取自长表里
      `spherical_bands` 展开的三行，靠 **`group` 列**区分频带。
      但**现存归档的 `scores.csv` 缺 `group` 这一列**（契约 24 列、实拍 23 列），
      5 个频带的行混在一起认不出来，这三节会走 `SPHERICAL_ABSENT` 标「本批未出」

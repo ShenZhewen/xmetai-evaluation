@@ -25,7 +25,7 @@
 **与 `_single` 支线的差别**：纬向谱 log-RMS 这里用 **ln**（骨架 §2.1 的定义），
 `generate_det_report.py` 用 **log10**，两者差 ×2.3026，不要互相对数。
 
-**球谐带（§5.1–5.3）的数据来自长表里 `spherical_bands` 展开的三行**
+**球谐带（§4.1–4.3）的数据来自长表里 `spherical_bands` 展开的三行**
 （``spherical_band_power_forecast`` / ``_observation`` / ``_ratio``），
 靠 ``group`` 列区分频带（``1_4`` / ``5_20`` …）。两种情况会让这三节标
 「本批未出」：配置里没有 ``spherical_bands`` 指标；或者算了，但产物

@@ -124,7 +124,7 @@ xmetai-eval --config my_multi_config
 
 ### 分纬度带评估（regions）
 
-格点协议（`grid_valid_time`）支持在 `options` 里声明纬度带，逐带出分：
+两类协议都支持在 `options` 里声明纬度带，逐带出分：
 
 ```python
 options={
@@ -136,13 +136,23 @@ options={
 }
 ```
 
-每个 (起报, 时效) 样本除全球行外再逐带各出一行，长表里用 `region` 列区分
-（全球行该列为空）。实现口径：带边界是闭区间；数据不裁、只把 `valid_mask`
-收缩到带内，标量指标（RMSE/Bias/ACC/活跃度等按掩码加权或筛点的）逐带出分；
-谱类（`zonal_spectrum`/`spherical_bands`/`spectrum`）与 FSS 需要**完整空间场**，
-不分区、只出全球行。不写
-`regions` 键则完全回到只有全球行的老行为。`weather_rmse_single_fuxi` 已启用
-经典三分带（热带 ±20° / 两半球中高纬），可作模板。
+格点协议（`grid_valid_time`）：每个 (起报, 时效) 样本除全球行外再逐带各出一行。
+站点协议（`station_valid_time`，TS 系列）同样支持，站点按**站点纬度**整站归带
+（读 `station_lat`，没有就找 `lat`；两者都取不到直接报错，不静默回退成全球分）。
+
+长表里用 `region` 列区分（全球行该列为空）。实现口径：带边界是闭区间（正好压线
+的格点/站点**两条带都算**）；数据不裁、只把 `valid_mask` 收缩到带内，标量指标
+（RMSE/Bias/ACC/活跃度等按掩码加权或筛点的）逐带出分；谱类
+（`zonal_spectrum`/`spherical_bands`/`spectrum`）与 FSS 需要**完整空间场**，
+不分区、只出全球行。不写 `regions` 键则完全回到只有全球行的老行为。
+
+报告侧：连续场走「附 L 分纬度带结果」，TS 走「附 L 分纬度带结果（可选）」——
+两块都**只留带行、全球行不参与**（各带平均再平均 ≠ 全球平均），图走独立编号
+`图 L1`，加不加都不动正文图号。`weather_rmse_single_fuxi` 已启用经典三分带、
+`weather_ts_single_fgvp` 与 `weather_ts_ens_fuxi` 已启用中国四带（南方 / 长江中下游
+/ 华北 / 东北），可作模板。集合那份的 `options` 是**两段共用**的，所以 24h 的 TS 段
+与 6h 的概率段都会出带行；报告的「附 L」只汇总 TS 那段，概率段的带行落在
+`scores.csv` / `diagnostics/probability_wide.csv` 里（第六节本来就没有渲染器）。
 
 ## 执行策略（并发与数据加载）
 
