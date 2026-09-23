@@ -227,15 +227,23 @@ def diagnose(summary: Dict[str, object]) -> List[str]:
     ]
     if far_entries:
         entry = far_entries[-1]
-        if entry["FAR"] > entry["漏报率"]:
+        far_text, miss_text = _fmt(entry["FAR"]), _fmt(entry["漏报率"])
+        # 比**格式化之后**的文本：两个值差在小数点后第四位时，正文里看到的仍是
+        # 「1.000 高于 1.000」——按显示值判平，才不会写出这种自相矛盾的句子。
+        if far_text == miss_text:
             findings.append(
-                f"误差形态偏**空报**：{entry['grade']}mm 的 FAR {_fmt(entry['FAR'])}"
-                f" 高于漏报率 {_fmt(entry['漏报率'])}。"
+                f"误差形态：{entry['grade']}mm 的 FAR 与漏报率均为 {far_text}，"
+                f"空报与漏报比重相当，无主导方向。"
+            )
+        elif entry["FAR"] > entry["漏报率"]:
+            findings.append(
+                f"误差形态偏**空报**：{entry['grade']}mm 的 FAR {far_text}"
+                f" 高于漏报率 {miss_text}。"
             )
         else:
             findings.append(
-                f"误差形态偏**漏报**：{entry['grade']}mm 的漏报率 {_fmt(entry['漏报率'])}"
-                f" 高于 FAR {_fmt(entry['FAR'])}。"
+                f"误差形态偏**漏报**：{entry['grade']}mm 的漏报率 {miss_text}"
+                f" 高于 FAR {far_text}。"
             )
 
     decay = summary.get("decay")
@@ -1328,6 +1336,204 @@ def _section_capability(
     return lines
 
 
+# ------------------------------------------------------------- 分纬度带（附 L）
+#: 分带小节的图名：既是 ``artifacts`` 里的键，也是报告里 ``![…]()`` 的标签。
+REGION_FIGURE = "region_TS_vs_lead"
+
+#: 这份产物**一条带都没落数**时的说明。保留节位、写清原因，不静默省略——
+#: 与 ``weather_rmse_wave.md`` 里球谐带那几节、``det_report`` 的「附 L」同一套约定。
+_REGION_MISSING_NOTE = (
+    "这份产物的宽表里没有 `region` 行：本次评测没配 `options[\"regions\"]`"
+    "（或者配了但没有任何一条带算出结果）。"
+)
+
+
+def region_labels_from(root: Path) -> Dict[str, str]:
+    """``{带名: 边界串}``，边界取自产物 ``manifest["regions"]``（形如 ``south[0, 15]``）。
+
+    带名与边界都**照搬配置**的 ``options["regions"]``：报告不翻译、也不写死任何
+    带名，配置里叫什么就显示什么；要换一套切法改配置重跑即可，报告这边一个字
+    都不用动。读不到 manifest（直接调 ``build_ts_report``、产物目录不在手边）就
+    返回空——那时带宽只显示带名，不编一个边界出来。
+
+    实现复用 ``det_report`` 的同一份解析：``manifest["regions"]`` 这个键的形状
+    只有一处定义，两份报告各解析一遍迟早对不上。**延迟导入**是因为
+    ``precipitation_plots`` 在模块层 import 了本模块，本模块在模块层再 import
+    回去就绕成一个环。
+    """
+    from xmetai_evaluation.visualization.det_report import region_labels
+
+    try:
+        return region_labels(Path(root))
+    except ValueError:  # 没有 manifest.json，或它不是一个合法 JSON
+        return {}
+
+
+def _band_order(names: Sequence[str], labels: Optional[Dict[str, str]]) -> List[str]:
+    """带名按**南界从低到高**排。
+
+    纬度带天生分南北，按名字排中文是乱序（东北 / 南方 / 华北 / 长江中下游），
+    一张按纬度排好的表读者一眼就能扫完。边界只在 manifest 里，取不到（老产物、
+    直接调 ``build_ts_report``）时退回按名字升序——不编一个边界出来排。
+    """
+    def key(name: str):
+        head = str((labels or {}).get(name, "")).split(",")[0].strip()
+        try:
+            return (0, float(head), name)
+        except ValueError:
+            return (1, 0.0, name)
+
+    return sorted(names, key=key)
+
+
+def _region_table(
+    band_frames: Dict[str, pd.DataFrame], labels: Optional[Dict[str, str]]
+) -> str:
+    """带 × 降水等级 的 TS 表，末列是各带自己的「全等级等权平均」。
+
+    口径与第二节、能力雷达图的综合轴**完全同源**——都走 ``summarize``
+    （先把列联表合计再算比率，再对各等级等权平均），不在这里另算一遍：
+    同一个「综合」两处各算一遍，迟早只在一处修好。
+    """
+    from xmetai_evaluation.visualization.det_report import region_display
+
+    grades = [str(grade) for grade in ordered_grades(list(band_frames.values()))]
+    header = ["纬度带"] + grades + ["综合"]
+    lines = ["| " + " | ".join(header) + " |", "|" + "---|" * len(header)]
+    for name in _band_order(list(band_frames), labels):
+        frame = band_frames[name]
+        summary = summarize(frame)
+        by_grade = {entry["grade"]: entry for entry in summary["grades"]}
+        cells = [_fmt(by_grade[grade]["TS"]) if grade in by_grade else "—" for grade in grades]
+        lines.append(
+            "| "
+            + " | ".join(
+                [region_display(name, labels or {})] + cells + [_fmt(summary["overall_ts"])]
+            )
+            + " |"
+        )
+    return "\n".join(lines)
+
+
+def _region_reading(
+    band_frames: Dict[str, pd.DataFrame], labels: Optional[Dict[str, str]]
+) -> str:
+    """分带判读句：最强的带、最弱的带、差多少，以及头名是否随预报时效翻转。
+
+    「翻转」按各带**逐时效**的 TS（等级等权平均）比：整段平均出来的名次在
+    某些时效上未必成立，而这正是分带要回答的问题。
+    """
+    overall = {
+        name: float(summarize(frame)["overall_ts"]) for name, frame in band_frames.items()
+    }
+    finite = {name: value for name, value in overall.items() if np.isfinite(value)}
+    if len(finite) < 2:
+        return "各带的有效样本不足以横向比较（至少要有两条带各自算出 TS）。"
+
+    # 并列判定按**表里显示出来的精度**（三位小数）：表上两行一模一样却写「相差
+    # 0.000」，或者硬点一个第一名出来，都是文字和图各说各话。
+    ranked = sorted(finite.items(), key=lambda item: item[1], reverse=True)
+
+    def _tied(value: float) -> List[str]:
+        key = _fmt(value)
+        return [name for name, item_value in ranked if _fmt(item_value) == key]
+
+    tops, bottoms = _tied(ranked[0][1]), _tied(ranked[-1][1])
+    if tops == bottoms:
+        text = (
+            f"各带的全等级等权平均 TS 都是 {_fmt(ranked[0][1])}，"
+            f"带间分不出高下（差距小于表里的显示精度）。"
+        )
+        best_names = set(tops)
+    else:
+        text = (
+            f"各带之中全等级等权平均 TS 最高的是 {_join_bands(tops, labels)}"
+            f"（{_fmt(ranked[0][1])}），最低的是 {_join_bands(bottoms, labels)}"
+            f"（{_fmt(ranked[-1][1])}），相差 {_fmt(ranked[0][1] - ranked[-1][1])}"
+            f"{'——并列。' if len(tops) > 1 else '。'}"
+        )
+        best_names = set(tops)
+
+    by_lead = {
+        name: frame.groupby("lead_h")["TS"].mean() for name, frame in band_frames.items()
+    }
+    leads = sorted({float(lead) for series in by_lead.values() for lead in series.index})
+    flips = 0
+    for lead in leads:
+        values = {
+            name: float(series.get(lead, np.nan))
+            for name, series in by_lead.items()
+            if lead in series.index
+        }
+        values = {name: value for name, value in values.items() if np.isfinite(value)}
+        if not values:
+            continue
+        lead_best = max(values.values())
+        lead_tops = {name for name, value in values.items() if _fmt(value) == _fmt(lead_best)}
+        if not lead_tops & best_names:
+            flips += 1
+    if flips:
+        text += (
+            f" 名次并不固定：{len(leads)} 个时效里有 {flips} 个时效的头名是别的带——"
+            f"带间差异随时效变化，不能只拿全时效平均下结论。"
+        )
+    else:
+        text += f" {len(leads)} 个时效的头名都在上面那几条带里，带间差异在全时效上一致。"
+    return text
+
+
+def _join_bands(names: Sequence[str], labels: Optional[Dict[str, str]]) -> str:
+    """并列的带名连起来写（``south [0, 15]、north [15, 30]``）。"""
+    from xmetai_evaluation.visualization.det_report import region_display
+
+    return "、".join(region_display(name, labels or {}) for name in names)
+
+
+def _section_regions(
+    band_frames: Dict[str, pd.DataFrame],
+    labels: Optional[Dict[str, str]],
+    artifacts: Optional[Dict[str, Path]],
+    figure: Optional[Path],
+) -> List[str]:
+    """「附 L 分纬度带结果（可选）」——空数据时保留节位并写「本批未出」。
+
+    图号走**独立命名空间** `图 L1`：这一块是可选的，删掉它不该动正文任何一个
+    编号（与 ``weather_rmse_single.md`` 的「附 L / 附 S」同一条约定）。
+    """
+    lines = ["## 附 L 分纬度带结果（可选）", ""]
+    if not band_frames:
+        lines += [f"**本块本批未出。** {_REGION_MISSING_NOTE}", ""]
+        return lines
+
+    lines += [
+        "本块把宽表里 `region` 非空的行**单独汇总**，全球行**不参与**——全球平均与",
+        "纬度带平均是两个量，混在一起算会把带间差异整个抹平，这一块也就没有意义了。",
+        "带名与边界照搬评测配置 `options[\"regions\"]`：**报告不翻译、也不写死任何带名**，",
+        "配置里叫 `south` 就显示 `south`；要换一套切法改配置重跑即可，报告这边一个字",
+        "都不用动。表里的口径与第二节完全一致（先合计列联表再算比率，再对等级等权平均），",
+        "末列的「综合」就是该带自己的全等级等权平均。",
+        "",
+        "**分纬度带 TS（各降水等级，全时效平均）**",
+        "",
+        _region_table(band_frames, labels),
+        "",
+        _region_reading(band_frames, labels),
+        "",
+        "> 这一块**只汇总主模型**：按带切和按模型切是两个正交的维度，硬塞进同一张表，",
+        "> 会出现「同一个名字既是带名又是模型名」的歧义。另外，各带的站点数差得远时",
+        "> TS 的抽样噪声也不一样，差一两个百分点不必当结论。",
+        "",
+    ]
+    if figure is not None and REGION_FIGURE in (artifacts or {}):
+        lines += [
+            f"![{REGION_FIGURE}]({figure.name})",
+            "",
+            "图 L1：各纬度带 TS 随时效变化（每个降水等级一个子图，纵轴 0–1）",
+            "",
+        ]
+    return lines
+
+
 def build_ts_report(
     data: pd.DataFrame,
     output_path: Path,
@@ -1341,6 +1547,8 @@ def build_ts_report(
     artifacts: Optional[Dict[str, Path]] = None,
     lead_h: Optional[float] = None,
     box_models: Optional[Dict[str, pd.DataFrame]] = None,
+    region_frames: Optional[Dict[str, pd.DataFrame]] = None,
+    region_labels: Optional[Dict[str, str]] = None,
 ) -> Path:
     """写一份 Markdown 报告。
 
@@ -1353,8 +1561,22 @@ def build_ts_report(
             由 ``create_report`` 算好传进来，与它画图用的是**同一个 dict**；
             不传则按 ``model_name`` + ``baseline_df``/``baseline_name`` + ``baselines``
             自己拼一份（直接调本函数的场景，比如测试）。
+        region_frames: ``{带名: 该带的宽表行}``，进末尾的「附 L」。不传就自己从
+            ``data`` 的 ``region`` 列里切一份（见 ``precipitation_plots.split_regions``）；
+            ``create_report`` 已经把全球行筛出来传进来了，那时从 ``data`` 里切只能
+            得到空集，所以它显式传这个参数。
+        region_labels: ``{带名: 边界串}``，只影响带名怎么写（``south [0, 15]``），
+            取不到就只显示带名。
     """
     output_path = Path(output_path)
+    # 全球行与带行分开算：``data`` 里混着带行时，第二～五节会把同一天算好几遍。
+    # 传进来的已经是全球行（create_report 切过）时这一步是恒等的。
+    # 延迟导入：``precipitation_plots`` 在模块层 import 了本模块。
+    from xmetai_evaluation.visualization.precipitation_plots import split_regions
+
+    data, derived_regions = split_regions(data)
+    if region_frames is None:
+        region_frames = derived_regions
     summary = summarize(data)
     findings = diagnose(summary)
     grades = summary["grades"]
@@ -1399,6 +1621,24 @@ def build_ts_report(
         )
         if artifacts is not None and radar_path.exists():
             artifacts["capability_radar"] = radar_path
+
+    # 分带图与雷达图同一套做法：要画才画，且只有真的落盘了才登记进 artifacts
+    # （登记了但没写进正文，`test_every_artifact_is_placed_in_the_report` 会红）。
+    region_figure: Optional[Path] = None
+    if region_frames:
+        region_figure = output_path.parent / f"{prefix}region_TS_vs_lead.png"
+        from xmetai_evaluation.visualization.precipitation_plots import PrecipitationPlotter
+
+        PrecipitationPlotter().plot_multi_model_vs_lead(
+            dict(region_frames),
+            metric="TS",
+            mode="absolute",
+            legend_title="纬度带",
+            suptitle="各纬度带 TS 随时效变化（每个降水等级一个子图）",
+            save_path=region_figure,
+        )
+        if artifacts is not None and region_figure.exists():
+            artifacts[REGION_FIGURE] = region_figure
 
     numbering = _Numbering()
     captions = _figure_captions(summary, window=window, lead=lead, model_name=model_name)
@@ -1489,6 +1729,10 @@ def build_ts_report(
     lines.append("- **跨时效不要直接平均后比较模型**：正式对比应使用共同有效样本与固定验证口径；")
     lines.append("- 结果来自统一长表（`scores.csv` / `categorical_wide.csv`），逐行可追溯到具体时效与阈值。")
     lines.append("")
+
+    # 附 L 放在「口径与注意事项」之后：它是可选块，编号走自己的 `图 L*` 命名空间，
+    # 有它没它都不动正文任何一个号。
+    lines += _section_regions(region_frames, region_labels, artifacts, region_figure)
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text("\n".join(lines), encoding="utf-8")

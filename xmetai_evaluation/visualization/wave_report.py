@@ -4,38 +4,42 @@
 
 输入是 ``weather_rmse_wave_<模型>`` 支线的**评估产物目录**，形状与 ``_single``
 支线完全相同（``scores.csv`` + ``manifest.json`` + ``diagnostics/``）——两条支线
-吃同一份产物，区别只在报告口径：这一份**专管谱**，走「总体结果 → RMSE 分变量 →
-功率谱检验 → 异常与风险 → 验收建议」这条链，不重复逐变量 RMSE/ACC 明细。
+吃同一份产物，区别只在报告口径：这一份**专管谱**，一条链走到底：总体结果 →
+功率谱检验 → 附录。
+
+**这份是补充报告，不是第二份全面报告**（2026-09-22 简化）：原报告里的逐变量 RMSE、
+分时效、异常与风险、验收建议，以及热力图 / 单起报谱曲线 / 能力雷达图 / 附 L 分纬度带，
+主报告都已经出过**同一批数、同一张图**，这里整块去掉，只留第 3 节的基线值供读「相对」
+口径。要改章节删减，同时改本模块的 ``render_wave`` 与骨架，别只改一边。
 
 格式契约是 ``skills/xmetai-evaluation/assets/templates/weather_rmse_wave.md``：
-章节用 ``# 1.``…``# 7.`` + 附录，**表不编号、图带 ``图 N：`` 且连续**，中文数字
+章节用 ``# 1.``…``# 4.`` + 附录，**表不编号、图带 ``图 N：`` 且连续**，中文数字
 由渲染器给（``{模型数}`` 填「五」而不是「5」）。
 
 **两套谱，别混**：
 
-* **纬向 FFT 谱**（§2–§4、§5.4）来自 ``diagnostics/spectrum_by_init.csv``，
+* **纬向 FFT 谱**（§2–§4）来自 ``diagnostics/spectrum_by_init.csv``，
   逐起报一条曲线，波数 1–720。log-RMS 这里用 **ln**，而 ``det_report.analyze``
   的 ``spectrum_rms`` 用 **log10**，两者差 ×2.3026——本模块照骨架 §2.1 的定义
   走 ln，**不复用** ``spectrum_rms``。
-* **球谐带功率**（§5.1–5.3）来自长表里 ``spherical_bands`` 展开的三行
+* **球谐带功率**（§4.1–4.3）来自长表里 ``spherical_bands`` 展开的三行
   （``spherical_band_power_forecast`` / ``_observation`` / ``_ratio``），
   **频带靠 ``group`` 列区分**（``1_4`` / ``5_20`` …）。它按球谐总阶数 ``l`` 分段
-  （``DEFAULT_SPHERICAL_BANDS``），与 §5.4.1 按纬向波数分的 ``WAVE_BANDS``
+  （``DEFAULT_SPHERICAL_BANDS``），与 §4.5 按纬向波数分的 ``WAVE_BANDS``
   不是同一套分段，不能互相换算。
 
 球谐带这一节在**两种**情况下退化成「本批未出」的占位说明（不静默省略、也不留
 空表）：配置里没有 ``spherical_bands``，或结果行缺 ``group`` 列认不出频带。
 第二种情况下**绝不能把几个频带混起来平均**——那样得到的数不属于任何尺度。
 
-占位符 ``{匹配尺度上限}`` 取 128，依据是骨架 §5.4.3 的「1–128 波数逐变量结果」
-与 §5.4 的「与球谐损失的最高阶数同范围」两处措辞。
+占位符 ``{匹配尺度上限}`` 取 128，依据是骨架 §4.7 的「1–128 波数逐变量结果」
+与 §4.4 的「与球谐损失的最高阶数同范围」两处措辞。
 """
 
 from __future__ import annotations
 
 from pathlib import Path
 from typing import (
-    Callable,
     Dict,
     List,
     Mapping,
@@ -57,26 +61,19 @@ from xmetai_evaluation.visualization.det_plots import DetPlotter, model_colors
 from xmetai_evaluation.visualization.precipitation_plots import setup_chinese_font
 from xmetai_evaluation.visualization.det_report import (
     Archive,
-    BASELINE,
     Bundle,
     PairTest,
     _CN_NUM,
     _date_span,
     _fmt,
     _lead_span,
-    _model_count_word,
-    _rank,
     _table,
     analyze,
-    _region_reading,
-    region_display,
-    region_table,
     _signed,
     load_spectrum,
     metric_rows,
     paired_tests,
     probe_dates,
-    radar_scores,
     report_date,
 )
 
@@ -125,18 +122,6 @@ SPHERICAL_ABSENT = (
     "要么结果行缺 `group` 列、认不出频带），**本批未出**。"
 )
 
-#: 谱诊断没有按纬度带切开时，「附 L」第二张表（分纬度带纬向谱）写这句。
-#: 谱诊断 ``diagnostics/spectrum_by_init.csv`` 的列是
-#: ``variable / init_time / wavenumber / wavelength_km / pred / obs``——**没有 region**，
-#: 纬向谱跟不准到带上，这一栏就只能标未出，不能拿全球谱冒充某一带。
-REGION_SPECTRUM_ABSENT = (
-    "纬向谱这一项**本批未出**：谱诊断 `diagnostics/spectrum_by_init.csv` 只有 "
-    "`variable / init_time / wavenumber / wavelength_km / pred / obs`，**没有 `region` 列**，"
-    "谱没有跟纬度带绑在一起，拿全球谱顶替某一带会得出错的结论。要补上得让评测侧在谱诊断里"
-    "也写 `region`（与 scores.csv 的 `region` 同口径），报告这边不用改。"
-)
-
-
 def _season_block() -> List[str]:
     """「附 S 分季节结果（可选）」——与另两份骨架同一段静态说明。
 
@@ -164,72 +149,12 @@ def _season_block() -> List[str]:
         "",
         "季节对这份补充报告尤其要紧：谱比随季节变化明显（冬夏的行星波活动差一个量级），",
         "把四个季节平均成一条谱曲线，会把「某个模式只在一个季节小尺度偏低」这类问题",
-        "整个抹掉。补数之后这一块的形态与「附 L」一致：一张分季节表（一行一个季节，",
+        "整个抹掉。补数之后这一块的形态与主报告的「附 L」一致：一张分季节表（一行一个季节，",
         "按 DJF、MAM、JJA、SON 升序，各模型各占一列，末列 `最佳`；基线在**子集内**重算",
         "并写在表下），加一条带天数的判读句。`season_summary.png`（`图 S1`）与",
         "`season_rmse_vs_lead.png`（各季节综合相对RMSE 随预报时效的变化，`图 S2`）",
         "是可选图——**没出图就别留号**，不指不存在的文件。",
     ]
-
-
-def _region_block(bundle: WaveBundle, figures: Mapping[str, str]) -> List[str]:
-    """「附 L 分纬度带结果（可选）」。
-
-    与 det / ens 的差别只有一处：本报告的落脚点是谱，骨架要求这一块**同时给出 RMSE 与
-    纬向谱两项**。谱诊断里没有 `region`，所以第二张表本批给不出，只能标未出——见
-    :data:`REGION_SPECTRUM_ABSENT`。
-    """
-    base = bundle.base
-    count = len(base.names)
-    word = _model_count_word(count)
-    lines = ["## 附 L 分纬度带结果（可选）", ""]
-    if not base.region_names:
-        lines += [f"**本块本批未出。** {base.region_note}", ""]
-        return lines
-
-    table = region_table(base)
-    lines += [
-        "本块把长表里 `region` 非空的行**单独汇总**，全球行**不参与**——全球平均与纬度带平均",
-        "是两个量，混在一起算会把带间差异整个抹平。带名与边界照搬评测配置",
-        "`options[\"regions\"]`：**报告不翻译、也不写死任何带名**，配置里叫什么就显示什么。",
-        f"表里的相对RMSE是**对本带基线**取的（100 = 该带内的{word}模型几何均值），",
-        "不是全球基线——热带和极区的绝对 RMSE 差一个量级，不除本带基线没法横向比。",
-        "",
-        "本报告的落脚点是谱，所以分带表**同时给出 RMSE 与纬向谱两项**：如果某个带里",
-        "RMSE 排名与谱排名不一致，多半是该带的观测谱在高波数段本身接近零，",
-        "谱指标在那里被放大，判读要以 RMSE 为准，并在正文点名说明。",
-        "",
-        "**分纬度带综合相对RMSE**",
-        "",
-    ]
-    lines += _table(["纬度带"] + list(base.names) + ["Best"], table.rows)
-    lines += [
-        "",
-        f"**分纬度带纬向谱 log-RMS×100（全波数 1–{FULL_K_MAX}）**",
-        "",
-        REGION_SPECTRUM_ABSENT,
-        "",
-    ]
-    reading = _region_reading(
-        base, table.best_global, table.best_of, table.levels,
-    )
-    reading += (
-        " 两个口径（RMSE 与谱）的排名在高纬是否一致，这一批**核不了**："
-        "分带的纬向谱没有出数（原因见上），等谱诊断带上 `region` 之后再回来对。"
-    )
-    lines += [reading, ""]
-    lines += [
-        f"![lat_band_rmse_vs_lead]({figures['lat_band_lead']})",
-        "",
-        f"图 L1：各纬度带综合相对RMSE随预报时效的变化"
-        f"（100 = 该带内{word}模型几何均值；{_date_span(bundle.dates)} 共同日期平均）",
-        "",
-        f"![lat_band_summary]({figures['lat_band_summary']})",
-        "",
-        f"图 L2：分纬度带综合相对RMSE"
-        f"（100 = 该带内{word}模型几何均值；{_date_span(bundle.dates)} 共同日期平均）",
-    ]
-    return lines
 
 
 # ====================================================================== 谱指标
@@ -358,7 +283,7 @@ def load_band_power(root, dates: Sequence[str], variable: str,
 def probe_bands(root, dates: Sequence[str], variables: Sequence[str]) -> bool:
     """产物里有没有**可用**的球谐带功率结果。
 
-    光有结果行不够——还得分得出频带（``group`` 列非空），否则 §5.1–5.3 只能记缺席。
+    光有结果行不够——还得分得出频带（``group`` 列非空），否则 §4.1–4.3 只能记缺席。
     """
     if not dates or not variables:
         return False
@@ -432,23 +357,6 @@ def _bias_pct(samples: Sequence[np.ndarray]) -> float:
     if not stacked:
         return float("nan")
     return 100.0 * float(np.mean(np.abs(np.concatenate(stacked) - 1.0)))
-
-
-def _first_lead_value(bundle: Bundle, variable: str) -> float:
-    """各模型在该变量上首时效的值，取其中最大者。
-
-    ``Bundle.acc_by_lead`` 在 :func:`det_report.analyze` 里已经乘过 ``BASELINE``，
-    拿到的就是百分数，这里**不要再乘 100**。
-    """
-    values = []
-    for name in bundle.names:
-        frame = bundle.acc_by_lead.get(name)
-        if frame is None or variable not in frame.columns or frame.empty:
-            continue
-        series = frame[variable].dropna()
-        if not series.empty:
-            values.append(float(series.iloc[0]))
-    return max(values) if values else float("nan")
 
 
 # ====================================================================== 分析
@@ -759,18 +667,16 @@ def _section_conclusion(bundle: WaveBundle) -> List[str]:
     base = bundle.base
     names = bundle.names
     order = base.relative_composite.sort_values().index.tolist()
-    best, worst = order[0], order[-1]
+    best = order[0]
     zonal_best = bundle.zonal_full.idxmin()
     zonal_worst = bundle.zonal_full.idxmax()
-    fa_best = base.fa_bias.idxmin()
 
+    # 补充报告：精度与幅度只在第 3 节给基线值，结论段不重复主报告的判断，
+    # 只讲这一份独有的两套谱。
     items = [
-        f"{_cn(len(names))}个产物完整性检查通过，全部模型 `n_ok = n_dates`，无失败起报点。",
-        f"综合相对 RMSE 最好 {best}（{_fmt(base.relative_composite[best])}），"
-        f"最差 {worst}（{_fmt(base.relative_composite[worst])}）；"
-        f"ACC 最高 {base.acc_mean.idxmax()}（{_fmt(base.acc_mean.max())}%）。",
-        f"幅度真实性（FA 偏差）最好 {fa_best}（{_fmt(base.fa_bias[fa_best], 4)} pp），"
-        f"最差 {base.fa_bias.idxmax()}（{_fmt(base.fa_bias.max(), 4)} pp）。",
+        f"{_cn(len(names))}个产物完整性检查通过，全部模型 `n_ok = n_dates`，"
+        f"无失败起报点；综合相对 RMSE、ACC、FA 只在第 3 节列基线值，"
+        f"明细与验收建议见原输出级评估报告。",
         f"纬向 FFT 谱（全波数 1–{FULL_K_MAX}）log-RMS×100 最小 {zonal_best}"
         f"（{_fmt(bundle.zonal_full[zonal_best], 2)}），最大 {zonal_worst}"
         f"（{_fmt(bundle.zonal_full[zonal_worst], 2)}）；"
@@ -798,43 +704,24 @@ def _section_conclusion(bundle: WaveBundle) -> List[str]:
             f"{direction} {_fmt(abs(delta), 2)}；综合相对 RMSE "
             f"{_fmt(base.relative_composite[reference])} → {_fmt(base.relative_composite[primary])}。"
         )
-    variable = base.anomaly_variable
     items.append(
-        f"异常变量检查：{base.anomaly_model} 的 {variable} RMSE 为其余模型中位数的 "
-        f"{_fmt(base.anomaly_ratio, 2)} 倍"
-        + ("，超出 3× 阈值，详见 6.1。" if base.anomaly_ratio >= 3.0 else "，未超 3× 阈值。")
-    )
-    items.append(
-        f"选型取向：精度优先看综合相对 RMSE（{best}），幅度与谱真实性优先看 FA 偏差"
-        f"（{fa_best}）与纬向谱（{zonal_best}），三者不一定指向同一模型。"
+        f"选型取向：谱保真度优先看纬向谱（{zonal_best}）"
+        + (f"与球谐带（{bundle.sph_rms.idxmin()}）" if bundle.sph_available else "")
+        + f"，与精度类指标（综合相对 RMSE 最低 {best}）不一定指向同一模型。"
     )
     return [
         "# 1. 结论摘要",
         "",
         # 先交代评估基本信息（评的是谁、多少天、什么指标），再给结论
-        f"本报告评估{'、'.join(sorted(names))}共{len(names)}个模型，"
+        f"本报告评估{'、'.join(sorted(names))}共{_cn(len(names))}个模型，"
         f"覆盖{len(bundle.dates)}天（{_date_span(bundle.dates)}）；"
-        f"口径为RMSE与纬向 FFT、球谐带功率谱。本报告是补充分析，"
-        f"不修订、也不替代原输出级评估检验报告。",
+        f"口径为纬向 FFT 与球谐带功率谱，RMSE / ACC / FA 只作基线。"
+        f"本报告是补充分析，不修订、也不替代原输出级评估检验报告。",
         "",
         # 结论并成一段而不是逐条列点：读起来是判断，不是清单
         "".join(items),
         "",
     ]
-
-
-def _spectrum_inclusive_rank(base, bundle) -> pd.Series:
-    """RMSE + ACC + FA + **纬向 FFT 谱** 的等权平均秩。§3.1 与 §7 共用。
-
-    **不能**拿 ``base.rank_score`` 顶替：那是 ``det_report`` 的口径，第四项是
-    单变量 log10 的 ``spectrum_rms``。本报告从 §2.1 到 §5 讲的都是纬向 FFT 谱
-    （ln 底），两套数字摆在同一份报告里会互相打架——出现过 §3.1 写「加入纬向谱
-    后平均秩最低的是 FuXi」，§7 的「多维度均衡」却写 AIFS 的情况。
-    """
-    return (
-        _rank(base.relative_composite) + _rank(base.acc_mean, higher_is_better=True)
-        + _rank(base.fa_bias) + _rank(bundle.zonal_full)
-    ) / 4.0
 
 
 def _section_scope(bundle: WaveBundle) -> List[str]:
@@ -954,151 +841,17 @@ def _section_overall(bundle: WaveBundle) -> List[str]:
               "图 1：{模型数}模型的综合相对 RMSE、ACC、FA 偏差与纬向谱 log-RMS×100 对比"
               "（共同日期平均，柱高越低越好，ACC 除外）。".replace("{模型数}", _cn(len(bundle.names))), ""]
 
-    # --- 3.1 排序随评价目标变化 ---
-    rank_three = (
-        _rank(base.relative_composite) + _rank(base.acc_mean, higher_is_better=True)
-        + _rank(base.fa_bias)
-    ) / 3.0
-    rank_four = _spectrum_inclusive_rank(base, bundle)
-    # 骨架 §3.1 第二行是「+ 球谐带功率谱」。球谐缺席时退回纬向 FFT 谱口径
-    # （``rank_four``），并在解释里写清楚这一行统计的到底是哪套谱。
-    if bundle.sph_available:
-        rank_spectrum = (3.0 * rank_three + _rank(bundle.sph_rms)) / 4.0
-        spectrum_name = "球谐带功率谱"
-    else:
-        rank_spectrum = rank_four
-        spectrum_name = "纬向 FFT 谱"
-    lines += ["## 3.1 排序随评价目标变化", ""]
-
-    # 平均秩是几项指标的等权汇总，并列很常见（例如 FGVP 与 FGVP_pinpu 同为 7/3）。
-    # 用 "<" 连两个显示相同的数字会把并列写成“优于”，所以按显示精度判并列、用 "=" 连。
-    def describe(rank: pd.Series) -> str:
-        chunks: List[str] = []
-        previous: Optional[float] = None
-        for name in rank.sort_values().index:
-            shown = round(float(rank[name]), 2)
-            separator = "" if previous is None else (" = " if shown == previous else " < ")
-            chunks.append(f"{separator}{name} {_fmt(rank[name], 2)}")
-            previous = shown
-        return "".join(chunks)
-
-    def tied_winners(rank: pd.Series) -> List[str]:
-        best = round(float(rank.min()), 2)
-        return [n for n in rank.index if round(float(rank[n]), 2) == best]
-
-    def winners(rank: pd.Series) -> str:
-        """并列第一时把并列者都列出来，不能只报 idxmin 挑中的那一个。"""
-        tied = tied_winners(rank)
-        suffix = f"（{_cn(len(tied))}者并列 {_fmt(rank.min(), 2)}）" if len(tied) > 1 else ""
-        return "、".join(tied) + suffix
-
-    lines += _table(
-        ["**评价口径**", "**模型排序（平均秩，越低越好）**", "**第一**", "**解释**"],
-        [
-            ["RMSE + ACC + FA", describe(rank_three), winners(rank_three),
-             "只看精度、相关与幅度，不看谱分布"],
-            [f"RMSE + ACC + FA + {spectrum_name}",
-             describe(rank_spectrum) if bundle.sph_available else "—",
-             winners(rank_spectrum) if bundle.sph_available else "—",
-             f"在上一口径基础上加入{spectrum_name}保真度" if bundle.sph_available
-             else "球谐带功率谱本批未出，该口径无法计算；下表用纬向 FFT 谱代替"],
-        ],
-    )
-    lines += [
-        "",
-        f"这里的“平均秩”只是{_cn(3)}项指标的等权汇总，不代替业务权重；"
-        "写“=”表示两模型在该口径下平均秩并列，不代表指标完全相同。"
-        f"加入{spectrum_name}后平均秩最低的是 {winners(rank_spectrum)}，"
-        f"不含谱口径是 {winners(rank_three)}，"
-        + ("两者是同一组模型，说明谱保真度没有改变精度主导的排序。"
-           if set(tied_winners(rank_spectrum)) == set(tied_winners(rank_three))
-           else "两者不是同一组，说明谱保真度会改变模型取舍。")
-        + ("两套口径的头部都出现并列，说明这组模型的整体水平接近，"
-           "排名对指标权重的敏感度高，选型时需明确以哪一类应用为准。"
-           if len(tied_winners(rank_spectrum)) > 1 or len(tied_winners(rank_three)) > 1
-           else "选型时需明确以哪一类应用为准。"),
-        "",
-    ]
-    return lines
-
-
-def _section_rmse(bundle: WaveBundle) -> List[str]:
-    base = bundle.base
-    variables = base.common_variables
-    names = bundle.names
-    lines = ["# 4. RMSE 与时效表现", ""]
-
-    mean_rmse = pd.DataFrame({
-        name: base.rmse_by_date[name].mean(axis=0) for name in names
-    }).reindex(index=variables)
-    header = ["**变量**"] + [f"**{n}**" for n in names] + ["**最佳**"]
-    rows = []
-    for variable in sorted(variables):
-        row = mean_rmse.loc[variable]
-        rows.append([variable] + [_fmt(row[n], 4) for n in names] + [row.idxmin()])
-    lines += _table(header, rows)
-
-    best_overall = base.relative_composite.idxmin()
-    per_variable_best = mean_rmse.idxmin(axis=1)
-    tally = "、".join(
-        f"{model} 在 {int(count)} 个变量上最优"
-        for model, count in per_variable_best.value_counts().items()
-    )
-    wins = base.win_counts
-    win_text = "；".join(
-        f"{row['模型对'][0]} vs {row['模型对'][1]} 为 "
-        f"{int(row['A 显著更优'])} : {int(row['B 显著更优'])}"
-        f"（{int(row['无显著差异'])} 个变量无显著差异）"
-        for _, row in wins.iterrows()
-    )
-    lines += [
-        "",
-        f"全局第一为 {best_overall}（综合相对 RMSE {_fmt(base.relative_composite[best_overall])}）；"
-        f"逐变量看，{tally}。逐变量 Wilcoxon 配对检验（未做多重校正，只作方向性提示）：{win_text}。",
-        "",
-        "## 4.1 分时效综合相对 RMSE",
-        "",
-    ]
-
-    lead_relative = base.lead_relative
-    bands = ((0.0, 120.0), (120.0, 240.0), (240.0, 360.0))
-    rows = []
-    for low, high in bands:
-        subset = lead_relative[(lead_relative.index > low) & (lead_relative.index <= high)]
-        if subset.empty:
-            continue
-        means = subset.mean(axis=0)
-        rows.append([f"{low:g}–{high:g}h"] + [_fmt(means[n]) for n in names] + [means.idxmin()])
-    lines += _table(["**时效段**"] + [f"**{n}**" for n in names] + ["**最佳**"], rows)
-    lines += [
-        "",
-        f"口径与第 3 节一致：逐 lead 先按变量做几何均值归一，再对 {_cn(len(variables))} 个共享变量"
-        f"等权平均；未排除任何变量。",
-        "",
-        "分时效看，"
-        + "；".join(
-            f"{low:g}–{high:g}h 首选 "
-            + f"{(lead_relative[(lead_relative.index > low) & (lead_relative.index <= high)].mean(axis=0)).idxmin()}"
-            for low, high in bands
-        )
-        + "。短时效与中长时效的领先者未必是同一个模型，选型时应按实际预报时效长度取。",
-        "",
-        "![rmse_by_lead_range](rmse_by_lead_range.png)",
-        "",
-        f"图 2：{_cn(len(names))}模型分时效段（6–120h / 126–240h / 246–360h）的综合相对 RMSE 对比。",
-        "",
-    ]
     return lines
 
 
 def _spherical_bands_section(bundle: WaveBundle) -> List[str]:
-    """§5.1 球谐带分频结果：频带 × 模型，logRMS 与均值比各一组。"""
+    """§4.1 球谐带分频结果：频带 × 模型，logRMS 与均值比各一组。"""
     names = bundle.names
-    lines = ["## 5.1 球谐带分频结果", ""]
+    lines = ["## 4.1 球谐带分频结果", ""]
     if not bundle.sph_available:
         lines += [f"{SPHERICAL_ABSENT}因此本节无表、无图，保留节位以便将来补数后直接填入。", ""]
         return lines
-    # 列序与 §5.4.1 一致：每个模型 logRMS / 均值比 两列相邻，「最佳」收尾
+    # 列序与 §4.5 一致：每个模型 logRMS / 均值比 两列相邻，「最佳」收尾
     header = ["**频带**"]
     for name in names:
         header += [f"**{name} logRMS**", f"**{name} 均值比**"]
@@ -1129,23 +882,23 @@ def _spherical_bands_section(bundle: WaveBundle) -> List[str]:
         "",
         "![spherical_bands_logrms](spherical_bands_logrms.png)",
         "",
-        f"图 3：{_cn(len(names))}模型分球谐总阶数频带（{' / '.join(band_list)}）"
+        f"图 2：{_cn(len(names))}模型分球谐总阶数频带（{' / '.join(band_list)}）"
         f"的球谐带 log-RMS×100 对比。",
         "",
         "![spherical_bands_ratio](spherical_bands_ratio.png)",
         "",
-        f"图 4：{_cn(len(names))}模型分球谐总阶数频带的 pred/obs 均值比对比（虚线为理想值 1）。",
+        f"图 3：{_cn(len(names))}模型分球谐总阶数频带的 pred/obs 均值比对比（虚线为理想值 1）。",
         "",
     ]
     return lines
 
 
 def _spherical_variables_section(bundle: WaveBundle) -> List[str]:
-    """§5.2 球谐带分变量结果：变量 × 模型。"""
+    """§4.2 球谐带分变量结果：变量 × 模型。"""
     names = bundle.names
-    lines = ["## 5.2 球谐带分变量结果", ""]
+    lines = ["## 4.2 球谐带分变量结果", ""]
     if not bundle.sph_available:
-        lines += [f"{SPHERICAL_ABSENT}本节同 5.1，一并留空。", ""]
+        lines += [f"{SPHERICAL_ABSENT}本节同 4.1，一并留空。", ""]
         return lines
     variables = sorted(bundle.sph_variable.index)
     rows = []
@@ -1161,12 +914,12 @@ def _spherical_variables_section(bundle: WaveBundle) -> List[str]:
         "",
         f"逐变量的球谐带 log-RMS×100 排序为 "
         + " < ".join(f"{n}（{_fmt(by_variable[n], 2)}）" for n in order_variable)
-        + f"，按 §5.1 的频带口径汇总为 "
+        + f"，按 §4.1 的频带口径汇总为 "
         + " < ".join(f"{n}（{_fmt(by_band[n], 2)}）" for n in order_band)
         + ("，两者一致。" if order_variable == order_band else
            "，**两者不一致**。")
         + "两者用的是同一批带功率样本，只是聚合维度不同（这里按变量汇总全部频带，"
-        "§5.1 按频带汇总全部变量），排序不一致时说明模型间的优劣集中在个别频带上，"
+        "§4.1 按频带汇总全部变量），排序不一致时说明模型间的优劣集中在个别频带上，"
         "选型时要指明关注哪一段尺度。",
         "",
     ]
@@ -1174,11 +927,11 @@ def _spherical_variables_section(bundle: WaveBundle) -> List[str]:
 
 
 def _spherical_tests_section(bundle: WaveBundle) -> List[str]:
-    """§5.3 球谐带配对检验：指标（频带）× 模型对。"""
+    """§4.3 球谐带配对检验：指标（频带）× 模型对。"""
     names = bundle.names
-    lines = ["## 5.3 球谐带配对检验", ""]
+    lines = ["## 4.3 球谐带配对检验", ""]
     if not bundle.sph_available:
-        lines += [f"{SPHERICAL_ABSENT}本节同 5.1，一并留空。", ""]
+        lines += [f"{SPHERICAL_ABSENT}本节同 4.1，一并留空。", ""]
         return lines
     rows = []
     for band in bundle.sph_band_logrms.index:
@@ -1216,7 +969,7 @@ def _section_spectrum(bundle: WaveBundle, figures: Mapping[str, str]) -> List[st
     names = bundle.names
     variables = bundle.spectrum_variables
     lines = [
-        "# 5. 功率谱检验",
+        "# 4. 功率谱检验",
         "",
         f"产物保留两套功率谱定义：纬向 FFT 谱（`diagnostics/spectrum_by_init.csv`）"
         f"和球谐带功率（`scores.csv` 里 `spherical_bands` 的结果行）。"
@@ -1228,7 +981,7 @@ def _section_spectrum(bundle: WaveBundle, figures: Mapping[str, str]) -> List[st
     lines += _spherical_variables_section(bundle)
     lines += _spherical_tests_section(bundle)
     lines += [
-        f"## 5.4 纬向 FFT 功率谱（完整）",
+        f"## 4.4 纬向 FFT 功率谱（完整）",
         "",
         f"纬向 FFT 对每个纬圈做一维 rFFT，经度方向波数 k=1..{FULL_K_MAX}，k=0 的纬向平均已置零。"
         f"纬向谱与球谐谱不是同一种变换：纬向谱保留完整 1–{FULL_K_MAX} 波数，"
@@ -1246,7 +999,7 @@ def _section_spectrum(bundle: WaveBundle, figures: Mapping[str, str]) -> List[st
         ["**口径**"] + [f"**{n}**" for n in names] + ["**最佳**", "**解释**"], rows,
     )
 
-    lines += ["", f"## 5.4.1 {_cn(len(WAVE_BANDS))}个波数带结果", ""]
+    lines += ["", f"## 4.5 {_cn(len(WAVE_BANDS))}个波数带结果", ""]
     header = ["**波数带**"]
     for name in names:
         header += [f"**{name} logRMS**", f"**{name} 能量比**"]
@@ -1276,10 +1029,10 @@ def _section_spectrum(bundle: WaveBundle, figures: Mapping[str, str]) -> List[st
         "",
         "![zonal_spectrum_bands](zonal_spectrum_bands.png)",
         "",
-        f"图 5：{_cn(len(names))}模型分波数带（{' / '.join(b.split()[0] for b in bundle.band_logrms.index)}）"
+        f"图 4：{_cn(len(names))}模型分波数带（{' / '.join(b.split()[0] for b in bundle.band_logrms.index)}）"
         f"的纬向谱 log-RMS×100 对比。",
         "",
-        "## 5.4.2 平均功率谱与比值曲线",
+        "## 4.6 平均功率谱与比值曲线",
         "",
         f"下列曲线是{len(bundle.dates)}个日度功率谱的平均。黑线为 ERA5，"
         f"彩色线为{_cn(len(names))}个模型的预测谱；比值为 pred/obs，理想值为 1，"
@@ -1287,13 +1040,13 @@ def _section_spectrum(bundle: WaveBundle, figures: Mapping[str, str]) -> List[st
         "",
         "![mean_power_spectrum](mean_power_spectrum.png)",
         "",
-        f"图 6：{base.spectrum_variable} 纬向功率谱（{len(bundle.dates)} 个共同日期平均，双对数坐标）。",
+        f"图 5：{base.spectrum_variable} 纬向功率谱（{len(bundle.dates)} 个共同日期平均，双对数坐标）。",
         "",
         "![spectrum_ratio](spectrum_ratio.png)",
         "",
-        f"图 7：{base.spectrum_variable} 纬向谱 pred/obs 比值随波数的变化（纵轴限定 0.1–10）。",
+        f"图 6：{base.spectrum_variable} 纬向谱 pred/obs 比值随波数的变化（纵轴限定 0.1–10）。",
         "",
-        f"## 5.4.3 1–{MATCHED_K_MAX} 波数逐变量结果",
+        f"## 4.7 1–{MATCHED_K_MAX} 波数逐变量结果",
         "",
     ]
     rows = []
@@ -1315,16 +1068,9 @@ def _section_spectrum(bundle: WaveBundle, figures: Mapping[str, str]) -> List[st
         "",
     ]
 
-    # --- 5.5 主模型专项 ---
+    # --- 4.8 主模型专项（可选：只在显式指定了 primary / reference 时出） ---
     if bundle.primary and bundle.reference:
         lines += _section_primary(bundle)
-
-    lines += [""]
-    lines += _heatmap_block(bundle, figures)
-    lines += [""]
-    lines += _single_init_block(bundle, figures)
-    lines += [""]
-    lines += _capability_block(bundle, figures)
     return lines
 
 
@@ -1335,7 +1081,7 @@ def _section_primary(bundle: WaveBundle) -> List[str]:
     names = bundle.names
     others = [n for n in names if n not in (primary, reference)]
 
-    lines = [f"## 5.5 {primary} 相对 {reference} 的频谱专项对比", "",
+    lines = [f"## 4.8 {primary} 相对 {reference} 的频谱专项对比", "",
              f"本节为{primary}（主模型）与{reference}（对照）的逐项对比，"
              f"用于判断频谱优化是否落地。", ""]
 
@@ -1401,285 +1147,6 @@ def _section_primary(bundle: WaveBundle) -> List[str]:
     return lines
 
 
-def _heatmap_block(bundle: WaveBundle, figures: Mapping[str, str]) -> List[str]:
-    """「§5.5 变量 × 时效 RMSE 热力图」（``图 8``）——给谱结论做 RMSE 侧对照。"""
-    base = bundle.base
-    if "rmse_heatmap" not in figures:
-        return [
-            "## 5.5 变量 × 时效 RMSE 热力图（谱结论的 RMSE 侧对照）",
-            "",
-            "**本批未出。** 只有单个 lead 时热力图没有可读的横向变化，"
-            "渲染器不出这张图。",
-        ]
-    count = len(base.names)
-    variables = len(base.common_variables)
-    first, last, leads = _lead_span(base.rmse_by_lead[base.names[0]].index)
-    return [
-        "## 5.5 变量 × 时效 RMSE 热力图（谱结论的 RMSE 侧对照）",
-        "",
-        f"{count}幅子图，每个模型一幅：纵轴是{variables}个变量、横轴是全部{leads}个lead",
-        f"（{first}–{last}h）。格子里的数**不是 RMSE 本身，而是该模型在该变量、该 lead 上",
-        f"相对自己首时效（{first}h）的 RMSE 倍数**，除以首时效就把量纲与气候态差异约掉了。",
-        "这一节是给前面几节的谱结论做**对照**用的，本身不是谱指标：谱上说某模型小尺度能量",
-        "偏低，就该在这张图上看到对应的变量（通常是高层风场与位势高度）误差随 lead 加深更快；",
-        "图上看不到对应信号，说明谱偏差还没传导到场误差，正文里要照实写，",
-        "不能只报谱上的差距。",
-        "",
-        f"![multi_model_rmse_heatmap]({figures['rmse_heatmap']})",
-        "",
-        f"图 8：{variables}个变量 × {leads}个 lead 的 RMSE 倍数热力图"
-        f"（各自除以本模型首时效 {first}h 的 RMSE；{_date_span(base.dates)} 共同日期平均）",
-    ]
-
-
-def _single_init_block(bundle: WaveBundle, figures: Mapping[str, str]) -> List[str]:
-    """「§5.6 单起报谱曲线」（``图 9``）。"""
-    base = bundle.base
-    variable = base.spectrum_variable
-    init = str(base.dates[0]) if base.dates else ""
-    lines = [
-        "## 5.6 单起报谱曲线",
-        "",
-        f"§5.4.2 是{len(base.dates)}个日期平均后的谱，平均会把个例差异抹平。这一节换成"
-        f"**单个起报**（{init}）的谱，用来核对平均谱上的结论在个例上是否成立——平均谱上",
-        "「小尺度偏低」如果只在少数个例出现，就不该写成模式的普遍特征。",
-        "",
-    ]
-    if "spectrum_curve" in figures:
-        lines += [
-            f"![spectrum_curve]({figures['spectrum_curve']})",
-            "",
-            f"图 9：{init} 单起报的 {variable} 纬向功率谱"
-            f"（双对数；黑色虚线为同时刻观测谱）",
-        ]
-    else:
-        lines += [
-            f"**本批未出。** 产物里没有 {variable} 的逐起报谱"
-            f"（`diagnostics/spectrum_by_init.csv`），出不了这张图。",
-        ]
-    return lines
-
-
-#: 能力雷达图的轴：``(轴名, 取 Series 的函数, 是否越高越好)``。
-#:
-#: 五根都是**综合评分**——单一标量、衡量一种能力、可跨模型比。逐变量 / 逐波数带的
-#: 细粒度指标**不进雷达图**：雷达图一根轴只画一个顶点，细粒度指标要么先汇总
-#: （那已经变成另一个综合评分），要么把轴撑爆、读不出形状。
-#:
-#: 前四根就是 §5.1 那张「综合四指标」柱状图的四个数，摆成多边形看形状；第五根
-#: 是同一份纬向谱换 k 上限的口径。**这两根谱轴天然相关**（1–128 是 1–720 的子集），
-#: 摆在一起是有意的：报告正文本来就双口径并列，图上不一致说明高波数段改变了格局，
-#: 一致则说明结论稳——真要合成一根反而把这个信息抹掉了。
-CAPABILITY_AXES: Tuple[Tuple[str, Callable[[WaveBundle], pd.Series], bool], ...] = (
-    ("综合相对RMSE", lambda b: b.base.relative_composite, False),
-    ("ACC (%)", lambda b: b.base.acc_mean, True),
-    ("FA偏差 (pp)", lambda b: b.base.fa_bias, False),
-    (f"谱 logRMS 1–{FULL_K_MAX}", lambda b: b.zonal_full, False),
-    (f"谱 logRMS 1–{MATCHED_K_MAX}", lambda b: b.zonal_matched, False),
-)
-
-
-def capability_profile(
-    bundle: WaveBundle,
-) -> Tuple[List[str], Dict[str, Dict[str, float]], Dict[str, bool]]:
-    """组装雷达图要的三样东西：轴序、``{模型: {轴: 原始值}}``、各轴方向。"""
-    axes = [label for label, _, _ in CAPABILITY_AXES]
-    higher = {label: flag for label, _, flag in CAPABILITY_AXES}
-    raw = {
-        str(name): {
-            label: getter(bundle).get(name) for label, getter, _ in CAPABILITY_AXES
-        }
-        for name in bundle.names
-    }
-    return axes, raw, higher
-
-
-def _capability_block(bundle: WaveBundle, figures: Mapping[str, str]) -> List[str]:
-    """「§5.7 模型能力雷达图」——综合评分的批内归一化对比（``图 10``）。"""
-    axes, raw, higher = capability_profile(bundle)
-    scores = radar_scores(raw, axes, higher)
-    names = [str(name) for name in bundle.names]
-    kept = [axis for axis in axes if names and axis in scores[names[0]]]
-    dropped = [axis for axis in axes if axis not in kept]
-
-    lines = [
-        "## 5.7 模型能力雷达图",
-        "",
-        "这一节把 §5.1 那张总表的**综合评分**摆成多边形：每根轴一种能力，",
-        "每个模型一个多边形，**越靠外越好**。它不引入任何新算法，只是把总表的数",
-        "换个读法——看的是「能力形状」，不是「谁排第一」：两个模型综合分接近时，",
-        "雷达图能显出差距集中在哪几项上。谱上的差距会同时反映到两根谱轴上，",
-        "所以谱明显偏低的模型在这里会凹进去两块，那**不是两次独立扣分**，是同一件事。",
-        "",
-        f"共 {len(kept)} 根轴，方向已在括号里标明（越高越好 / 越低越好）："
-        + "；".join(
-            f"{axis}（{'越高越好' if higher[axis] else '越低越好'}）" for axis in kept
-        )
-        + "。",
-        "",
-    ]
-
-    if dropped:
-        lines += [
-            f"**有 {len(dropped)} 根轴本批未画**：{'、'.join(dropped)}——"
-            "这些轴上有模型缺值（通常是该指标整块没出数）。雷达图没有断点，"
-            "少画一个顶点会把多边形拉歪，所以整根剔除，不拿 0 顶替"
-            "（那是「这项能力为零」，不是「没有这项能力」）。",
-            "",
-        ]
-
-    lines += [
-        "**读法**：纵轴 0–1 是**批内相对分**，每根轴上 1 = 本批最好、0 = 本批最差"
-        "（各轴方向先行统一）。"
-        f"这是{_model_count_word(len(names))}模型互比出来的相对位置，**不是绝对能力分**——"
-        "全批都差时每根轴照样有人拿 1；只有两个模型时必然是 1 和 0。"
-        "某一根轴上所有模型打平时，该轴一律画在满格 1.0（画成 0 会让多边形凭空凹进去），"
-        "所以**满格不代表领先**，要回正文看绝对数值。",
-        "",
-    ]
-
-    if "capability_radar" in figures:
-        lines += [
-            f"![capability_radar]({figures['capability_radar']})",
-            "",
-            f"图 10：{_model_count_word(len(names))}模型能力雷达图（{len(kept)} 根综合评分轴；"
-            f"各轴批内 min-max 归一化，1 = 本批最好；{_date_span(bundle.dates)} 共同日期）",
-        ]
-    else:
-        lines += [
-            "**本批未出。** 渲染器没拿到雷达图的落盘路径。这一节**不像别处那样"
-            "依赖可选数据**——五根轴每个批次都有，正常跑 `generate_wave_report.py` "
-            "必然出图；缺了就是渲染器或调用方出了问题，该回去查，"
-            "不要当成「这批数据没跑到」。",
-        ]
-
-    if scores and names:
-        outer = max(names, key=lambda name: sum(scores[name].values()))
-        inner = min(names, key=lambda name: sum(scores[name].values()))
-        if outer != inner:
-            lines += [
-                "",
-                f"多边形面积最大的是 {outer}（各轴得分之和 "
-                f"{_fmt(sum(scores[outer].values()), 2)}），"
-                f"最小的是 {inner}（{_fmt(sum(scores[inner].values()), 2)}）。",
-            ]
-    return lines
-
-
-def _section_risks(bundle: WaveBundle) -> List[str]:
-    base = bundle.base
-    names = bundle.names
-    variable = base.anomaly_variable
-    model = base.anomaly_model
-    # 骨架这一节原本是条件章节（异常检出），标题里的「尺度异常（高优先级）」只在
-    # 真的超阈值时才成立。没检出的年份照抄标题，会出现「高优先级」下面跟着
-    # 「不单独作为风险项」的自相矛盾，所以标题跟着结论走。
-    detected = base.anomaly_ratio >= 3.0
-    lines = ["# 6. 异常与数据质量风险", "",
-             f"## 6.1 {model} {variable} "
-             + ("尺度异常（高优先级）" if detected else "量级检查（未检出异常）"), ""]
-
-    rows = []
-    for lead in base.lead_relative.index:
-        column = base.rmse_by_lead[model].get(variable)
-        other_series = [base.rmse_by_lead[n].get(variable) for n in names if n != model]
-        other_series = [s for s in other_series if s is not None and lead in s.index]
-        if column is None or lead not in column.index or not other_series:
-            continue
-        median = float(np.median([float(s.loc[lead]) for s in other_series]))
-        value = float(column.loc[lead])
-        rows.append([f"{float(lead):g}"] + [_fmt(base.rmse_by_lead[n].get(variable, pd.Series()).get(lead), 4)
-                                           for n in names]
-                    + [_fmt(value / median, 3) if median else "—"])
-    lines += _table(
-        ["**Lead (h)**"] + [f"**{n}**" for n in names]
-        + [f"**{model} / 其余{_cn(len(names) - 1)}模型中位数**"],
-        rows,
-    )
-    ratio = base.anomaly_ratio
-    lines += [
-        "",
-        f"{model} 的 {variable} RMSE 是其余模型中位数的 {_fmt(ratio, 2)} 倍"
-        + ("，超出「同量级」的可接受范围（阈值 3×）。该差异在所有 lead 上一致存在，"
-           "不是个别时效的抖动，更像是量纲/单位或变量定义层面的问题；"
-           f"建议核对 {variable} 的预报与观测是否使用同一套单位与层次定义后，"
-           f"再采信该变量的结论，并在修复前不要用 {variable} 参与模型排名。"
-           if ratio >= 3.0 else
-           "，未超过 3× 的异常阈值，属于正常的模型间水平差异，"
-           "不单独作为风险项，但也说明该变量的模型间可比性弱于其他变量。"),
-        "",
-        "## 6.2 FA 幅度偏差",
-        "",
-        f"{_cn(len(base.fa_variables))}个 FA 变量的幅度偏差（100×mean\\|pred/obs−1\\|）为："
-        + "、".join(f"{n} {_fmt(base.fa_bias[n], 4)} pp" for n in names)
-        + f"。偏差最小（幅度最真实）的是 {base.fa_bias.idxmin()}，"
-        f"偏差最大的是 {base.fa_bias.idxmax()}。"
-        "FA 偏差是绝对值口径，丢掉了「偏强/偏弱」的方向，只能说明幅度失真多少，"
-        "不能据此断言某个模型偏平滑或偏噪；要判方向需回到逐日 pred/obs 比值。",
-        "",
-        "## 6.3 原始场独立复算不足（中高优先级）",
-        "",
-        f"本报告的纬向谱、综合相对 RMSE、ACC 与 FA 全部读自各模型产物目录里的 "
-        f"scores.csv 汇总行与 diagnostics/ 下的谱表，没有回到原始预报场与观测场做独立复算。"
-        f"产物目录不含原始场，这一点无法在本报告内弥补。"
-        f"因此评测环节（变量映射、插值、单位换算、谱变换）如果出错，"
-        f"本报告会原样继承且无法自查。结论用于模型间横向比较是充分的；"
-        f"用于绝对谱保真度认定前，建议抽一个日期回到原始场复算一次谱。",
-        "",
-        "## 6.4 ACC 定义风险（中高优先级）",
-        "",
-        f"{base.acc_variable} 的首时效 ACC 已达 "
-        f"{_fmt(_first_lead_value(base, base.acc_variable), 3)}%"
-        f"（最高模型 {base.acc_mean.idxmax()} 全程 {_fmt(base.acc_mean.max())}%）。"
-        f"距平相关系数在近端接近饱和，对模型差异几乎不敏感，"
-        f"用它排名会把不同模型压成几乎同分，不能单独作为选型依据；"
-        f"建议与 RMSE、纬向谱三项同看。",
-        "",
-    ]
-    return lines
-
-
-def _section_acceptance(bundle: WaveBundle) -> List[str]:
-    base = bundle.base
-    names = bundle.names
-    rmse_best = base.relative_composite.idxmin()
-    acc_best = base.acc_mean.idxmax()
-    fa_best = base.fa_bias.idxmin()
-    zonal_best = bundle.zonal_full.idxmin()
-    # 与 §3.1 的「RMSE + ACC + FA + 纬向 FFT 谱」口径保持一致，不用 base.rank_score。
-    rank_four = _spectrum_inclusive_rank(base, bundle)
-    rank_best = rank_four.idxmin()
-    worst = base.relative_composite.idxmax()
-
-    rows = [
-        ["综合精度优先（默认）", rmse_best,
-         f"综合相对 RMSE 最低（{_fmt(base.relative_composite[rmse_best])}）"],
-        ["大尺度形势场", acc_best, f"ACC 最高（{_fmt(base.acc_mean[acc_best])}%）"],
-        ["幅度与谱真实性优先", zonal_best,
-         f"纬向谱 log-RMS×100 最低（{_fmt(bundle.zonal_full[zonal_best], 2)}）"],
-        ["强度与活跃度", fa_best, f"FA 偏差最小（{_fmt(base.fa_bias[fa_best], 4)} pp）"],
-        ["多维度均衡", rank_best, f"综合排名分最低（{_fmt(rank_four[rank_best], 2)}）"],
-        ["暂缓采用", worst, f"综合相对 RMSE 最高（{_fmt(base.relative_composite[worst])}）"],
-    ]
-    if bundle.primary:
-        rows.append([f"谱优化版本（{bundle.primary}）", bundle.primary,
-                     f"纬向谱 log-RMS×100 {_fmt(bundle.zonal_full[bundle.primary], 2)}，"
-                     f"综合相对 RMSE {_fmt(base.relative_composite[bundle.primary])}"])
-
-    lines = ["# 7. 验收结论与选型建议", ""]
-    lines += _table(["**目标**", "**推荐**", "**结论依据**"], rows)
-    lines += [
-        "",
-        f"**总体判定：在 {len(bundle.dates)} 个共同日期（{_date_span(bundle.dates)}）上，"
-        f"{rmse_best} 的综合相对 RMSE 最低、{acc_best} 的 ACC 最高、"
-        f"{zonal_best} 的纬向谱保真度最好、{fa_best} 的幅度最真实；"
-        f"四个口径没有指向同一个模型，验收时应按实际业务目标取权重，"
-        f"不宜只凭单一指标定论。**",
-        "",
-    ]
-    return lines
-
-
 def _appendix(bundle: WaveBundle, figures: Mapping[str, str],
               archive: Optional[str], out_dir: Path) -> List[str]:
     base = bundle.base
@@ -1719,8 +1186,7 @@ def _appendix(bundle: WaveBundle, figures: Mapping[str, str],
         "",
     ]
     # 骨架把可选块定在「附录那张表之后」，图件清单是渲染器自己加的一节，排在可选块后面。
-    lines += _region_block(bundle, figures)
-    lines += [""]
+    # 附 L（分纬度带）已随简化去掉——主报告的附 L 覆盖同一张表，本报告不再复制。
     lines += _season_block()
     lines += [
         "",
@@ -1754,10 +1220,7 @@ def render_wave(bundle: WaveBundle, figures: Mapping[str, str], *,
         _section_conclusion(bundle),
         _section_scope(bundle),
         _section_overall(bundle),
-        _section_rmse(bundle),
         _section_spectrum(bundle, figures),
-        _section_risks(bundle),
-        _section_acceptance(bundle),
         _appendix(bundle, figures, archive, out_dir),
     ):
         lines += section
@@ -1778,17 +1241,18 @@ def build_wave_report(archives: Sequence[Archive], out_dir: Path, *,
     names = bundle.names
     base = bundle.base
 
+    # 图序即本字典的顺序。简化后只出谱图，编号由骨架的「图 N：」定死：
+    #   1 总体柱状 → 2/3 球谐带（有球谐时才占号）→ 4 五波数带 → 5/6 平均谱与比值
+    # 球谐缺席时 2/3 一并消失，后面整体前移——编号由渲染器现算，不写死。
     figures = {
         "overall_summary": "overall_summary.png",
-        "rmse_by_lead_range": "rmse_by_lead_range.png",
         "zonal_spectrum_bands": "zonal_spectrum_bands.png",
         "mean_power_spectrum": "mean_power_spectrum.png",
         "spectrum_ratio": "spectrum_ratio.png",
     }
-    if bundle.sph_available:      # 图 3 / 图 4，插在分时效图与分波数带图之间
+    if bundle.sph_available:
         figures = {
             "overall_summary": "overall_summary.png",
-            "rmse_by_lead_range": "rmse_by_lead_range.png",
             "spherical_bands_logrms": "spherical_bands_logrms.png",
             "spherical_bands_ratio": "spherical_bands_ratio.png",
             "zonal_spectrum_bands": "zonal_spectrum_bands.png",
@@ -1806,19 +1270,7 @@ def build_wave_report(archives: Sequence[Archive], out_dir: Path, *,
         suptitle=f"{_cn(len(names))}模型总体指标对比",
     )
 
-    # 图 2：分时效段综合相对 RMSE
-    band_rows = {}
-    for low, high in ((0.0, 120.0), (120.0, 240.0), (240.0, 360.0)):
-        subset = base.lead_relative[(base.lead_relative.index > low) & (base.lead_relative.index <= high)]
-        if not subset.empty:
-            band_rows[f"{low:g}–{high:g}h"] = subset.mean(axis=0)
-    _grouped_bars(
-        out_dir, figures["rmse_by_lead_range"], pd.DataFrame(band_rows).T,
-        suptitle=f"{_cn(len(names))}模型分时效段综合相对 RMSE（越低越好）",
-        ylabel="综合相对 RMSE",
-    )
-
-    # 图 3 / 图 4：球谐带 log-RMS 与均值比
+    # 图 2 / 图 3：球谐带 log-RMS 与均值比
     if bundle.sph_available:
         _grouped_bars(
             out_dir, figures["spherical_bands_logrms"], bundle.sph_band_logrms.T,
@@ -1831,14 +1283,14 @@ def build_wave_report(archives: Sequence[Archive], out_dir: Path, *,
             ylabel="pred / obs", ref_line=1.0,
         )
 
-    # 图 5：分波数带 log-RMS
+    # 图 4：分波数带 log-RMS
     _grouped_bars(
         out_dir, figures["zonal_spectrum_bands"], bundle.band_logrms.T,
         suptitle=f"{_cn(len(names))}模型分波数带纬向谱 log-RMS×100（越低越好）",
         ylabel="log-RMS×100",
     )
 
-    # 图 6 / 图 7：平均功率谱与比值曲线（取优先变量）
+    # 图 5 / 图 6：平均功率谱与比值曲线（取优先变量）
     variable = base.spectrum_variable
     spectra = {name: frame[variable] for name, frame in bundle.spectra.items()}
     _plot_mean_spectrum(
@@ -1850,93 +1302,9 @@ def build_wave_report(archives: Sequence[Archive], out_dir: Path, *,
         suptitle=f"{variable} 纬向谱 pred/obs 比值（理想值 1）",
     )
 
-    # 图 8：变量 × 时效 RMSE 热力图（§5.5），给谱结论做 RMSE 侧对照。格子是
-    # 「除以本模型首时效」的倍数——各变量单位不同，不归一化就没法共用一根色标。
-    ratios: Dict[str, pd.DataFrame] = {}
-    for name in names:
-        frame = base.rmse_by_lead[name]
-        if frame.empty:
-            continue
-        lead_values = sorted(frame.index)
-        if len(lead_values) < 2:
-            continue
-        ratios[name] = frame.div(frame.loc[lead_values[0]].replace(0.0, np.nan))
-    if ratios:
-        figures["rmse_heatmap"] = "multi_model_rmse_heatmap.png"
-        DetPlotter().plot_rmse_heatmap(
-            ratios, base.common_variables,
-            leads=sorted(base.rmse_by_lead[names[0]].index),
-            suptitle=f"{_cn(len(names))}模型 RMSE 相对本模型首时效的倍数",
-            save_path=out_dir / figures["rmse_heatmap"],
-        )
-
-    # 图 9：单起报谱曲线（§5.6）。取共同日期里最早的那个起报，其余日期仍进 §5.4.2
-    # 的平均谱。产物没有逐起报谱就**不出图**，报告那边写「本批未出」。
-    if base.dates:
-        init = str(base.dates[0])
-        single: Dict[str, pd.DataFrame] = {}
-        # 循环变量**不能**叫 archive——那是本函数的参数名（`--archive` 传进来的归档名），
-        # 遮蔽掉之后 render_wave 拿到的是 Archive 对象，抬头会打印整个 repr。
-        for item in archives:
-            try:
-                pred, obs = load_spectrum(item.root, [init], base.spectrum_variable,
-                                          item.name)
-            except (FileNotFoundError, ValueError):
-                continue
-            if init in pred.columns:
-                single[item.name] = pd.DataFrame({"pred": pred[init], "obs": obs[init]})
-        if single:
-            figures["spectrum_curve"] = f"spectrum_curve_{base.spectrum_variable}_{init}.png"
-            _plot_mean_spectrum(
-                out_dir, figures["spectrum_curve"], single,
-                variable=base.spectrum_variable,
-                suptitle=f"{base.spectrum_variable} 纬向功率谱（{init} 单起报）",
-            )
-
-    # 图 L1 / 图 L2：分纬度带（可选块）。没有共同的 region 行就**不出图**，也不往
-    # figures 里塞不存在的文件名——报告那边会写「本批未出」，指一张没生成的图比不指更糟。
-    if base.region_names:
-        band_labels = [
-            region_display(region, base.region_labels) for region in base.region_names
-        ]
-        figures["lat_band_lead"] = "lat_band_rmse_vs_lead.png"
-        figures["lat_band_summary"] = "lat_band_summary.png"
-        plotter = DetPlotter()
-        plotter.plot_model_panels(
-            {
-                name: pd.DataFrame({
-                    label: base.region_lead_relative[region][name]
-                    for region, label in zip(base.region_names, band_labels)
-                })
-                for name in names
-            },
-            band_labels,
-            ylabel="综合相对 RMSE（100 = 该带内几何均值）",
-            ref_line=BASELINE,
-            ncols=min(len(band_labels), 3),
-            suptitle="分纬度带综合相对 RMSE 随预报时效的变化",
-            save_path=out_dir / figures["lat_band_lead"],
-        )
-        summary = base.region_relative_composite.copy()
-        summary.index = band_labels
-        plotter.plot_group_bars(
-            summary,
-            ylabel="综合相对 RMSE（100 = 该带内几何均值）",
-            ref_line=BASELINE,
-            suptitle="分纬度带综合相对 RMSE",
-            save_path=out_dir / figures["lat_band_summary"],
-        )
-
-    # 图 10：能力雷达图（§5.7）。轴与归一化都在渲染器那边（`capability_profile` +
-    # `radar_scores`），这里只负责出图——两边各算一遍会把图与图注算出分歧。
-    figures["capability_radar"] = "capability_radar.png"
-    axes, raw, higher = capability_profile(bundle)
-    DetPlotter().plot_capability_radar(
-        raw, axes, higher,
-        suptitle=f"{_cn(len(names))}模型能力雷达图（批内相对分，1 = 本批最好）",
-        save_path=out_dir / figures["capability_radar"],
-    )
-
+    # 简化后本报告只出谱图。热力图、单起报谱曲线、能力雷达图三张主报告的附录里
+    # 已经出过，分纬度带整块随附 L 一起去掉，分时效段的 RMSE 图随 §4 RMSE 那节
+    # 一起去掉——这里都不生成，免得留下没人引用的孤儿文件。
     text = render_wave(bundle, figures, archive=archive, out_dir=out_dir)
     report_path = out_dir / "REPORT.md"
     report_path.write_text(text, encoding="utf-8", newline="\n")

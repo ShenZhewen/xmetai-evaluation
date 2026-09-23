@@ -141,6 +141,33 @@ def prepare_ts_dataframe(df: pd.DataFrame) -> pd.DataFrame:
     return data.sort_values(["grade", "lead_h"])
 
 
+def split_regions(
+    df: pd.DataFrame,
+) -> Tuple[pd.DataFrame, Dict[str, pd.DataFrame]]:
+    """宽表 → ``(全球行, {带名: 该带的行})``。
+
+    分纬度带评测时同一张宽表里全球行与各带行并存（全球行的 ``region`` 空），
+    **两者绝不能混着算**：各带平均再平均 ≠ 全球平均，混进去会把带间差异整个
+    抹平。所以图与正文一律只看全球行，带行走 :func:`ts_report.build_ts_report`
+    的「附 L」那一块。
+
+    没有 ``region`` 列（这个能力出现之前的产物、或没配分带）时：全部算全球行、
+    带集为空——**与加这个能力之前逐行一致**。函数本身是幂等的，传进来的已经是
+    全球行时得到的还是它自己。
+    """
+    if "region" not in df.columns:
+        return df, {}
+    values = df["region"]
+    empty = values.isna() | (values.astype(str).str.strip() == "")
+    if bool(empty.all()):
+        return df, {}
+    bands = {
+        name: df[~empty & (values.astype(str).str.strip() == name)]
+        for name in sorted(set(values[~empty].astype(str).str.strip()))
+    }
+    return df[empty], bands
+
+
 def available_leads(df: pd.DataFrame) -> List[float]:
     """数据里出现过的时效（升序）。"""
     return sorted(float(value) for value in pd.unique(df["lead_h"]))
@@ -453,14 +480,22 @@ class PrecipitationPlotter:
         baselines: Optional[Dict[str, pd.DataFrame]] = None,
         sources: Optional[Dict[str, str]] = None,
         change_description: Optional[str] = None,
+        region_labels: Optional[Dict[str, str]] = None,
     ) -> Dict[str, Path]:
         """出图 + 写 Markdown 报告，返回 {名称: 路径}。"""
         output_dir = Path(output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
         data = prepare_ts_dataframe(df)
+        # 分纬度带：图和正文一律只看全球行，带行单独进报告的「附 L」（见
+        # ``split_regions``）。对比表同样只留全球行——各带平均再平均不等于全球
+        # 平均，把带行当全球行拿去比是另一种口径，不是同一件事。
+        data, region_frames = split_regions(data)
         # 对比表统一在这里规范化一次：差值图、箱线图、报告表格读的是同一份，
         # spec 有问题的对比表也会在这里就报出清晰的缺列错误。
-        baselines = {name: prepare_ts_dataframe(frame) for name, frame in (baselines or {}).items()}
+        baselines = {
+            name: split_regions(prepare_ts_dataframe(frame))[0]
+            for name, frame in (baselines or {}).items()
+        }
         lead = float(lead_h) if lead_h is not None else available_leads(data)[0]
         window = None
         if "window_h" in data.columns and data["window_h"].notna().any():
@@ -537,6 +572,8 @@ class PrecipitationPlotter:
             artifacts=artifacts,
             lead_h=lead,
             box_models=box_models,
+            region_frames=region_frames,
+            region_labels=region_labels,
         )
         artifacts["report"] = report_path
         # 别在这两行用 ✓ / ⚠：Windows 控制台默认 GBK，编码不了这两个字符。报告和图
@@ -554,6 +591,8 @@ class PrecipitationPlotter:
         reference: Optional[str] = None,
         figsize: Tuple[int, int] = (15, 7.5),
         save_path: Optional[Path] = None,
+        legend_title: str = "模型",
+        suptitle: Optional[str] = None,
     ):
         """各模型指标随时效变化的对比（每个降水等级一个子图）。
 
@@ -561,6 +600,9 @@ class PrecipitationPlotter:
             mode: ``"delta"``（默认）画相对主模型的**差值**——几个模型水平接近时
                 绝对曲线会重合成一团，差值才看得出谁强谁弱；``"absolute"`` 画绝对值。
             reference: 主模型名（差值基准）；默认取 ``model_dfs`` 的第一个。
+            legend_title / suptitle: 图例标题与总标题。分纬度带那张图借这个函数画
+                （每个带一条线，与"每个模型一条线"结构完全一样），不改标题就会
+                写成「各模型」却列着带名。
         """
         if mode not in ("delta", "absolute"):
             raise ValueError(f"未知 mode: {mode}（可选 delta/absolute）")
@@ -628,11 +670,14 @@ class PrecipitationPlotter:
         handles, labels = axes[0].get_legend_handles_labels()
         if handles:
             fig.legend(handles, labels, loc="lower center", ncol=min(len(labels), 3),
-                       frameon=True, title="模型")
+                       frameon=True, title=legend_title)
         fig.suptitle(
-            f"各模型 {metric} 与 {reference} 的差值随时效变化（>0 表示优于 {reference}）"
-            if mode == "delta"
-            else f"各模型 {metric} 随时效变化"
+            suptitle
+            or (
+                f"各模型 {metric} 与 {reference} 的差值随时效变化（>0 表示优于 {reference}）"
+                if mode == "delta"
+                else f"各模型 {metric} 随时效变化"
+            )
         )
         fig.tight_layout(rect=(0, 0.05, 1, 0.97))
         self._save(fig, save_path)

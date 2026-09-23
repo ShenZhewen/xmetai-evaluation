@@ -239,6 +239,10 @@ def _render_ts(
     # 来源要连对比模型一起写进报告头，否则每个对比模型都标成"未提供"
     sources = {model_name: str(wide_path)}
     sources.update({name: str(path) for name, path in comparisons.items()})
+    # 纬度带的边界只在 manifest 里（宽表只有带名），报告要写成「带名 [南界, 北界]」
+    # 就得从这里读。读不到（老产物没写这个键）时返回空，报告只显示带名。
+    from xmetai_evaluation.visualization.ts_report import region_labels_from
+
     return PrecipitationPlotter().create_report(
         pd.read_csv(wide_path),
         output_dir=target,
@@ -246,6 +250,7 @@ def _render_ts(
         baselines={name: pd.read_csv(path) for name, path in comparisons.items()} or None,
         sources=sources,
         change_description=change_description,
+        region_labels=region_labels_from(output_dir),
     )
 
 
