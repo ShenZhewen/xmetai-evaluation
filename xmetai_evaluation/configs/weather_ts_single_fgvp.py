@@ -77,19 +77,41 @@ cfg = EvalConfig(
 
     # 协议口径（station_valid_time）：8 = 北京时，Diamond 观测自带的口径，
     # 也是协议缺省。另可配 region（区域筛选）、weights（"cos_lat"）。
-    options={"local_utc_offset_hours": 8},
+    options={
+        "local_utc_offset_hours": 8,
+
+        # 分纬度带评估：{带名: {"lat_min": 南界, "lat_max": 北界}}，**闭区间**。
+        # 每个样本除全球行外逐带再出一行（长表 region 列区分，全球行为空），
+        # 站点按**站点纬度**整站归带。不带分带就删掉这个键，输出回到只有全球行。
+        #
+        # 带名就是报告里的显示名，**报告不翻译也不写死任何带名**；表按南界从低
+        # 到高排，改边界/改带名直接改这里。
+        #
+        # 闭区间的代价：正好落在 25 / 32 / 40 上的站**两条带都算**（与格点侧
+        # 口径一致，改成半开会让两类产物的分带对不上）。站点纬度极少正好压线，
+        # 真压上了也就是这两条带各多它一个站，不构成口径问题。
+        #
+        # 南方那条的南界写 0 而不是 -90：这是中国站点集（zd_sta_10285.dat），
+        # 赤道以南没有站；换成含南半球的站点集时这一带要重划。
+        "regions": {
+            "南方": {"lat_min": 0, "lat_max": 25},
+            "长江中下游": {"lat_min": 25, "lat_max": 32},
+            "华北": {"lat_min": 32, "lat_max": 40},
+            "东北": {"lat_min": 40, "lat_max": 90},
+        },
+    },
 
     start_date=os.environ.get("START_DATE", "20250101"),
     # 止于 15 号、不是 31 号：**站点观测档案到 2025-12-31 23:00 就没了**，预报比它长。
     # 起报越靠后，长时效的验证时刻越容易越过这条线，那种块整块评不出样本（日志里是
     # 「观测窗口不完整」+「没有任何样本可评」），只会白占一个失败块。15 号的最长时效
     # 落在 12-30，留一天余量。观测补齐后可改回来，`.states/` 里的旧块会原样复用。
-    end_date=os.environ.get("END_DATE", "20251215"),
+    end_date=os.environ.get("END_DATE", "20250215"),
     limit=None,  # 限起报数，直接改这里；None = 不限
 
     output_dir=os.environ.get(
         "EVAL_OUTPUT",
-        "/workspace/szwCode/xmetai-evaluate/evaluation_results/weather_ts_single_fgvp",
+        "/workspace/szwCode/evaluation_results/weather_ts_single_fgvp",
     ),
     log_level="INFO",
 
@@ -103,7 +125,7 @@ cfg = EvalConfig(
     # 进程一份站点观测"的开销，而 threads 下 resident 全局只有 1 份（loader 有锁）。
     execution={
         "mode": "threads",      # 轻指标 → threads（auto 也会推导成它，这里写死）
-        "n_workers": 4,         # 缺省 4；numpy/读盘释放 GIL，典型加速 2~3×，再加收益递减
+        "n_workers": 24,         # 缺省 4；numpy/读盘释放 GIL，典型加速 2~3×，再加收益递减
         "chunk_days": 1,        # 一个块装 1 个起报日
         "lead_chunk_days": 1,   # 一个块装 1 天时效（= 4 个 6h 时效），正好框住 1 个 24h 采样点
         # 站点观测的推导缺省就是 resident（整个 run 读一次：Diamond 是逐时文本，
