@@ -11,8 +11,10 @@
 不向量化——归档对拍要的是逐位一致，不是"数学上等价"。
 
 沿/横路径误差（``at_km`` / ``ct_km``）的定向用**前一个配对上的实况位置**，
-不是预报-实况连线，也不是起报点；所以一条路径里**第一个配对时效**的 at/ct
-必为空——没有前一个实况就无从定向。实况有缺口时缺的是那个时效，不是固定 6h。
+不是预报-实况连线，也不是起报点；所以确定性链里**第一个配对时效**的 at/ct
+为空——没有前一个实况就无从定向。（集合链例外：首时次用**起报时刻实况**
+定向，那是旧集合链路的归档口径，见 ``TrackErrorEns``。）实况有缺口时缺的是
+那个时效，不是固定 6h。
 
 除标量外，本指标把整条逐时效表放进 ``MetricResult.curve``：一个场次一行一个
 时效，15 个字段，直接喂给 ``typhoon_cases`` writer 出 ``tc<编号>_<起报>.csv``。
@@ -323,13 +325,18 @@ def _row_nanmean(values: np.ndarray) -> np.ndarray:
 class TrackErrorEns(TrackError):
     """集合台风的路径与强度误差：方案 A / B 两种口径一次算清。
 
-    与 ``TrackError`` 的差别只在**批次带成员轴**时怎么算：
+    与 ``TrackError`` 有两处差别：
 
-    - 曲线的 15 个确定性列里，``fcst_*`` 给的是**集合平均位置**，所以
-      ``track_err_km`` / ``at_km`` / ``ct_km`` 就是**方案 B**；
-    - 方案 A 的三项另开 ``*_a`` 列（逐成员先算误差、再对成员平均）；
-    - 强度类两项两方案代数恒等，只出一列——
+    - **批次带成员轴时怎么算**：曲线的 15 个确定性列里，``fcst_*`` 给的是
+      **集合平均位置**，所以 ``track_err_km`` / ``at_km`` / ``ct_km`` 就是
+      **方案 B**；方案 A 的三项另开 ``*_a`` 列（逐成员先算误差、再对成员平均）；
+      强度类两项两方案代数恒等，只出一列——
       ``mean_m(pmin_m − obs) ≡ mean_m(pmin_m) − obs``，实况对成员是常数。
+    - **首时次 at/ct 的定向基准**：集合链按旧链路（``run_tc`` 的集合分支 /
+      ``recompute_ens_track_error.py``）的口径，用**起报时刻实况**当"前一个
+      位置"（协议放在 alignment 的 ``init_obs_position``）；起报时刻没有实况时
+      首时次才留空。确定性链没有这个基准、首时次一贯为空——两条链各自对齐自己
+      的归档，别按其中一条的直觉改另一条。
 
     逐时效仍走标量循环；方案 A 只是在成员维上多一层循环，**每个成员算误差的调用
     顺序与确定性链完全一致**——对拍要的是逐位一致，不是"数学上等价"。
@@ -339,6 +346,25 @@ class TrackErrorEns(TrackError):
     """
 
     MERGE_FIELDS = CURVE_FIELDS + ENS_EXTRA_FIELDS
+
+    #: 结果产品类型（长表 product_kind 列）：与确定性链分开。两条链的指标名不同
+    #: （track_error / track_error_ens），产品身份同样是集合的——两份归档拼在
+    #: 一起时别让下游按确定性口径取用。
+    PRODUCT_KIND = "ensemble"
+
+    def requirements(self) -> MetricRequirements:
+        """集合输入契约：成员轴是这条链的正常输入，声明 ``ENSEMBLE_SAMPLES``。
+
+        ``TrackError`` 的 ``DETERMINISTIC_FIELD`` 会被基类校验拦下（"要求确定性
+        场，但输入含 member 维"）——那道检查拦的是"确定性指标收到集合输入"，
+        正是这条链的对立面。成员级诊断场就在 forecast 的
+        ``(lead_time, storm, member)`` 轴上，不另设 ``members`` 槽位（基类校验
+        已同时认这两种入口，见 ``metrics/base.py`` 的同款注释）。
+        """
+        return MetricRequirements(
+            product_type=ProductType.ENSEMBLE_SAMPLES,
+            variables=["*"],
+        )
 
     def __init__(self, params: Dict[str, Any] = None):
         super().__init__(params)
@@ -391,16 +417,27 @@ class TrackErrorEns(TrackError):
         pmin = np.full(n_lead, nan)
         n_valid = np.zeros(n_lead, dtype=int)
 
-        # 逐时效标量推进：prev 只在**配对成功**的时效上更新，与确定性链同款。
+        # 首时次 at/ct 的定向基准：**起报时刻实况**（旧集合链路口径，协议放在
+        # alignment 的 init_obs_position）。它和种子不是同一条记录：种子是
+        # "起报后第一条能配上时效的实况"，通常晚 6h 以上；起报时刻没有实况时
+        # 基准为 None，首时次 at/ct 留空——与旧归档（run_tc 集合分支 /
+        # recompute_ens_track_error.py）一致。
+        alignment = dict(batch.alignment or {})
+        init_obs = alignment.get("init_obs_position")
+        initial = (float(init_obs[0]), float(init_obs[1])) if init_obs else None
+
+        # 逐时效标量推进：prev 只在**配对成功**的时效上更新；首时次用起报时刻
+        # 实况当"前一个位置"定向，其后与确定性链同款。
         prev = None
         for k in range(n_lead):
             if not np.isfinite(o_lat[k]):
                 continue
+            anchor = prev if prev is not None else initial
             # 方案 B：集合平均位置 vs 实况
             err_b[k] = float(great_circle_km(m_lat[k], m_lon[k], o_lat[k], o_lon[k]))
-            if prev is not None:
+            if anchor is not None:
                 at_b[k], ct_b[k] = along_cross_track(
-                    prev[0], prev[1], o_lat[k], o_lon[k], m_lat[k], m_lon[k]
+                    anchor[0], anchor[1], o_lat[k], o_lon[k], m_lat[k], m_lon[k]
                 )
             # 方案 A：逐成员算误差，再对"能诊断出中心"的成员平均
             member_err: List[float] = []
@@ -412,9 +449,9 @@ class TrackErrorEns(TrackError):
                 member_err.append(
                     float(great_circle_km(f_lat[k, j], f_lon[k, j], o_lat[k], o_lon[k]))
                 )
-                if prev is not None:
+                if anchor is not None:
                     along, cross = along_cross_track(
-                        prev[0], prev[1], o_lat[k], o_lon[k], f_lat[k, j], f_lon[k, j]
+                        anchor[0], anchor[1], o_lat[k], o_lon[k], f_lat[k, j], f_lon[k, j]
                     )
                     member_at.append(float(along))
                     member_ct.append(float(cross))
