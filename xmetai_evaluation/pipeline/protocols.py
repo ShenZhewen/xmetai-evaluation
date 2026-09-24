@@ -84,11 +84,13 @@ def babj_seed_moment(
     moments: Iterable[datetime],
     init_bjt: datetime,
     min_offset_hours: float = 6.0,
+    step_hours: float = 6.0,
 ) -> Optional[datetime]:
-    """链式诊断的起始中心该取哪一条实况（协议与执行计划层共用的唯一口径）。
+    """链式诊断的起始中心该取哪一条实况；这个起报不是场次时返回 ``None``。
 
-    取**起报后第一条不早于「起报 + min_offset_hours」的实况**；一条都没有就
-    返回 ``None``，调用方跳过这个场次。
+    取**起报后、时效网格上的第一条实况**（不早于「起报 + min_offset_hours」，
+    且时刻正好落在 ``init_bjt + 时效`` 的网格上）；一条都没有就返回 ``None``，
+    调用方跳过这个场次。
 
     为什么起点不是起报时刻本身，而是往后一个时效：链的种子要保证**第一条
     时效能配上实况**。报文里的分析场是 6 小时一个（北京时 02/08/14/20），
@@ -97,23 +99,50 @@ def babj_seed_moment(
     曲线会一个实况都配不上，白出一个全空场次。从第一个时效的 valid 时刻起
     找，就不会有这个问题。
 
+    **种子必须正好落在某个时效的验证时刻上**：验证时刻是 ``init_bjt + 时效``
+    （``step_hours`` 网格），而报文里存在 17:00/05:00 这类**不在网格上**的
+    记录（观测段有 3 小时一条的时候）。归档（``tc/fuxi``）的口径是"第一条
+    **能配上时效**的实况"——非网格记录跳过、取网格上的第一条。不跳的后果是
+    init_pos 与归档差一条记录：2025 年 2507@0722 的 17:00 非网格、20:00 才是
+    第一条能配的（两者相距 ~1.3°），逐位对拍就差这一场。
+
     默认 6.0 就是第一个时效的步长，与标准归档（``tc/fuxi``）同口径：那边
-    的 ``init_pos`` 实测恒等于"起报后第一条不早于 init+6h 的实况"。改用
-    起报时刻本身当种子会让绝大多数场次的种子前移约 6 小时（中位 ~100km），
-    虽然被 ±4° 的早期搜索框吸收、曲线多半仍然一致，但边界场次（台风刚生成
-    / 快消散、msl 场平缓）会静默对不上。
+    的 ``init_pos`` 实测恒等于"起报后第一条能配上时效的实况"。改用起报时刻
+    本身当种子会让绝大多数场次的种子前移约 6 小时（中位 ~100km），虽然被
+    ±4° 的早期搜索框吸收、曲线多半仍然一致，但边界场次（台风刚生成/快消散、
+    msl 场平缓）会静默对不上。
+
+    **起报日必须落在该台风的生命史日期窗内**（首条实况的日期 ≤ 起报北京时
+    日期 ≤ 末条实况的日期），否则返回 ``None``：这个起报不是这号台风的场次。
+    没有这道窗，"只往后找"会把生成前的起报日全部放行——起报之后总能找到
+    第一条实况（哪怕在几天后的生成时刻），一号台风于是凭空多出从年初到它
+    消散的每一天场次，预报侧还有一条全无实况可配的"曲线"。标准归档
+    （``tc/fuxi``）的口径就是"起报日落在生命史日期窗内"，这里按它复现
+    （2025 年 157 个场次实测逐一相同）。
 
     只往后找，不往前找：往前找等于用"预报还没起步"的位置当起点，时效与
     实况对不上。
 
-    ``moments`` 可以是某号台风的 ``{北京时: 记录}`` 字典（协议侧），也可以是
-    几号台风实况时刻的并集（计划层切块前用它）。
+    ``moments`` 可以是某号台风的 ``{北京时: 记录}`` 字典（协议侧），也可以
+    是某号台风实况时刻的集合（计划层——**必须逐号传，不能传并集**：并集的
+    日期窗会把各台风之间的空档日也放行）。
     """
+    moments = set(moments)
+    if not moments:
+        return None
+    first, last = min(moments), max(moments)
+    if not (first.date() <= init_bjt.date() <= last.date()):
+        return None
     if min_offset_hours <= 0:
         # 0 = 种子就取起报时刻那条；等价于"起点不往后挪"
         return init_bjt if init_bjt in moments else None
+    step = timedelta(hours=float(step_hours))
     limit = init_bjt + timedelta(hours=min_offset_hours)
-    later = [moment for moment in moments if moment >= limit]
+    later = [
+        moment
+        for moment in moments
+        if moment >= limit and (moment - init_bjt) % step == timedelta(0)
+    ]
     return min(later) if later else None
 
 
@@ -129,6 +158,7 @@ def babj_init_times(
     offset_hours: float,
     storm_ids: Optional[List[str]] = None,
     min_offset_hours: float = 6.0,
+    step_hours: float = 6.0,
 ) -> List[datetime]:
     """从 BABJ 报文反推哪些起报时刻对得上实况（协议与执行计划层共用的唯一口径）。
 
@@ -138,17 +168,22 @@ def babj_init_times(
     再靠报错筛掉。
 
     计划层用它在切块前把对不上的起报日剔出去。不剔的后果不是"少跑几场"：
-    台风空档期（生成前、消散后）那些起报日仍会各切出一个块，每块读到 0 个
-    样本、被判失败块，manifest 里堆一片「工作块失败」——看着像跑挂了，实际
-    只是那天没有台风。同时也白读一遍全部报文。
+    台风空档期那些起报日仍会各切出一个块，每块读到 0 个样本、被判失败块，
+    manifest 里堆一片「工作块失败」——看着像跑挂了，实际只是那天没有台风。
+    同时也白读一遍全部报文。
 
     ``storm_ids`` 必须参与筛选，否则会漏掉一层：只跑 2501 时，7 月那些"有
-    别的台风、没有 2501"的日子照样会切出空块。所以这里按**在评的那几号
-    台风**的实况时刻取并集。
+    别的台风、没有 2501"的日子照样会切出空块。所以这里**逐号台风**判
+    ``babj_seed_moment``（生成前的起报日由那道日期窗剔掉）——判定必须逐号，
+    不能把几号台风的实况时刻并起来判：并集的日期窗会把台风之间的空档日
+    也放行，切出来的块在协议侧一个场次都建不出，又回到"空块堆进 manifest"。
 
     ``min_offset_hours`` 必须与协议侧同源（``plan.py`` 两处传的是同一个配置
     项 ``seed_min_offset_hours``）。这里收窄了、协议没收窄，就会静默少场次
     ——正是这个函数跟 ``babj_seed_moment`` 共用一份规则要避免的事。
+
+    ``step_hours`` 同理：时效步长（种子须落在 ``init_bjt + 时效`` 网格上），
+    plan 侧从预报布局取（``_layout_step_hours``）。
 
     报文是 KB 级、数量以十计，这里整目录读一次换准确的起报集，划算。
     """
@@ -161,19 +196,27 @@ def babj_init_times(
         for index, name in enumerate(names)
         if storm_ids is None or name in storm_ids
     ]
-    moments = set()
+    per_storm: List[set] = []
     for index in scope:
         column = payload["lat"].values[:, index]
-        for k in range(column.size):
-            if np.isfinite(column[k]):
-                moments.add(
-                    payload["time"].values[k].astype("datetime64[us]").item()
-                )
+        moments = {
+            payload["time"].values[k].astype("datetime64[us]").item()
+            for k in range(column.size)
+            if np.isfinite(column[k])
+        }
+        if moments:
+            per_storm.append(moments)
     offset = timedelta(hours=offset_hours)
     return [
         value
         for value in init_times
-        if babj_seed_moment(moments, value + offset, min_offset_hours) is not None
+        if any(
+            babj_seed_moment(
+                moments, value + offset, min_offset_hours, step_hours
+            )
+            is not None
+            for moments in per_storm
+        )
     ]
 
 
@@ -1165,6 +1208,9 @@ class TyphoonTrackProtocol(Protocol):
         # 链的种子最早取到"起报后多久"的实况，见 babj_seed_moment。6.0 = 第一个
         # 时效的步长，与标准归档同口径；0 = 就取起报时刻那条（找不到就跳过）。
         self.seed_min_offset = float(spec.options.get("seed_min_offset_hours", 6.0))
+        # 时效步长（种子须落在时效网格上，见 babj_seed_moment）；_prepare_common
+        # 里按预报布局的实际步长覆盖。
+        self._step_hours = 6.0
         # 想只跑某几号台风就填 storm_ids（单号可写 tcid），留空跑报文目录下全部
         self.storm_ids = typhoon_storm_filter(spec.options)
         self.batches: Dict[Any, EvaluationBatch] = {}
@@ -1206,6 +1252,10 @@ class TyphoonTrackProtocol(Protocol):
         forecast = context.forecast
         observation = context.observation
         self.forecast = forecast
+        # 时效步长：种子必须落在时效网格上（见 babj_seed_moment），布局声明的
+        # step_hours 就是网格步长（本仓台风两条链都是 6h）。
+        layout = getattr(forecast.reader, "layout", None)
+        self._step_hours = float(getattr(layout, "step_hours", None) or 6.0)
         init_times = [
             datetime.fromisoformat(str(value))
             for value in self.spec.forecast.params.get("init_times", [])
@@ -1412,7 +1462,9 @@ class TyphoonTrackProtocol(Protocol):
         同一个函数**，两边口径必须是一份，否则会出现"计划层剔了某天、协议其实
         能跑"的静默缺场次。这里只负责把时刻翻成记录。
         """
-        moment = babj_seed_moment(analyses, init_bjt, self.seed_min_offset)
+        moment = babj_seed_moment(
+            analyses, init_bjt, self.seed_min_offset, self._step_hours
+        )
         if moment is None:
             return None, 0.0
         return analyses[moment], (moment - init_bjt).total_seconds() / 3600.0
@@ -1631,8 +1683,13 @@ class TyphoonTrackEnsProtocol(TyphoonTrackProtocol):
                 # 种子比下限还晚 = 第一个时效那条分析场缺了（判断与确定性链同款）
                 if seed_offset_h > self.seed_min_offset + 1e-6:
                     self.seed_gaps.append(f"{tcid}@{init_bjt}+{seed_offset_h:g}h")
+                # 首时次 at/ct 的定向基准：起报时刻实况（旧集合链路口径）。
+                # 注意与种子（origin）不是同一条记录：种子是"起报后第一条能
+                # 配上时效的实况"，通常晚 6h 以上；这里要的是起报时刻本身那条，
+                # 取不到就 None（首时次 at/ct 会留空）。
                 sessions[(tcid, init_time)] = {
                     "origin": origin,
+                    "init_obs": analyses.get(init_bjt),
                     "seed_offset_h": seed_offset_h,
                     "analyses": analyses,
                     "tcname": str(self.babj["tcname"].values[storm_position]),
@@ -1689,6 +1746,7 @@ class TyphoonTrackEnsProtocol(TyphoonTrackProtocol):
                 per_member,
                 session["origin"],
                 session["seed_offset_h"],
+                session["init_obs"],
             )
             self.sample_list.append(
                 Sample(
@@ -1729,12 +1787,15 @@ class TyphoonTrackEnsProtocol(TyphoonTrackProtocol):
         per_member: Dict[str, List[Dict[str, Any]]],
         origin: Dict[str, float],
         seed_offset_h: float,
+        init_obs: Optional[Dict[str, float]],
     ) -> EvaluationBatch:
         """打包成 ``(lead_time, storm, member)`` 的批次。
 
         预报侧保留**成员轴**：成员各自的诊断位置是原始数据，集合平均位置与两种
         误差口径都由 ``track_error_ens`` 去算，协议不预先聚合。观测侧给
         ``(lead_time, storm)``——实况对成员是同一份，由指标自己广播。
+        ``init_obs`` 是起报时刻那条实况（可为 None）：指标用它给首时次的
+        at/ct 定向（旧集合链路口径，见 ``track_error_ens``）。
         """
         def member_rows(field: str) -> np.ndarray:
             """(lead, member)：各成员在该字段上的整条时效序列。"""
@@ -1800,6 +1861,13 @@ class TyphoonTrackEnsProtocol(TyphoonTrackProtocol):
                 "tz_shift_hours": self.tz_shift,
                 "init_bjt": (init_time + timedelta(hours=self.tz_shift)).isoformat(),
                 "init_position": [origin["lat"], origin["lon"]],
+                # 首时次 at/ct 的定向基准：**起报时刻实况**（旧集合链路口径——
+                # run_tc 的集合分支 / recompute_ens_track_error.py 用它当"前一个
+                # 位置"）。与上面 init_position（种子）是两条不同的记录：种子
+                # 通常晚 6h 以上。取不到起报时刻实况时为 None，首时次 at/ct 留空。
+                "init_obs_position": (
+                    [init_obs["lat"], init_obs["lon"]] if init_obs else None
+                ),
                 # 起始中心相对起报时刻的偏移小时（见 babj_seed_moment）：正常是
                 # seed_min_offset（6h），更大说明那一条分析场缺了。只写进 meta。
                 "seed_offset_hours": seed_offset_h,
