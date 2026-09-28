@@ -110,12 +110,14 @@ def build_plan(
         #
         # seed_min_offset_hours 与协议读的是同一个配置项：计划层与协议必须按同一
         # 口径判断"这个起报能不能起链"，否则能跑的场次在切块前就被剔掉了。
+        # 时效步长（种子须落在时效网格上）同样从预报布局取，两边同源。
         init_times = babj_init_times(
             observation,
             init_times,
             spec.local_utc_offset_hours,
             typhoon_storm_filter(spec.options),
             float(spec.options.get("seed_min_offset_hours", 6.0)),
+            _layout_step_hours(forecast),
         )
         if not init_times:
             raise EvaluationError(
