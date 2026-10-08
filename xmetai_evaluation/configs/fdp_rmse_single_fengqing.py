@@ -1,129 +1,95 @@
 # -*- coding: utf-8 -*-
-"""要素检验（Fengqing × CRA40）：RMSE / Bias / ACC。
+"""FDP 要素检验（确定性口径）：Fengqing × CRA40。
 
-流程：``fdp_field_scores``（格点有效时刻配对；集合先降维）。
+流程 ``["fdp_field_scores", "fdp_activity_spectrum"]`` 两段按顺序跑、结果合并落
+同一个 output_dir：前段出误差族 RMSE / Bias 与距平族 ACC，后段出活跃度比与功率谱。
+两段模板都带 ``ensemble_mean``，所以评的是集合平均场当确定性预报。
 
-数据：
-    预报  Fengqing 单卡（z500，逐 6h，文件名里带 3 位时效）
-    观测  CRA40 再分析（框架现有 ``cra`` reader，gh@500hPa）
-    参考  气候态 —— **ACC 需要，RMSE / Bias 不需要**；见下面 CRA_CLI_ROOT 那段
-
-规模：起报与时效都由配置显式钉死（``init_times`` 一个起报 × ``lead_times`` 5 个
-时效 = 5 个样本），不是按 start/end 滚一整段。所以这份是**单场次冒烟/对比**用的
-配置，跑起来只有 1 个块。
-
-内存：单块工作集很小（1 个起报 × 5 个时效 × 1 要素）。CRA40 是 GRIB2、按请求
-跨度现读现弃；气候态若给了就是整份驻留。逐键说明见下面 ``execution`` 那段。
+数据源三件套就是本仓库 weather 系列换了个来源（预报 fengqing / 观测 cra /
+参考气候态）。⚠ 预报侧要用 ``fengqing`` 而不是 ``fengqing_phys``——后者 z500 报
+m²/s²，与 CRA 的 gh（米）对不上（前者按 1/g 换算成米）。
 """
-import os
+from xmetai_evaluation.configs.base import EvalConfig, metric_options_from_var_metrics
 
-from xmetai_evaluation.configs.base import EvalConfig
+# 预报（FENGQING_LAYOUT）与观测（CRA_LAYOUT）两边布局都有的要素。
+# msl / tp 暂不列入：实测本 cra_root 的两个 grib 里都没有 tp，而 msl 落在
+# ART_ATM、CRA_LAYOUT 却把它归到 SURFACE 组——读文件是按组选的，归错组就读不到。
+# 换成服务器上完整的 CRA40 归档后可以把它们加回这个表。
+VARS = ["z500", "t2m", "u10", "v10"]
+
+# 逐变量指标表 -> metric_options。⚠ 两段用到的 5 个指标都必须点到某个变量下，
+# 漏点名的会拿到整批多变量数据并直接报错（框架有意防静默出假数）。
+VAR_METRICS = {
+    "z500": ["rmse", "bias", "acc", "activity", "spectrum"],
+    "t2m": ["rmse", "bias", "acc"],
+    "u10": ["rmse", "bias", "acc"],
+    "v10": ["rmse", "bias", "acc"],
+}
+
+METRIC_OPTIONS = metric_options_from_var_metrics(VAR_METRICS)
+# ACC 口径：True = 经典皮尔逊（距平再减域加权均值）；False = FDP / WeatherBench2
+# 的 uncentered 口径。对标 FDP 用 False。
+METRIC_OPTIONS["acc"] = {**METRIC_OPTIONS["acc"], "centered": False}
+
+_FENGQING_ROOT = "/mnt/d/weather_main/chunyan_weather_test_bash/fengqing"
+_CRA_ROOT = "/mnt/d/weather_main/chunyan_weather_test_bash/cra_root"
 
 cfg = EvalConfig(
     name="fdp_rmse_single_fengqing",
-    description="FDP 要素检验：z500 的 RMSE / Bias / ACC",
-    pipeline="fdp_field_scores",
+    description="FDP 要素检验（Fengqing × CRA40）：RMSE / Bias / ACC / 活跃度 / 功率谱",
+    pipeline=["fdp_field_scores", "fdp_activity_spectrum"],
 
     forecast_reader={
-        "type": "fengqing",
-        "root_dir": os.environ.get(
-            "FDP_FENGQING_ROOT", "/mnt/d/weather_main/chunyan_weather_test_bash/fengqing"
-        ),
-        "variables": ["z500"],
-        "step_hours": 6.0,      # 布局步长：lead_from="filename"，文件名里的 3 位时效 × 6h
-        # 时效列表（小时）。本流程**没有累积窗**（fdp_field_scores 的变换只有
-        # ensemble_mean），每个读到的时效都是独立样本，所以这里可以写稀疏集——
-        # 与降水流程（weather_ts_det / weather_ts_ens）不同，那些必须按 6h 密排。
-        "lead_times": [24, 48, 72, 96, 120],
-        # 起报时刻显式钉死；给了它就不再按 start_date/end_date 去目录里找起报。
-        # 一个起报 × 5 个时效 = 5 个样本，所以下面 start/end 对本段其实不起作用。
-        "init_times": ["2026-08-19T00:00:00"],
+        "type": "fengqing",     # 集合；本流程先用 ensemble_mean 降成确定性场
+        "root_dir": _FENGQING_ROOT,
+        "variables": VARS,
+        "step_hours": 6.0,      # 布局步长：时效取文件名里的 3 位 × 6h
+        # 本流程没有累积窗（变换只有 ensemble_mean），每个时效都是独立样本，
+        # 所以这里**可以**写稀疏集；降水那两份必须按 6h 密排，不一样。
+        "lead_times": [24, 30, 36, 42],
     },
     observation_reader={
         "type": "cra",
-        "root_dir": os.environ.get(
-            "FDP_CRA_ROOT", "/mnt/d/weather_main/chunyan_weather_test_bash/cra_root"
-        ),
-        "variables": ["z500"],
+        "root_dir": _CRA_ROOT,
+        "variables": VARS,
     },
-    # 气候态参考是**有条件的**，这是语义不是风格：没设 CRA_CLI_ROOT 就当作"没有
-    # 参考源"，而不是退回一个默认路径。后果：ACC 用零场兜底、状态标 partial 且
-    # 日志给警告，**那个 ACC 数字没有意义**；RMSE / Bias 不受影响。要让 ACC 有效
-    # 就 export CRA_CLI_ROOT=<气候态文件或目录>。
-    reference_reader=(
-        {"type": "climatology", "root_dir": os.environ["CRA_CLI_ROOT"]}
-        if os.environ.get("CRA_CLI_ROOT")
-        else None
-    ),
+    # 气候态：ACC / 活跃度必需（RMSE / Bias 用不上，但给了不构建）。
+    # ⚠ 必须是 **CRA40 的** 气候态——拿 ERA5 的配 CRA 实况不同源，ACC 会系统性偏，
+    # 而框架不会拦（文件本身合法）。改成你服务器上的路径。
+    reference_reader={
+        "type": "daily_climatology",
+        "root_dir": "/workspace/data/worm/cra_clim_phys_14.nc",
+        "smooth_days": 15,      # ±7.5 天环形滑动、跨年首尾相接，抹平单日噪声
+    },
 
-    start_date=os.environ.get("START_DATE", "20260819"),
-    end_date=os.environ.get("END_DATE", "20260819"),
-    limit=None,  # 限起报数，直接改这里；None = 不限
+    # 只管起报日范围。本机 fixture 的 cra_root 只有 20260820 一天，所以起报钉在
+    # 0819、时效 24~42 → 有效时刻正好是 0820 的 00/06/12/18，四个样本全配得上。
+    # 0820 起报的 6/12/18 也有观测，要一起评就把 end_date 改 "20260820"、并在
+    # lead_times 里加上 6/12/18；那两组跨不上的组合会各报一次 "No cra files
+    # found" 后跳过，不影响其余样本。
+    start_date="20260819",
+    end_date="20260819",
+    limit=None,             # 限起报数，直接改这里；None = 不限
 
-    output_dir=os.environ.get(
-        "EVAL_OUTPUT",
-        "/mnt/d/fdp_rmse_single_fengqing",
-    ),
-    # json 是**在本模板默认的 ["csv_long"] 之上追加的**（配置级 writers 是替换，
-    # 所以这里必须把模板那份也写全，漏了 csv_long 主表就没了）。
-    writers=["csv_long", "json"],
+    output_dir="/mnt/d/fdp_rmse_single_fengqing",
+    # ⚠ 配置级 writers 是**替换**模板的，所以必须把两段模板的输出都写全：
+    # fdp_field_scores 给 csv_long，fdp_activity_spectrum 给 csv_long + spectrum。
+    # 漏了 spectrum 就没有逐波数曲线（30 个点的曲线走长表会爆行数）。
+    writers=["csv_long", "spectrum", "json"],
+    metric_options=METRIC_OPTIONS,
     log_level="INFO",
 
-    # 协议口径。本配置不写 options —— 模板自带的 {"ensemble_reduction": "mean"}
-    # 就是全部，而配置级的 options 是**合并**不是替换（spec.options 先取模板再
-    # update 配置），所以真要加也只需写增量。
-    # 另注意 ACC 的口径：本模板给的是**经典皮尔逊**（距平场再减域加权均值）；
-    # FDP / WeatherBench2 的 uncentered 口径是另一个指标 acc_uncentered。
-
-    # ── 并发与数据加载：execution ──────────────────────────────────────
-    # 可用键**就下面这 6 个**，全部是字面量，只覆盖写到的键（不写 = 用推导值）。
-    # 写错键名会直接报配置错，不会静默忽略。
-    #
-    #   mode             并发形态，四选一：
-    #                      serial     单进程顺序跑块（冒烟、单块用）
-    #                      threads    1 个进程内 N 线程并发块；resident/window
-    #                                 全局只有 1 份（loader 有锁），适合轻指标
-    #                      processes  进程池，块按**时间连续分段**、一段固定一个
-    #                                 子进程顺序处理（段内相邻块能命中窗块缓存）
-    #                      auto       推导：单块 → serial；重指标 → processes；
-    #                                 轻指标 → threads
-    #                    本流程的 rmse / bias / acc 都是轻指标，落成什么形态看块数：
-    #                    块按 (chunk_days 个起报日) × (lead_chunk_days 天时效) 切，
-    #                    本配置 5 个时效跨 5 个日期 → **5 个块 → threads × 4**
-    #                    （时效若都落在同一天，才是 1 个块 → serial）。
-    #                    所以这一项写 auto 而不是某个具体形态——写死了反而会在
-    #                    起报数变化时卡在错误的选择上。
-    #                    ⚠ threads 会并发打开各自的 .nc，而 HDF5 不是线程安全的：
-    #                    IO 层已用 hdf5_guard 把文件访问串行化（见 io/base.py），
-    #                    所以三种形态结果一致，只差速度。
-    #   n_workers        进程/线程数。推导缺省 processes = CPU 核数、threads = 4
-    #   chunk_days       一个工作块装几个**起报日**（缺省 1）——管起报跨度
-    #   lead_chunk_days  一个工作块装几天**时效**（缺省 1）——管时效跨度。本配置
-    #                    只有 lead 24~120 共 5 个采样点，落成 5 个时效窗；取值
-    #                    0 = 不切（整段时效一块，本配置只有 5 个时效，完全可行）
-    #   loads            角色驻留覆盖 {角色: 策略}，角色只有 observation / reference：
-    #                      slice      每个块现读现弃
-    #                      resident   整个 run 读一次驻留内存
-    #                      window:W   按 W 天块滚动缓存（LRU），省相邻块的重复读
-    #                      window     裸写不带数字 = 自动定窗；落成的值回写成
-    #                                 "window:N" 记进 manifest 的 execution.loads
-    #                    推导缺省：站点观测 / 气候态 = resident，其余 = slice。
-    #                    本配置 observation 是 cra → slice；reference 是
-    #                    climatology → resident，**但只在设了 CRA_CLI_ROOT 时
-    #                    才存在这个角色**（没参考源时这一项写了也不生效）。
-    #   resume           True 时已完成块的状态落 output_dir/.states/，重跑跳过
-    #
-    # 下面 loads 两行就是推导结果，写出来是为了好改。代价：写死之后不再自动
-    # 跟随数据源——换了观测/参考读取器要记得回来核对一遍。
+    # 可用键就 mode / n_workers / chunk_days / lead_chunk_days / loads / resume，
+    # 只覆盖写到的键（不写 = 按指标族与数据源形态推导），写错键名直接报配置错。
     execution={
-        "mode": "auto",         # 单块 → serial；块数上去 → threads（本流程是轻指标）
-        "n_workers": 4,         # 线程缺省 4；落地 serial 时这项不起作用
+        "mode": "auto",         # 本流程是轻指标 + 少量块；块数上去会落 threads
+        "n_workers": 4,
         "chunk_days": 1,        # 一个块装 1 个起报日
         "lead_chunk_days": 1,   # 一个块装 1 天时效
         "loads": {
-            "observation": "slice",     # CRA40 GRIB2 按请求跨度切，现读现弃
-            "reference": "resident",    # 气候态整 run 驻留（仅当设了 CRA_CLI_ROOT）
+            "observation": "slice",     # CRA40 GRIB2 按请求跨度现读现弃
+            "reference": "resident",    # 气候态整 run 驻留一份，fork 共享
         },
-        "resume": True,         # 长时段正式跑建议开：中断后接着算
+        "resume": True,         # 已完成块的状态落 .states/，重跑跳过
     },
 )
