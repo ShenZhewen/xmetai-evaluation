@@ -131,9 +131,14 @@ class Metric(ABC):
                     f"（如 {{'type': 'ensemble_mean'}}）",
                     variable=self.name,
                 )
+        # 成员场有两个合法入口：``members`` 槽位（网格/站点协议把原始成员与
+        # 主变量分开装配）与预报场自带的 ``member`` 轴（台风集合链的诊断路径
+        # 本身就是成员级数据，不再另抄一份进槽位）。两处都没有才算真缺——
+        # 只查槽位会把后一类集合指标误判成"没有成员场"。
         if (
             reqs.product_type is ProductType.ENSEMBLE_SAMPLES
             and getattr(batch, "members", None) is None
+            and "member" not in dims
         ):
             raise MetricError(
                 f"指标 '{self.name}' 需要集合成员（member 维），但这一批配对数据里没有成员场；"
