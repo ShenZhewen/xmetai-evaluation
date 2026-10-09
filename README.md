@@ -21,14 +21,18 @@ xmetai-inference → 预报产品文件 → xmetai-evaluation → 评测结果�
 
 ```bash
 pip install -e .
-
+cd xmetai-evalation-v2
 # 看有哪些评测功能
-xmetai-eval --list-pipelines
+python -m xmetai_evaluation.cli --list-pipelines         
 
 # 开始评测（配置可以是内置名，也可以是 .py 路径；数据路径由环境变量提供）
-xmetai-eval --config weather_ts_ens_fuxi
+python -m xmetai_evaluation.cli --config weather_rmse_single_fgvp --log-file /workspace/szwCode/evaluation_results/weather_rmse_single_fgvp_ctrl/smoke_tp.log
 
-output /workspace/data/worm/tmp_result/_XMETAI_test_results_single 
+# --log-file 可省略：省略后日志只打到控制台（INFO 级），不落文件；
+# --config 可以更换，如 weather_rmse_single_fgvp
+
+# 测试
+python -m pytest tests/integration/test_fdp_fengqing_realdata.py -m realdata
 ```
 
 ## 目录结构
