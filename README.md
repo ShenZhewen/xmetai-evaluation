@@ -730,7 +730,7 @@ echo "已用: $(cat /sys/fs/cgroup/memory.current)"
 | `weather_typhoon_single_fuxi` | 台风路径与强度（确定性 × BABJ） |
 | `weather_typhoon_ens_fuxi` | 台风路径与强度（集合，方案 A/B 一次算清） |
 | `fdp_rmse_single_fengqing` / `fdp_rmse_ens_fengqing` | FDP 要素检验（确定性 / 集合） |
-| `fdp_precip_fengqing` | FDP 降水站点检验：TS/频率偏差 + 集合概率 BS/AROC/BSS |
+| `fdp_precip_single_fengqing` / `fdp_precip_ens_fengqing` | FDP 降水站点检验（确定性 TS/频率偏差 / 集合概率 BS/AROC/BSS） |
 | `rainstorm_ts_single_fuxi` / `_fgvp_ctrl` | 暴雨过程分档检验：走 `weather_ts_det`，逐过程展开起报，过程编目（43 个过程，编号/起止/等级）的唯一真值在 `rainstorm_catalog.py` |
 
 批量多模型见上「批量评测」——写一份 `cfgs` 列表即可，无内置示例。
