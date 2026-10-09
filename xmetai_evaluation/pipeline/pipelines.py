@@ -9,8 +9,9 @@
     python -m xmetai_evaluation --list-pipelines            # 看能力清单
     python -m xmetai_evaluation --config my_config.py       # 配置自己声明 pipeline
 
-12 条流程按三大业务块统一前缀：``fdp_``（业务天气评测）、``weather_``（天气模型
-验证）、``clim_``（气候，待落地）。每条模板的 ``description`` 就是
+流程按三大业务块统一前缀：``fdp_``（业务天气评测）、``weather_``（天气模型
+验证）、``clim_``（气候，待落地）。条数看 ``PIPELINE_TEMPLATES`` 本身，不在
+这里写死。每条模板的 ``description`` 就是
 ``--list-pipelines`` 打印的内容（含用途、输入数据、计算口径、指标阈值与产出文件），
 所以这里不再另抄一份流程清单。阈值之类的数字直接引用本文件的常量，改常量即生效。
 
