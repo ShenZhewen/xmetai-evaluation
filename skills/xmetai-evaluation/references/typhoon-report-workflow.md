@@ -5,7 +5,7 @@
 这是 `xmetai-evaluation` skill 的台风报告分支，由原 `typhoon-error-report` 整合而来，
 只消费已有 evaluation 产物，不重跑中心诊断。通用计算与渲染在主仓库
 `visualization/typhoon_report.py` 与 `typhoon_plots.py`；skill 脚本只做入口，
-`generate_report.py` 已接通标准台风产物的自动派发。
+`render_report.py` 已接通标准台风产物的自动派发。
 不要假定其他项目具有相同的目录、字段、模型或依赖。
 
 ## 可执行入口
@@ -51,7 +51,7 @@ SHA256、配对键、排除计数、配置与依赖版本）、`statistics.csv`�
 标准带 manifest 的产物也可走统一入口：
 
 ```bash
-python skills/xmetai-evaluation/scripts/generate_report.py \
+python skills/xmetai-evaluation/scripts/render_report.py \
   evaluation_results/weather_typhoon_ens_fgvp --model FGVP \
   --compare "FuXi=evaluation_results/weather_typhoon_ens_fuxi" \
   --result reports/typhoon_ens_comparison

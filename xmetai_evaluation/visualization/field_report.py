@@ -2,47 +2,33 @@
 # -*- coding: utf-8 -*-
 """连续场评分长表 → Markdown 报告。
 
-一句话用法::
+命令行入口 ``skills/xmetai-evaluation/scripts/render_report.py``（按产物目录
+自动认能力、选模板）；本模块只提供实现。覆盖 ``weather_field_scores``
+（RMSE / ACC / 预报活跃度 / 纬向谱），指标语义集中在 ``METRIC_SEMANTICS``。
 
-    python -m xmetai_evaluation.visualization.field_report \
-        --scores scores.csv --result reports/field_fuxi --model FuXi
+三条克制：只用数据内证据（不设绝对合格线）；只消费已落盘的表，缺行缺列如实
+写出，不重算不补（逐波数谱取 ``diagnostics/spectrum_<变量>.csv``）；分波段功率比
+必须连着「实况占比」一起看。
 
-覆盖流程 ``weather_field_scores``（RMSE / ACC / 预报活跃度 / 纬向谱），
-指标语义集中在本模块的 ``METRIC_SEMANTICS``，出图和报告都从这里取。
-
-报告内容都是算出来的，不是套话：执行摘要（规则化诊断，逐条带数值）、逐变量总览、
-RMSE 随时效表、活跃度表、**分波段功率比表**、图表索引、口径说明。
-
-三条刻意的克制：
-
-* **只用数据内证据**。不引入没有来源的绝对合格线，所以报告里不会出现
-  "ACC ≥ 0.6 算合格"这类判决，只在数据内部比大小、看形态。
-* **不重算指标**。只消费已经落盘的表，缺行缺列如实写出来，不猜也不补。
-  ``scores.csv`` 是数值主来源；逐波数谱不在长表里（长表一行一个变量的总量），
-  走 ``MetricResult.curve`` 落成 ``diagnostics/spectrum_<变量>.csv``，那一节从它取
-  （见 :func:`spectrum_bands`）。
-* **比值要连着分母一起看**。分波段那节同时给「实况占比」，因为一个占比 0.01%
-  的波段有着 5 倍的功率比，也不说明模式在那一档失真。
-
-两处容易算错、本模块显式挡掉的地方（都在 :func:`summarize` 里）：
-
-* **区域行**：新格式对每个「起报 × 时效 × 指标」写一行全球 + 每区域一行。
-  只统计全球行（:func:`global_rows`），区域平均不能和全球混在一起平均；
-* **分组指标**：球谐带功率一个频带一行，靠 ``group`` 区分。行键带上频带标签
-  （``z500·1_4``）；**认不出频带时宁可不聚合**——把五个频带按 mean 平均会得到
-  一个不属于任何频带、数值却挺像样的数。
+``summarize()`` 显式挡掉两处：区域行只取全球（:func:`global_rows`）；球谐带按
+``group`` 分行，认不出频带时宁可不聚合，绝不跨频带平均。
 """
 
 from __future__ import annotations
 
-import argparse
-import json
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence
 
 import numpy as np
 import pandas as pd
+
+from xmetai_evaluation.visualization._common import (
+    cn_number,
+    fmt_number,
+    is_finite_number,
+    source_of,
+)
 
 #: 指标语义表 —— **唯一**放指标语义的地方（出图、报告、诊断都从这里取）。
 #:
@@ -105,18 +91,9 @@ METRIC_SEMANTICS: Dict[str, Dict[str, object]] = {
 #: 只进表格不进图。
 SKILL_METRICS = ("rmse", "acc", "activity_ratio", "spectrum_power_ratio")
 
-#: **配置里的原始指标名** → 它在长表里展开成的指标名。
-#:
-#: 长表一行一个**展开后**的指标：``activity`` 拆成 ratio / bias / forecast /
-#: observation 四行，``zonal_spectrum`` 只留 ``spectrum_power_ratio``（总量字段
-#: 进了评分表，逐波数曲线走 ``MetricResult.curve``、落 ``diagnostics/spectrum_*.csv``），
-#: ``spherical_bands`` 拆成 forecast / observation / ratio 三个名字（再用 ``group``
-#: 分频带）。而 ``manifest`` 的 ``metric_options`` 记的是**原始**指标名——两边不同名。
-#:
-#: 缺项检查要把它们对齐，否则 ``curves.get("zonal_spectrum")`` 永远是空，**每个谱
-#: 变量都会被误报成"该算没算"**。这不是假想：``weather_rmse_single_fuxi``
-#: 那份产物里 22 条缺项有 13 条是这么来的（7 个谱变量 + 6 个活跃度变量其实都算出来了）。
-#: 没登记的名字按原样查（``rmse`` / ``acc`` 这类不展开的指标就该如此）。
+#: 配置里的原始指标名 → 长表里展开后的指标名。``manifest.metric_options`` 记原始名、
+#: 长表记展开名，缺项检查不对齐会把已算出的谱/活跃度全误报成「该算没算」。
+#: 没登记的指标按原样查。
 METRIC_EXPANSIONS: Dict[str, tuple] = {
     "activity": (
         "activity_ratio",
@@ -150,8 +127,6 @@ GROUP_SUMMARY = "summary"
 #: 不会出现，切出来的前半段一定还是变量名。
 ROW_KEY_SEPARATOR = "·"
 
-_CN_NUMBERS = ("一", "二", "三", "四", "五", "六", "七", "八", "九", "十")
-
 #: 赤道周长（km）。波数 k 的波长按 ``40075 / k`` 换算，与参考实现
 #: ``mean_spectrum_<var>.csv`` 的 ``wavelength_km`` 列同口径。
 EQUATOR_CIRCUMFERENCE_KM = 40075.0
@@ -167,23 +142,9 @@ SPECTRUM_BANDS = ((1, 5), (6, 20), (21, 60), (61, 180), (181, 720))
 # --------------------------------------------------------------------------- #
 # 小工具
 # --------------------------------------------------------------------------- #
-def _finite(value: object) -> bool:
-    try:
-        return bool(np.isfinite(float(value)))  # type: ignore[arg-type]
-    except (TypeError, ValueError):
-        return False
-
-
-def _fmt(value: object, digits: int = 3) -> str:
-    """定点格式；非有限值写成 “—”（与 TS 报告一致）。"""
-    if value is None or not _finite(value):
-        return "—"
-    return f"{float(value):.{digits}f}"
-
-
 def _fmt_auto(value: object) -> str:
     """按量级自动定小数位：RMSE 这类跨 4 个数量级的量用它更可读。"""
-    if value is None or not _finite(value):
+    if value is None or not is_finite_number(value):
         return "—"
     number = float(value)
     magnitude = abs(number)
@@ -197,7 +158,7 @@ def _fmt_auto(value: object) -> str:
 
 
 def _pct(value: object) -> str:
-    if not _finite(value):
+    if not is_finite_number(value):
         return "—"
     return f"{float(value):.1%}"
 
@@ -631,8 +592,8 @@ def diagnose(
             f"RMSE 增长最快的是 **{fastest[0]}**"
             f"（{_fmt_auto(fastest[1]['first'])} → {_fmt_auto(fastest[1]['last'])}"
             f" {fastest[1]['unit']}，{fastest[1]['first_lead']:g}h → {fastest[1]['last_lead']:g}h"
-            f" 涨到 {_fmt(fastest[1]['ratio'], 2)} 倍）；"
-            f"最慢的是 {slowest[0]}（{_fmt(slowest[1]['ratio'], 2)} 倍）。"
+            f" 涨到 {fmt_number(fastest[1]['ratio'], 2)} 倍）；"
+            f"最慢的是 {slowest[0]}（{fmt_number(slowest[1]['ratio'], 2)} 倍）。"
         )
         wandering = [name for name, stats in rmse_items if stats["n_rise"] != stats["n_leads"] - 1]
         if wandering:
@@ -658,10 +619,10 @@ def diagnose(
                 else f"非单调下降（{stats['n_leads'] - 1} 个间隔里 {stats['n_fall']} 次下降）"
             )
             findings.append(
-                f"ACC（{name}）{stats['first_lead']:g}h 的 {_fmt(stats['first'])}"
-                f" → {stats['last_lead']:g}h 的 {_fmt(stats['last'])}"
-                f"（绝对 −{_fmt(drop)}，相对 −{_pct(relative)}），全时效均值 "
-                f"{_fmt(stats['mean'])}，{shape}。"
+                f"ACC（{name}）{stats['first_lead']:g}h 的 {fmt_number(stats['first'])}"
+                f" → {stats['last_lead']:g}h 的 {fmt_number(stats['last'])}"
+                f"（绝对 −{fmt_number(drop)}，相对 −{_pct(relative)}），全时效均值 "
+                f"{fmt_number(stats['mean'])}，{shape}。"
                 f"距平相关没有普适合格线，这里只报形态与幅度。"
             )
 
@@ -675,12 +636,12 @@ def diagnose(
         direction = "偏平滑（能量不足）" if worst["last"] < 1 else "偏噪（能量过量）"
         head = (
             f"**{metric_label(metric)}**：偏离 1 最多的是 **{worst_name}** "
-            f"{_fmt(worst['last'])}（{direction}，末时效 {worst['last_lead']:g}h），"
+            f"{fmt_number(worst['last'])}（{direction}，末时效 {worst['last_lead']:g}h），"
             f"{len(items)} 个变量里 {len(low)} 个 <1、{len(items) - len(low)} 个 >1。"
         )
         if len(ranked) > 1:
             head += "偏离最大的三个：" + "、".join(
-                f"{name} {_fmt(stats['last'])}" for name, stats in ranked[:3]
+                f"{name} {fmt_number(stats['last'])}" for name, stats in ranked[:3]
             ) + "。"
         if metric == "spectrum_power_ratio":
             # 指向哪儿得看那一节在不在：说了"看下一节的表"而下一节根本没出现，
@@ -711,10 +672,10 @@ def diagnose(
             f"**分波段**看（{len({str(item['variable']) for item in bands})} 个变量 × "
             f"{len(SPECTRUM_BANDS)} 个波段共 {len(bands)} 段）：对总能量偏差贡献最大的是 "
             f"**{worst['variable']} 的 {worst['band']}**"
-            f"（波长约 {_fmt(worst['wavelength_min_km'], 0)}–{_fmt(worst['wavelength_max_km'], 0)} km，"
+            f"（波长约 {fmt_number(worst['wavelength_min_km'], 0)}–{fmt_number(worst['wavelength_max_km'], 0)} km，"
             f"占实况总功率 {_pct(worst['observation_share'])}）："
-            f"预报/实况 {_fmt(worst['ratio'], 3)}，比同变量**全波数总比** "
-            f"{_fmt(worst['total_ratio'], 3)} 偏得更远。{len(bands)} 段里 {low} 段 <1、"
+            f"预报/实况 {fmt_number(worst['ratio'], 3)}，比同变量**全波数总比** "
+            f"{fmt_number(worst['total_ratio'], 3)} 偏得更远。{len(bands)} 段里 {low} 段 <1、"
             f"{len(bands) - low} 段 >1。总比接近 1 不代表每个尺度都对——"
             f"方向相反的波段会互相抵消。"
         )
@@ -725,7 +686,7 @@ def diagnose(
             if sharp is not worst:
                 text += (
                     f"占比 ≥1% 的波段里，偏得最狠的是 {sharp['variable']} 的 "
-                    f"{sharp['band']}（{_fmt(sharp['ratio'], 3)}，占 "
+                    f"{sharp['band']}（{fmt_number(sharp['ratio'], 3)}，占 "
                     f"{_pct(sharp['observation_share'])}）。"
                 )
         findings.append(text)
@@ -801,13 +762,6 @@ def requested_from(info: Dict[str, object]) -> Dict[str, List[str]]:
     return requested
 
 
-def _source_of(sources: Optional[Dict[str, str]], name: str) -> str:
-    """来源标注：给了路径就写路径，否则如实写"未提供"。"""
-    if sources and sources.get(name):
-        return f"`{sources[name]}`"
-    return "未提供（调用方应在 sources 里给出文件路径）"
-
-
 def _file_summary(paths: Sequence[str], limit: int = 1) -> str:
     """文件清单只写个数与首尾，避免把 60 条绝对路径全抄进报告。"""
     if not paths:
@@ -853,7 +807,7 @@ def _rmse_table(summary: Dict[str, object]) -> str:
             f"| {name} | {stats['unit'] or '—'} "
             f"| {_fmt_auto(stats['first'])} | {_fmt_auto(stats['mid'])} "
             f"| {_fmt_auto(stats['last'])} | {_fmt_auto(stats['mean'])} "
-            f"| {_fmt(stats['ratio'], 2)} | {monotone} |"
+            f"| {fmt_number(stats['ratio'], 2)} | {monotone} |"
         )
     return "\n".join(lines)
 
@@ -866,10 +820,10 @@ def _band_table(bands: Sequence[Dict[str, object]]) -> str:
     for item in bands:
         lines.append(
             f"| {item['variable']} | {item['band']} "
-            f"| {_fmt(item['wavelength_min_km'], 0)}–{_fmt(item['wavelength_max_km'], 0)} "
+            f"| {fmt_number(item['wavelength_min_km'], 0)}–{fmt_number(item['wavelength_max_km'], 0)} "
             f"| {_fmt_auto(item['forecast'])} | {_fmt_auto(item['observation'])} "
-            f"| {_fmt(item['ratio'], 3)} | {_pct(item['observation_share'])} "
-            f"| {_fmt(item['total_ratio'], 3)} |"
+            f"| {fmt_number(item['ratio'], 3)} | {_pct(item['observation_share'])} "
+            f"| {fmt_number(item['total_ratio'], 3)} |"
         )
     return "\n".join(lines)
 
@@ -896,7 +850,7 @@ def _ratio_table(summary: Dict[str, object]) -> str:
             "spectrum_power_ratio",
         ):
             item = stats.get(key)
-            cells.append(_fmt(item["last"]) if item else "—")
+            cells.append(fmt_number(item["last"]) if item else "—")
         lines.append(f"| {entry['variable']} | " + " | ".join(cells) + " |")
     return "\n".join(lines)
 
@@ -956,7 +910,7 @@ def build_field_report(
     # ---- 一、评测对象与数据来源 -------------------------------------------- #
     head: List[str] = []
     run_id = info.get("run_id") or "未提供"
-    head.append(f"- **run_id**：`{run_id}`（来源：{_source_of(sources, 'scores')}）")
+    head.append(f"- **run_id**：`{run_id}`（来源：{source_of(sources, 'scores')}）")
     head.append(
         f"- **评测对象**：{model_name}"
         f"（预报源 `{info.get('forecast_reader') or info.get('model_id') or '未提供'}`）"
@@ -1109,7 +1063,7 @@ def build_field_report(
 
     lines: List[str] = [f"# {model_name} 连续场检验报告", ""]
     for index, (title, body) in enumerate(sections):
-        marker = _CN_NUMBERS[index] if index < len(_CN_NUMBERS) else str(index + 1)
+        marker = cn_number(index + 1)
         lines.append(f"## {marker}、{title}")
         lines.append("")
         lines.extend(body)
@@ -1118,51 +1072,3 @@ def build_field_report(
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text("\n".join(lines), encoding="utf-8")
     return output_path
-
-
-# --------------------------------------------------------------------------- #
-# CLI
-# --------------------------------------------------------------------------- #
-def main(argv: Optional[Sequence[str]] = None) -> int:
-    parser = argparse.ArgumentParser(
-        description="把连续场评分长表画成图并写成 Markdown 报告",
-        epilog="示例: python -m xmetai_evaluation.visualization.field_report "
-        "--scores scores.csv --result reports/field_fuxi --model FuXi",
-    )
-    parser.add_argument("--scores", type=Path, required=True, help="长表 scores.csv")
-    parser.add_argument("--result", type=Path, required=True, help="输出目录")
-    parser.add_argument("--model", default=None, help="模型名（默认取 model_id 列）")
-    parser.add_argument("--manifest", type=Path, default=None, help="可选：manifest.json")
-    parser.add_argument("--change", default=None, help="可选：本次改动说明")
-    parser.add_argument("--dpi", type=int, default=150)
-    args = parser.parse_args(argv)
-
-    from xmetai_evaluation.visualization.field_plots import FieldScorePlotter
-
-    scores = pd.read_csv(args.scores)
-    manifest = (
-        json.loads(args.manifest.read_text(encoding="utf-8")) if args.manifest else None
-    )
-    info = manifest_info_from(manifest)
-    model = args.model or str(info.get("model_id") or args.scores.stem)
-
-    # 纬向谱面板与分波段功率比读 scores.csv 同级 diagnostics/ 下的
-    # ``spectrum_<变量>.csv``；没有就照常出图，不额外要一个开关。
-    spectrum_dir = args.scores.parent
-    plotter = FieldScorePlotter()
-    artifacts = plotter.create_report(
-        scores,
-        output_dir=args.result,
-        spectrum_dir=spectrum_dir,
-        model_name=model,
-        manifest_info=info,
-        sources={"scores": str(args.scores)},
-        change_description=args.change,
-    )
-    for name, path in artifacts.items():
-        print(f"  {name}: {path}")
-    return 0
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())

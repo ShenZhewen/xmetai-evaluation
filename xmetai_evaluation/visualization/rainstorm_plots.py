@@ -1,25 +1,12 @@
 # -*- coding: utf-8 -*-
-"""2025 年暴雨过程个例检验的出图器（多模型 × 多过程 × 双口径）。
+"""暴雨过程个例检验的出图器（多模型 × 多过程 × 双口径）。
 
-只画图，不写报告——正文与统计量在 :mod:`xmetai_evaluation.visualization.rainstorm_report`。
-图与正文共用同一批统计量（由 ``rainstorm_report`` 算好传进来），避免"表、图、文字
-各说各话"。
+只画图，统计量与正文在 :mod:`xmetai_evaluation.visualization.rainstorm_report`；
+图用的是它算好的同一批统计量。四类图都多模型并排：过程总览分组条形（两种口径
+各一张）、单过程逐日 24h TS 折线（按等级分面）、单过程累积 TS 条形、
+A/B 口径散点（带 ``y = x`` 参考线，看名次会不会翻转）。
 
-四类图，都是**多模型并排**：
-
-- :meth:`RainstormPlotter.plot_process_overview`：43 个过程的分组条形，
-  按主模型降序——这是「挑过程」那一步看的图。**两种口径各画一张**
-  （``metric_label`` 只改文字，数值由调用方按口径算好传进来）；
-- :meth:`RainstormPlotter.plot_daily_ts`：单个过程的逐日 24h TS 折线，
-  按降水等级分面，每个模型一条线；
-- :meth:`RainstormPlotter.plot_threshold_bars`：单个过程的累积 TS 按阈值分组的条形；
-- :meth:`RainstormPlotter.plot_caliber_scatter`：逐过程散点，横轴口径 A 汇总、
-  纵轴口径 B 累积，带 ``y = x`` 参考线——回答"换口径名次会不会翻转"。
-
-**不出降水空间分布图**：评测产物里只有站点列联表的聚合统计
-（``diagnostics/categorical_wide.csv``：hits / misses / false_alarms / n_pairs / TS…），
-没有逐站或逐格的降水量，画不出实况场、也画不出预报−实况差值场。要画得回头读
-原始预报 nc 与站点报文，那是另一个脚本的事。
+不出降水空间分布图——产物只有站点列联表的聚合统计，没有逐站/逐格降水场。
 """
 
 from __future__ import annotations
@@ -29,9 +16,12 @@ from typing import Dict, Optional, Sequence
 
 import numpy as np
 
-from xmetai_evaluation.visualization.precipitation_plots import (
-    MODEL_COLORS,
-    setup_chinese_font,
+from xmetai_evaluation.visualization.style import (
+    NEUTRAL,
+    apply_style,
+    font_sizes,
+    model_colors,
+    snap_width,
 )
 
 #: 折线/条形里"没有有效取值"的图元直接跳过，而不是画成 0——
@@ -50,10 +40,10 @@ class RainstormPlotter:
         import matplotlib.pyplot as plt
 
         self._plt = plt
-        self.font = setup_chinese_font()
+        self.font = apply_style()
         if style:
             plt.style.use(style)
-            setup_chinese_font()
+            self.font = apply_style()
         plt.rcParams["figure.dpi"] = 150
         plt.rcParams["savefig.dpi"] = 150
         plt.rcParams["savefig.bbox"] = "tight"
@@ -66,14 +56,6 @@ class RainstormPlotter:
             fig.savefig(save_path)
             print(f"已保存: {save_path}")
         self._plt.close(fig)
-
-    @staticmethod
-    def _colors(names: Sequence[str]) -> Dict[str, str]:
-        """模型配色按"名字在列表里的次序"取，与箱线图/差值图同一套"""
-        return {
-            str(name): MODEL_COLORS[index % len(MODEL_COLORS)]
-            for index, name in enumerate(names)
-        }
 
     # ------------------------------------------------------------------ 图
 
@@ -107,11 +89,13 @@ class RainstormPlotter:
                 -(values.get(ranked_by, {}).get(code) or 0.0),
             ),
         )
-        colors = self._colors(names)
+        colors = model_colors(names)
         positions = np.arange(len(ordered), dtype=float)
         width = 0.8 / max(len(names), 1)
 
-        fig, ax = plt.subplots(figsize=(max(10.0, 0.34 * len(ordered)), 5.4))
+        width = snap_width(max(10.0, 0.34 * len(ordered)))
+        sizes = font_sizes(width)
+        fig, ax = plt.subplots(figsize=(width, 5.4))
         for index, name in enumerate(names):
             series = [values.get(name, {}).get(code) for code in ordered]
             xs = [x for x, value in zip(positions, series) if value is not None]
@@ -124,15 +108,20 @@ class RainstormPlotter:
                 color=colors[name],
             )
         ax.set_xticks(positions)
-        ax.set_xticklabels(ordered, rotation=90, fontsize=7)
-        ax.set_ylabel(f"{metric_label} TS（≥{threshold:g}mm）")
+        ax.set_xticklabels(ordered, rotation=90, fontsize=sizes["tick"])
+        ax.set_ylabel(
+            f"{metric_label} TS（≥{threshold:g}mm）", fontsize=sizes["label"]
+        )
+        ax.tick_params(axis="y", labelsize=sizes["tick"])
         ax.set_title(
             f"各过程{metric_label} TS（≥{threshold:g}mm，按 {ranked_by} 降序）",
-            fontsize=11,
+            fontsize=sizes["suptitle"],
         )
         ax.set_ylim(bottom=0)
-        ax.grid(axis="y", alpha=0.3)
-        ax.legend(fontsize=8, ncols=min(len(names), 4))
+        ax.grid(axis="y")
+        ax.legend(
+            fontsize=sizes["legend"], ncols=min(len(names), 4)
+        )
         fig.tight_layout()
         self._save(fig, save_path)
 
@@ -155,11 +144,13 @@ class RainstormPlotter:
         """
         plt = self._plt
         names = list(series)
-        colors = self._colors(names)
+        colors = model_colors(names)
         short = [_short_day(day) for day in days]
 
+        width = snap_width(4.2 * max(len(thresholds), 1))
+        sizes = font_sizes(width)
         fig, axes = plt.subplots(
-            1, max(len(thresholds), 1), figsize=(4.2 * max(len(thresholds), 1), 3.8),
+            1, max(len(thresholds), 1), figsize=(width, 3.8),
             squeeze=False, sharey=True,
         )
         for column, threshold in enumerate(thresholds):
@@ -172,13 +163,16 @@ class RainstormPlotter:
                 ys = [value for value in values if value is not None]
                 if xs:
                     ax.plot(xs, ys, marker="o", markersize=4, label=name, color=colors[name])
-            ax.set_title(f"≥{threshold:g}mm", fontsize=10)
-            ax.grid(alpha=0.3)
+            ax.set_title(f"≥{threshold:g}mm", fontsize=sizes["title"])
+            ax.grid()
             ax.set_ylim(bottom=0)
-            ax.tick_params(axis="x", labelsize=8)
-        axes[0][0].set_ylabel("TS")
-        axes[0][0].legend(fontsize=8)
-        fig.suptitle(f"{code}（{span}）逐日 24h TS（08–08 北京时，day-1）", fontsize=11)
+            ax.tick_params(labelsize=sizes["tick"])
+        axes[0][0].set_ylabel("TS", fontsize=sizes["label"])
+        axes[0][0].legend(fontsize=sizes["legend"])
+        fig.suptitle(
+            f"{code}（{span}）逐日 24h TS（08–08 北京时，day-1）",
+            fontsize=sizes["suptitle"],
+        )
         fig.tight_layout()
         self._save(fig, save_path)
 
@@ -194,12 +188,14 @@ class RainstormPlotter:
         """单个过程的累积 TS 按阈值分组的条形，每个模型一组。"""
         plt = self._plt
         names = list(values)
-        colors = self._colors(names)
+        colors = model_colors(names)
         labels = [f"≥{threshold:g}" for threshold in thresholds]
         positions = np.arange(len(thresholds), dtype=float)
         width = 0.8 / max(len(names), 1)
 
-        fig, ax = plt.subplots(figsize=(max(6.0, 1.3 * len(thresholds)), 4.6))
+        width = snap_width(max(6.0, 1.3 * len(thresholds)))
+        sizes = font_sizes(width)
+        fig, ax = plt.subplots(figsize=(width, 4.6))
         for index, name in enumerate(names):
             series = [values.get(name, {}).get(threshold) for threshold in thresholds]
             xs = [x for x, value in zip(positions, series) if value is not None]
@@ -212,13 +208,17 @@ class RainstormPlotter:
                 color=colors[name],
             )
         ax.set_xticks(positions)
-        ax.set_xticklabels(labels)
-        ax.set_xlabel("降水等级（mm）")
-        ax.set_ylabel("过程累积 TS")
-        ax.set_title(f"{code}（{span}）过程累积 TS 随降水等级的变化", fontsize=11)
+        ax.set_xticklabels(labels, fontsize=sizes["tick"])
+        ax.tick_params(axis="y", labelsize=sizes["tick"])
+        ax.set_xlabel("降水等级（mm）", fontsize=sizes["label"])
+        ax.set_ylabel("过程累积 TS", fontsize=sizes["label"])
+        ax.set_title(
+            f"{code}（{span}）过程累积 TS 随降水等级的变化",
+            fontsize=sizes["suptitle"],
+        )
         ax.set_ylim(bottom=0)
-        ax.grid(axis="y", alpha=0.3)
-        ax.legend(fontsize=8, ncols=min(len(names), 4))
+        ax.grid(axis="y")
+        ax.legend(fontsize=sizes["legend"], ncols=min(len(names), 4))
         fig.tight_layout()
         self._save(fig, save_path)
 
@@ -240,9 +240,11 @@ class RainstormPlotter:
         """
         plt = self._plt
         names = list(points)
-        colors = self._colors(names)
+        colors = model_colors(names)
 
-        fig, ax = plt.subplots(figsize=(5.6, 5.2))
+        width = snap_width(5.6)
+        sizes = font_sizes(width)
+        fig, ax = plt.subplots(figsize=(width, 5.2))
         for name in names:
             pairs = [(x, y) for x, y in points.get(name, []) if x is not None and y is not None]
             if not pairs:
@@ -251,14 +253,24 @@ class RainstormPlotter:
             ys = [pair[1] for pair in pairs]
             ax.scatter(xs, ys, s=26, label=f"{name}（{len(pairs)} 个过程）",
                        color=colors[name], alpha=0.8, edgecolors="none")
-        ax.plot([0, 1], [0, 1], linestyle="--", linewidth=0.9, color="#888888")
+        ax.plot([0, 1], [0, 1], linestyle="--", linewidth=0.9,
+                color=NEUTRAL["reference"])
         ax.set_xlim(0, 1)
         ax.set_ylim(0, 1)
-        ax.set_xlabel(f"口径 A：逐日 24h 汇总 TS（≥{threshold:g}mm）")
-        ax.set_ylabel(f"口径 B：过程累积 TS（≥{threshold:g}mm）")
-        ax.set_title("两种口径的逐过程对照（虚线为 y = x）", fontsize=11)
-        ax.grid(alpha=0.3)
-        ax.legend(fontsize=8)
+        ax.set_xlabel(
+            f"口径 A：逐日 24h 汇总 TS（≥{threshold:g}mm）",
+            fontsize=sizes["label"],
+        )
+        ax.set_ylabel(
+            f"口径 B：过程累积 TS（≥{threshold:g}mm）",
+            fontsize=sizes["label"],
+        )
+        ax.tick_params(labelsize=sizes["tick"])
+        ax.set_title(
+            "两种口径的逐过程对照（虚线为 y = x）", fontsize=sizes["suptitle"]
+        )
+        ax.grid()
+        ax.legend(fontsize=sizes["legend"])
         fig.tight_layout()
         self._save(fig, save_path)
 

@@ -1,28 +1,15 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""连续场评分（RMSE / ACC / 活跃度 / 纬向谱）的可视化。
+"""连续场评分（RMSE / ACC / 活跃度 / 纬向谱）的出图器。
 
-输入：``weather_field_scores`` 流程产出的 ``scores.csv`` 长表，列至少包含
-``variable / metric / lead_h / value``（``unit`` 与 ``status`` 有则用、没有则兜底）。
+输入是 ``weather_field_scores`` 流程的 ``scores.csv``（至少含
+``variable / metric / lead_h / value``），输出 PNG；报告正文见 :mod:`field_report`。
 
-输出：若干 PNG，以及一份 Markdown 报告（报告正文见 :mod:`field_report`）。
-
-五件与"一张图一根轴画到底"不同的做法：
-
-* **折线画的是跨起报均值，不是每一条起报**。长表一行一个起报（本仓库实测 184 个），
-  把 ``value`` 按 ``lead_h`` 排序直接连线，画出来是 184 条曲线首尾相接地穿插，
-  看着像"带误差棒的粗线"，其实线的走向由起报的先后顺序决定、和均值无关——
-  同一个时效里的 184 个点被按原顺序连成一串竖线，再斜着连到下一个时效。
-  真正的形态（比如 RMSE 到底单不单调）只能从跨起报均值上看。离散程度改画分位带；
-* **RMSE 按单位分面**。同一张图里 z500 是 ``m^2/s^2``、t2m 是 ``K``、msl 是 ``Pa``，
-  混在一根纵轴上比大小是错的，所以一个单位一个子图；
-* **热力图用"相对首时效的倍数"**。同理，跨变量的原始值不可比；除过首时效之后
-  无量纲，行与行才可比，行标签里同时写上首时效的绝对值，尺度不丢；
-* **谱曲线读 ``diagnostics/spectrum_<变量>.csv``**，那是一张已经跨起报、跨时效
-  加权平均好的逐波数表，一个变量一次画全。要看**某一个起报**的谱才去读同目录的
-  ``spectrum_by_init.csv``——它逐起报存一条，长表那条链路**没有**逐时效的谱；
-* **参考线只在有理想值时画**（语义表里的 ``ref_result``）：比值类画 ``y=1``，ACC 画 ``y=1``，
-  RMSE 没有理想值就不画。
+四条与"一张图一根轴画到底"不同的做法：折线画**跨起报均值**（逐条连线只是
+按起报顺序穿插，看不出形态），离散程度用分位带；RMSE **按单位分面**，不混轴；
+热力图用**相对首时效的倍数**，跨变量才可比；谱读
+``diagnostics/spectrum_<变量>.csv``，只有要看单个起报时才读 ``spectrum_by_init.csv``。
+参考线只在语义表给了 ``ref_result`` 时画。
 """
 
 from __future__ import annotations
@@ -46,7 +33,13 @@ from xmetai_evaluation.visualization.field_report import (
     metric_ref,
     requested_from,
 )
-from xmetai_evaluation.visualization.precipitation_plots import setup_chinese_font
+from xmetai_evaluation.visualization.style import (
+    CMAP_SEQ,
+    NEUTRAL,
+    apply_style,
+    font_sizes,
+    snap_width,
+)
 
 REQUIRED_COLUMNS = ("lead_h", "variable", "metric", "value")
 
@@ -314,10 +307,10 @@ class FieldScorePlotter:
             style: 可选 matplotlib 样式名；默认不套样式，
                 避免样式把中文字体设置覆盖掉（降水那边就栽在这）。
         """
-        self.font = setup_chinese_font()
+        self.font = apply_style()
         if style:
             plt.style.use(style)
-            setup_chinese_font()
+            self.font = apply_style()
         plt.rcParams["figure.dpi"] = 150
         plt.rcParams["savefig.dpi"] = 150
         plt.rcParams["savefig.bbox"] = "tight"
@@ -367,8 +360,11 @@ class FieldScorePlotter:
         ref = metric_ref(metric)
         spread_drawn = False
         most_inits = 0
+        width = snap_width(12)
+        sizes = font_sizes(width)
         figure, axes = plt.subplots(
-            len(units), 1, figsize=(12, max(3.4 * len(units), 3.6)), sharex=True, squeeze=False
+            len(units), 1, figsize=(width, max(3.4 * len(units), 3.6)),
+            sharex=True, squeeze=False,
         )
         axes = [row[0] for row in axes]
         for axis, unit in zip(axes, units):
@@ -395,22 +391,26 @@ class FieldScorePlotter:
                     linewidth=1.6,
                     label=variable,
                 )
-            axis.set_ylabel(_axis_label(metric, unit), fontsize=10)
-            axis.grid(alpha=0.3, linewidth=0.6)
-            axis.legend(loc="best", fontsize=9, ncol=2, framealpha=0.85)
+            axis.set_ylabel(_axis_label(metric, unit), fontsize=sizes["label"])
+            axis.tick_params(labelsize=sizes["tick"])
+            axis.grid(linewidth=0.6)
+            axis.legend(loc="best", fontsize=sizes["legend"], ncol=2, framealpha=0.85)
             if ref is not None:
-                axis.axhline(ref, color="#888888", linestyle="--", linewidth=1)
+                axis.axhline(ref, color=NEUTRAL["reference"], linestyle="--", linewidth=1)
                 axis.annotate(
                     f"参考 {ref:g}",
                     xy=(0.995, ref),
                     xycoords=("axes fraction", "data"),
                     ha="right",
                     va="bottom",
-                    fontsize=8,
-                    color="#555555",
+                    fontsize=sizes["annot"],
+                    color=NEUTRAL["muted"],
                 )
-        axes[-1].set_xlabel("预报时效 (h)", fontsize=10)
-        figure.suptitle(title or f"{metric_label(metric)} 随预报时效变化", fontsize=13)
+        axes[-1].set_xlabel("预报时效 (h)", fontsize=sizes["label"])
+        figure.suptitle(
+            title or f"{metric_label(metric)} 随预报时效变化",
+            fontsize=sizes["suptitle"],
+        )
         notes = []
         if spread_drawn:
             notes.append(
@@ -421,7 +421,8 @@ class FieldScorePlotter:
         if len(units) > 1:
             notes.append("按单位分面，各面纵轴不同，面与面之间不可直接比大小。")
         figure.text(
-            0.01, 0.005, "注：" + "".join(notes), fontsize=8, color="#555555"
+            0.01, 0.005, "注：" + "".join(notes),
+            fontsize=sizes["annot"], color=NEUTRAL["muted"],
         )
         figure.tight_layout(rect=(0, 0.02, 1, 0.96))
         self._save(figure, save_path)
@@ -465,24 +466,32 @@ class FieldScorePlotter:
             labels.append(f"{variable}（首时效 {base[variable]:.4g}{suffix}）")
 
         leads = [float(value) for value in ratios.columns]
-        figure, axis = plt.subplots(figsize=(max(10, 0.22 * len(leads) + 4), 0.42 * len(order) + 3))
+        width = snap_width(max(10, 0.22 * len(leads) + 4))
+        sizes = font_sizes(width)
+        figure, axis = plt.subplots(
+            figsize=(width, 0.42 * len(order) + 3)
+        )
         mesh = axis.pcolormesh(
             np.asarray(leads),
             np.arange(len(order)),
             ratios.values,
-            cmap="viridis",
+            cmap=CMAP_SEQ,
             shading="nearest",
         )
         axis.set_yticks(np.arange(len(order)))
-        axis.set_yticklabels(labels, fontsize=9)
+        axis.set_yticklabels(labels, fontsize=sizes["tick"])
         axis.invert_yaxis()
-        axis.set_xlabel("预报时效 (h)", fontsize=10)
+        axis.set_xlabel("预报时效 (h)", fontsize=sizes["label"])
+        axis.tick_params(axis="x", labelsize=sizes["tick"])
         axis.set_title(
             title or f"{metric_label(metric)} 相对首时效的倍数（行标签括号内为首时效绝对值）",
-            fontsize=12,
+            fontsize=sizes["suptitle"],
         )
         bar = figure.colorbar(mesh, ax=axis, pad=0.02)
-        bar.set_label(f"{metric_label(metric)} 相对首时效的倍数", fontsize=9)
+        bar.set_label(
+            f"{metric_label(metric)} 相对首时效的倍数", fontsize=sizes["label"]
+        )
+        bar.ax.tick_params(labelsize=sizes["annot"])
         figure.tight_layout()
         self._save(figure, save_path)
         return figure
@@ -513,19 +522,22 @@ class FieldScorePlotter:
         observation_total = float(wide["power_observation"].sum())
         ratio = forecast_total / observation_total if observation_total else float("nan")
 
-        figure, axis = plt.subplots(figsize=(11, 6))
+        width = snap_width(11)
+        sizes = font_sizes(width)
+        figure, axis = plt.subplots(figsize=(width, 6))
         axis.plot(wide.index, wide["power_forecast"], linewidth=1.6, label="预报")
         axis.plot(wide.index, wide["power_observation"], linewidth=1.6, label="实况")
         axis.set_xscale("log")
         axis.set_yscale("log")
-        axis.set_xlabel("纬向波数 k（对数轴）", fontsize=10)
-        axis.set_ylabel("功率（对数轴）", fontsize=10)
-        axis.grid(alpha=0.3, which="both", linewidth=0.6)
-        axis.legend(loc="best", fontsize=10)
+        axis.set_xlabel("纬向波数 k（对数轴）", fontsize=sizes["label"])
+        axis.set_ylabel("功率（对数轴）", fontsize=sizes["label"])
+        axis.tick_params(labelsize=sizes["tick"])
+        axis.grid(which="both", linewidth=0.6)
+        axis.legend(loc="best", fontsize=sizes["legend"])
         axis.set_title(
             title
             or f"{variable} 纬向谱 @ {label}（总功率比 预报/实况 = {ratio:.3f}）",
-            fontsize=12,
+            fontsize=sizes["suptitle"],
         )
         axis.annotate(
             f"总功率比 = {ratio:.3f}\n（全波数求和后相除，与长表里的 "
@@ -534,9 +546,9 @@ class FieldScorePlotter:
             xycoords="axes fraction",
             ha="right",
             va="bottom",
-            fontsize=9,
-            color="#333333",
-            bbox={"facecolor": "white", "alpha": 0.8, "edgecolor": "#cccccc"},
+            fontsize=sizes["annot"],
+            color=NEUTRAL["text"],
+            bbox={"facecolor": "white", "alpha": 0.8, "edgecolor": NEUTRAL["grid"]},
         )
         figure.tight_layout()
         self._save(figure, save_path)
@@ -565,8 +577,10 @@ class FieldScorePlotter:
 
         columns = min(3, len(names))
         rows = -(-len(names) // columns)
+        width = snap_width(5.0 * columns)
+        sizes = font_sizes(width)
         figure, axes = plt.subplots(
-            rows, columns, figsize=(5.0 * columns, 3.6 * rows), squeeze=False
+            rows, columns, figsize=(width, 3.6 * rows), squeeze=False
         )
         flat = [axis for row in axes for axis in row]
         for axis, variable in zip(flat, names):
@@ -578,25 +592,30 @@ class FieldScorePlotter:
             axis.plot(wide.index, wide["power_forecast"], linewidth=1.4, label="预报")
             axis.plot(wide.index, wide["power_observation"], linewidth=1.4, label="实况")
             axis.set_yscale("log")
-            axis.set_title(f"{variable}（总功率比 {ratio:.3f}）", fontsize=11)
-            axis.grid(alpha=0.3, which="both", linewidth=0.6)
+            axis.set_title(
+                f"{variable}（总功率比 {ratio:.3f}）", fontsize=sizes["title"]
+            )
+            axis.tick_params(labelsize=sizes["tick"])
+            axis.grid(which="both", linewidth=0.6)
         for axis in flat[len(names):]:
             axis.axis("off")
         for axis in flat[: len(names)][-columns:]:
-            axis.set_xlabel("纬向波数 k", fontsize=9)
+            axis.set_xlabel("纬向波数 k", fontsize=sizes["label"])
         for index, axis in enumerate(flat[: len(names)]):
             if index % columns == 0:
-                axis.set_ylabel("功率（对数轴）", fontsize=9)
-        flat[0].legend(loc="lower left", fontsize=9)
-        figure.suptitle(title or "纬向功率谱（跨起报平均）", fontsize=13)
+                axis.set_ylabel("功率（对数轴）", fontsize=sizes["label"])
+        flat[0].legend(loc="lower left", fontsize=sizes["legend"])
+        figure.suptitle(
+            title or "纬向功率谱（跨起报平均）", fontsize=sizes["suptitle"]
+        )
         figure.text(
             0.01,
             0.005,
             "注：口径同 `mean_spectrum_<var>.csv`——跨起报、跨时效平均后的功率谱，"
             "看不出谱随预报时效怎么退化；要指定时效的谱请读 scores_detail.csv。"
             "标题里的总功率比是**全波数求和后**再相除，它正常不代表分布正常。",
-            fontsize=8,
-            color="#555555",
+            fontsize=sizes["annot"],
+            color=NEUTRAL["muted"],
         )
         figure.tight_layout(rect=(0, 0.03, 1, 0.96))
         self._save(figure, save_path)

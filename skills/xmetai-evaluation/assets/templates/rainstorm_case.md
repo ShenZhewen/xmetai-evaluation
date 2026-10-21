@@ -2,7 +2,7 @@
 
 覆盖 `weather_ts_det` 流程下的**暴雨过程个例检验**（`configs/rainstorm_ts_single_*`），
 渲染器是 `visualization/rainstorm_report.py`，入口是
-`scripts/generate_rainstorm_report.py`。
+`scripts/render_rainstorm_report.py`。
 
 **与其他骨架不是一个家族**：那些吃的是**一次连续时段评测**的宽表，
 按"时效 / 等级"分节；这一份吃的是一整年 **43 个过程 × 2 种口径**，
@@ -200,7 +200,7 @@
 - **第三节的表号、图号跨过程块连续**（`表 3`、`表 5`…），不按过程块重置。
   骨架里写的是 `表 {N}`，不是 `表 1`。
 - **第二节的 Δ 列在表头里重复三次**（每个阈值段一次），且三次文字完全相同。
-  这是 `_screening_header` 的既有形态，与 `rainstorm_summary.py` 的
+  这是 `_screening_header` 的既有形态，与 `render_rainstorm_summary.py` 的
   `screening.md` 一致，不要"优化"成只出现一次。
 - **口径 B 的等级表带 ≥0.1 一行**。0.1mm 是"有降水"档，属于配置里的
   `TS_THRESHOLDS`，不是错误。

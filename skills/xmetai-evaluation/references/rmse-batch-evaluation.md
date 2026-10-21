@@ -1,8 +1,9 @@
 # RMSE 批次家族：口径与产出
 
-覆盖 `weather_rmse_single_<模型>` / `weather_rmse_ens_<模型>` 两条配置支线，
-以及吃同一批产物的 `_wave` 谱检验补充报告（**模型名在最后**，别写成
-`weather_rmse_<模型>_single`——那是旧文档的写法）。
+覆盖 `weather_rmse_single_<模型>` / `weather_rmse_ens_<模型>` 两条配置支线。
+吃同一批产物的 `_wave` 谱检验补充报告现已并入前两份的球谐带小节
+（单成员 §4.5 / 集合 §4.8），`render_wave_report.py` 只作为 legacy 入口保留。
+**模型名在最后**，别写成 `weather_rmse_<模型>_single`——那是旧文档的写法。
 
 **它们的产物形状就是标准评估产物目录**（`scores.csv` + `manifest.json` +
 `diagnostics/`），与其它流程没有区别，`resolved_config.pipeline` 是
@@ -10,12 +11,12 @@
 
 | | 吃几份产物 | 出什么 |
 |---|---|---|
-| `generate_report.py` → `field_report.py` | **一份** | 单模型的连续场报告（RMSE / ACC / 活跃度 / 谱） |
-| `scripts/generate_det_report.py` → `det_report.py` | **N 份**（≥2） | N 个模型**横向对比**的报告（相对 RMSE、配对 Wilcoxon、名次） |
+| `render_report.py` → `field_report.py` | **一份** | 单模型的连续场报告（RMSE / ACC / 活跃度 / 谱） |
+| `scripts/render_det_report.py` → `det_report.py` | **N 份**（≥2） | N 个模型**横向对比**的报告（相对 RMSE、配对 Wilcoxon、名次） |
 
-`generate_report.py` 认得出这些产物（有 `manifest.json`、有
+`render_report.py` 认得出这些产物（有 `manifest.json`、有
 `resolved_config.pipeline`），它只是**不做多模型对比**。反过来，把 TS 的产物目录
-丢给 `generate_det_report.py` 会当场报错——它要 `scores.csv` 里
+丢给 `render_det_report.py` 会当场报错——它要 `scores.csv` 里
 `metric="rmse"` 且 `product_kind="deterministic"` 的行。
 
 **冲突时以代码为准。** 本文件是代码的散文镜像：
@@ -25,38 +26,32 @@
 | 产物目录的形状 | `xmetai_evaluation/output/store.py` 的写盘代码（`scores.csv` / `manifest.json`）+ `components.py`（`diagnostics/`） |
 | 老批次归档 ↔ 新长表的等价关系 | `visualization/det_report.py` 的**模块 docstring**（有一张三列对照表） |
 | 派生指标的定义 | 同上（那几个指标**没有生成脚本，是反推出来的**，docstring 里写明了） |
-| 报告长什么样 | `assets/templates/weather_rmse_*.md` 三份骨架 |
+| 报告长什么样 | `assets/templates/weather_rmse_single.md` / `weather_rmse_ens.md` 两份骨架 |
 
 改口径先改代码，再回来改这里。
 
-> ⚠️ **旧文档里的 `vfc/` 在本仓库不存在**（只有 `xmetai_evaluation/`）。
-> 本文件早期版本引用的 `vfc/regr_ens.py` / `vfc/regr_summary.py` /
-> `vfc/regr_pair.py` 与 `--summarize-det` / `--summarize-ens` 两个开关
-> **一并作废**：那套「批次归档 + 逐日 CSV」的中间层已经没有了，
-> 评测框架直接落 `scores.csv` 长表。下文凡提到这几个名字的地方都是历史沿革，
-> 现行口径一律以 `xmetai_evaluation/` 下的代码为准。
-
 ---
 
-## 0. 三条支线
+## 0. 两条支线
 
 | 支线 | config | 吃什么 | 骨架 | 渲染器 |
 |---|---|---|---|---|
-| 确定性单成员 | `weather_rmse_single_<模型>` | 评估产物目录（`metric="rmse"` + `product_kind="deterministic"`） | `weather_rmse_single.md` | ✅ `visualization/det_report.py` + `scripts/generate_det_report.py` |
-| 集合 | `weather_rmse_ens_<模型>` | 评估产物目录（多 `crps` / `spread` / `spread_error_ratio` 指标） | `weather_rmse_ens.md` | ✅ `visualization/ens_report.py` + `scripts/generate_ens_report.py` |
-| 谱检验补充 | 吃上面任一份产物 | 评估产物目录 + `spherical_bands` 指标 | `weather_rmse_wave.md` | ✅ `visualization/wave_report.py` + `scripts/generate_wave_report.py` |
+| 确定性单成员 | `weather_rmse_single_<模型>` | 评估产物目录（`metric="rmse"` + `product_kind="deterministic"`） | `weather_rmse_single.md`（§4.5 球谐带） | ✅ `visualization/det_report.py` + `scripts/render_det_report.py` |
+| 集合 | `weather_rmse_ens_<模型>` | 评估产物目录（多 `crps` / `spread` / `spread_error_ratio` 指标） | `weather_rmse_ens.md`（§4.8 球谐带） | ✅ `visualization/ens_report.py` + `scripts/render_ens_report.py` |
+| 谱检验补充（legacy） | 吃上面任一份产物 | 评估产物目录 + `spherical_bands` 指标 | —（已并入单成员 §4.5 / 集合 §4.8） | `visualization/wave_report.py` + `scripts/render_wave_report.py` |
 
-三条**各有各的入口，按支线选**：`_single` 用 `generate_det_report.py`，
-`_ens` 用 `generate_ens_report.py`，`_wave` 用 `generate_wave_report.py`。
-骨架是**格式契约**，三份章节口径互不相同——**拿错入口比报错危险**：
-集合与单成员的产物目录形状**一模一样**，`generate_det_report.py` 拿集合产物
+两条**各有各的入口，按支线选**：`_single` 用 `render_det_report.py`，
+`_ens` 用 `render_ens_report.py`。`render_wave_report.py` 仍可跑，
+但球谐带与谱分析已经写进单成员报告，它只作为 legacy 入口保留、没有独立骨架。
+骨架是**格式契约**，两份章节口径互不相同——**拿错入口比报错危险**：
+集合与单成员的产物目录形状**一模一样**，`render_det_report.py` 拿集合产物
 不会报错（它挑 `product_kind="deterministic"` 的行，集合的 rmse 行恰好也有
 确定性那一份），出来的却是 `_single` 的章节口径。
 
 单模型的入口用法：
 
 ```bash
-python skills/xmetai-evaluation/scripts/generate_det_report.py \
+python skills/xmetai-evaluation/scripts/render_det_report.py \
   --model FGVP=/path/to/weather_rmse_single_fgvp \
   --model FuXi=/path/to/weather_rmse_single_fuxi \
   --result report/det_2models
@@ -66,7 +61,10 @@ python skills/xmetai-evaluation/scripts/generate_det_report.py \
 `NAME` 是**报告里显示的模型名**，由调用方给、**不从目录名或
 `manifest.run_id` 猜**——这个仓库的规矩是身份不靠目录名。
 其余选项：`--result`（必给，报告输出目录）、`--title`、`--change`、`--archive`、
-`--declared NAME=v1,v2,...`（对应骨架第 6.2 节的「声明变量数」，不给则该列记 `—`）。
+`--declared NAME=v1,v2,...`（对应骨架第 6.2 节的「声明变量数」，不给则该列记 `—`）、
+`--spatial-csv FILE` + `--spatial-model NAME`（可选，给就出 §4.6 空间分布图，
+不给则该节写「本批未出」）。`render_ens_report.py` 有同样两个开关；
+集合版吃的 CSV 还必须带 spread 列（由 `extract_spatial_distribution_ens.py` 产出）。
 
 ---
 
@@ -78,7 +76,7 @@ python skills/xmetai-evaluation/scripts/generate_det_report.py \
 
 ```
 <model_root>/
-  scores.csv                  统一长表，23 列，见 §1.2——报告唯一的取数来源
+  scores.csv                  统一长表，25 列，见 §1.2——报告唯一的取数来源
   manifest.json               运行记录：statuses / valid_times / regions /
                               n_results / metrics / resolved_config / artifacts
   diagnostics/
@@ -93,7 +91,7 @@ python skills/xmetai-evaluation/scripts/generate_det_report.py \
 **集合成员数是运行参数，产物里不记。** 长表与 `manifest.json` 都只记「算出来的数」，
 `n_members` 这类运行参数一律读不到——`ens_report._unique_summary_value(archive, "n_members")`
 找不到列，只能把「成员数」渲染成「—」。**这个数只能人工维护**，现行取值见 §4；
-出报告时用 `generate_ens_report.py --members N` 对所有模型一律填同一个数
+出报告时用 `render_ens_report.py --members N` 对所有模型一律填同一个数
 （不给就还是「—」），不要指望从产物里读出来。
 
 > ⚠️ **报告的「成员数」列写「—」不是缺数据**，是产物确实没记这个数。
@@ -106,19 +104,21 @@ python skills/xmetai-evaluation/scripts/generate_det_report.py \
 
 ### 1.2 长表 `scores.csv`
 
-一行一个 `(变量, 指标, 区域, 起报, 时效)` 组合，**现在 24 列**：
+一行一个 `(变量, 指标, 区域, 起报, 时效)` 组合，**现在 25 列**：
 
 ```
 run_id, model_id, dataset_id, variable, level, metric, product_kind, aggregation,
 weights_id, region, group, threshold, window_h, lead_h, init_time, valid_time,
-sample_unit, value, unit, status, n_valid, n_requested, metric_version, protocol_id
+sample_unit, storm, value, unit, status, n_valid, n_requested, metric_version,
+protocol_id
 ```
 
 > `group` 是**分组指标的组标签**（球谐带的 `1_4` 等、分类检验的阈值名），
-> 非分组指标为空。**早于这次修复跑出来的归档只有 23 列、没有 `group`**——
-> 认一个归档是新是旧，数一下表头列数就行（`manifest.json` 的 `score_columns` 也记着）。
-> 渲染器不依赖 `group` 的有无（球谐带的分组信息从 `metric` / 阈值列拿），
-> 所以老归档照样能出报告，**不用为了补这一列专门重跑**。
+> 非分组指标为空；`storm` 是台风编号，其余链路为空。
+> **早于 `group` 修复跑出来的归档只有 23 列**——数一下表头列数就能认
+> （`manifest.json` 的 `score_columns` 也记着）。
+> **球谐带必须靠 `group` 区分频带**：没有它时整节走 `SPHERICAL_ABSENT`、
+> 标「本批未出」，只能重跑评测补齐（见 §5 第 6 条）。
 
 报告取数只看其中几列：
 
@@ -219,7 +219,7 @@ tropics[-20, 20]      nh_extratropics[20, 90]      sh_extratropics[-90, -20]
 
 **谱曲线没有逐时效的版本**（长表里 `zonal_spectrum` 是标量，没有波数轴；
 `spectrum_by_init` 也没有 lead 列），所以曾经那节「谱比随时效」永远只能是
-「本批未出」。**2026-09-22 已把这一节从三份 RMSE 骨架和渲染器里删掉**
+「本批未出」。**2026-09-22 已把这一节从 RMSE 骨架和渲染器里删掉**
 （留着纯是噪声，图号顺延），**不要再按这一节去找产物**——真要做逐 lead 的谱比，
 得先让 `spectrum` writer 多写一列 lead，那是改评测侧的事。
 
@@ -234,7 +234,7 @@ tropics[-20, 20]      nh_extratropics[20, 90]      sh_extratropics[-90, -20]
 "涨到几倍"这个说法只在当前这套输入下成立。
 
 各模型覆盖时段差很多时（实测五模型 27 / 228 / 348 / 349 / 29 天），为了对齐会把长的
-那几份砍到最短那份，这时用 `generate_ens_report.py --own-dates`：每个模型按**自己的
+那几份砍到最短那份，这时用 `render_ens_report.py --own-dates`：每个模型按**自己的
 全部起报日**统计，代价是**同表各列来自不同时段、位次里混着时段差异**，不是公平对比。
 两档的差别只在下面这几处（渲染器会逐处点名）：
 
@@ -249,22 +249,33 @@ tropics[-20, 20]      nh_extratropics[20, 90]      sh_extratropics[-90, -20]
 `Bundle.dates_by_model` 是这条口径的落点：**凡是要给单个模型算平均的地方读它，
 不要读 `Bundle.dates`**（后者永远是共同日期，配对检验与 §2 那一行用）。
 
-**哪些入口有这个开关**：`generate_ens_report.py` 与 `generate_wave_report.py`
-有 `--own-dates`；**`generate_det_report.py`（`_single`）还没有**——底层
+**哪些入口有这个开关**：`render_ens_report.py` 与 `render_wave_report.py`
+有 `--own-dates`；**`render_det_report.py`（`_single`）还没有**——底层
 `det_report.analyze` 已经支持，只是那个 CLI 没把参数接出来，要用得先补一行
-（`build_det_report` 的签名也要跟着透传）。`_wave` 那边谱是数据主体，各模型取
+（`build_det_report` 的签名也要跟着透传）。legacy 的 `_wave` 入口谱是数据主体，各模型取
 不同时段时曲线高低里混着季节与过程差异，渲染器会在 §1、§2、§4.6 与附录各点
 一次名；它的配对检验同样永远退回共同日期。
 
-### 2.2 派生指标（照 `det_report.py` docstring 抄）
+### 2.2 派生指标
 
 | 指标 | 定义 | 方向 |
 |---|---|---|
 | **相对 RMSE** | 逐变量 `100 × v_m / geomean_模型(v)`，再对**共享变量**等权平均 | 越低越好，**100 = 几何均值基线** |
 | **ACC (%)** | 共同日期 × 全 lead 的 ACC 变量平均 | 越高越好 |
 | **FA 偏差 (pp)** | `100 × mean(\|ratio − 1\|)`，对全部 FA 变量、全 lead 平均 | 越低越好 |
-| **频谱对数 RMS×100** | `100 × mean_v sqrt(mean_k (log10(pred_k / obs_k))²)` | 越低越好 |
-| **平均排名分** | 上述四个指标上名次的平均 | 越低越好 |
+| **频谱对数 RMS×100** | `100 × mean_v sqrt(mean_k (log10(pred_k / obs_k))²)`，纬向谱，log10 | 越低越好 |
+| **球谐谱 RMS×100** | `100 × RMS[ln(pred/obs)]`，对球谐总阶数频带池化，**ln 不是 log10** | 越低越好 |
+| **平均排名分** | 上述各指标上名次的平均 | 越低越好 |
+
+**纬度加权**：格点评估的方差/协方差一律 cos(lat) 加权（`transforms/regrid.compute_latitude_weights`），
+不是简单格点平均；站点协议按 `options.weights` 决定。
+
+**确定性 vs 集合**：长表里 `metric="rmse"` 有两套——`product_kind=deterministic`
+是确定性 RMSE，`product_kind=ensemble` 是 `spread_error` 展开出来的 rmse。
+名字一样，取数必须先按 `product_kind` 过滤。
+
+**全球行**：同一 (起报, 时效, 指标) 会同时写全球行与 `config_options.regions`
+的区域行，**只有 `region` 为空的那行是全球**，报告正文一律取全球行。
 
 > **相对 RMSE 的 100 是"这几个模型的几何均值"**，不是某个绝对标准。
 > 换一批模型参赛，同一个模型的分就变了——**它只在本次对比内部有意义**。
@@ -325,11 +336,11 @@ LEAD_BANDS = ((0,120], (120,240], (240,360)]   单位 h，左开右闭
 （`diagnostics/spectrum_by_init.csv` 取单日起报，或 `spectrum_<变量>.csv` 看平均谱），
 一个汇总数说不出来。
 
-> ⚠️ **底数在两条支线之间不一致，这是现行代码的真实状态、不是文档过时**：
+> ⚠️ **底数在不同报告之间不一致，这是现行代码的真实状态、不是文档过时**：
 > `det_report.py` 用 **log10**（`:810`），`ens_report.py`（`:282`）与
 > `wave_report.py`（`:253`、`:389`）用 **ln**，两者差 ×2.3026。
 > 两个渲染器都**在正文里自己声明了底数并互相点名**，所以单看一份报告不会错；
-> **跨份报告比这个数之前必须先统一底数**。要不要把三条支线对齐是一个
+> **跨份报告比这个数之前必须先统一底数**。要不要把各报告对齐是一个
 > 待定决策（改了会让已有归档的数整体变样，所以没有擅自动）。
 
 ---
@@ -379,11 +390,11 @@ LEAD_BANDS = ((0,120], (120,240], (240,360)]   单位 h，左开右闭
    拷进一个叫 `..._fgvp` 的目录，`run_id` 照样是 `..._fuxi`。
 5. **谱变量默认优先 `z500`**（`PREFERRED_VARIABLE`），缺了才退到字典序第一个。
    换变量会让频谱那条线整体变样，**别拿不同谱变量的数比大小**。
-6. ⚠️ **球谐带功率行在旧产物里认不出频带**。长表契约里有 `group` 列
-   （球谐带的 `1_4` / `5_20` …，见 `output/table.py:37`），**共 24 列**；
-   但现存归档的 `scores.csv` 只有 **23 列、没有 `group`**——那是修 `group`
-   之前跑出来的产物。此时 5 个频带的行混在一起无法区分，
-   `wave_report` 会走 `SPHERICAL_ABSENT`、§4.1–4.3 标「本批未出」。
+6. ⚠️ **球谐带功率行在旧产物里认不出频带**。长表契约 25 列里有 `group`
+   （球谐带的 `1_4` / `5_20` …，见 `output/table.py` 的 `SCORE_COLUMNS`）；
+   但早期归档的 `scores.csv` 只有 **23 列、没有 `group`**。此时 5 个频带的行
+   混在一起无法区分，确定性报告 §4.5 与集合报告 §4.8（以及 legacy
+   `wave_report` 的对应小节）会走 `SPHERICAL_ABSENT`、标「本批未出」。
    **修法是重跑评测**（配置里带 `spherical_bands` 指标即可），不是改报告端。
 
 ---
@@ -397,7 +408,7 @@ LEAD_BANDS = ((0,120], (120,240], (240,360)]   单位 h，左开右闭
 > 「JJA 240h 以后的 CRPS」
 
 **这类请求不需要重跑评测**——长表里每个维度都已经在列上了，取数是纯筛选加
-按报告既有口径重算。**渲染器不认这类请求**（三份骨架的「附 S」现在固定输出
+按报告既有口径重算。**渲染器不认这类请求**（两份骨架的「附 S」现在固定输出
 「本批未出」），要**智能体自己取数、自己把段落补进报告**。本节就是那套工序。
 
 ### 6.1 口语词 → 长表列
@@ -561,7 +572,7 @@ print("天数", len(per_date), "样本", int(sub["n_valid"].astype(int).sum()),
 - **口径若被迫换过，必须在表下写明**（见 §6.4）——归档分带不生效时改用另一档
   `product_kind`，是**这份报告**在替归档背锅，不写清楚下一手会拿它当集合口径用。
 - ⚠️ **手改的 REPORT.md 是临时的。** 渲染器每次跑都整份重写 `REPORT.md`，
-  手工补进「附 S」的这段**会在下次 `generate_*_report.py` 时被冲掉**，退回那句
+  手工补进「附 S」的这段**会在下次 `render_*_report.py` 时被冲掉**，退回那句
   「本批本批未出」的静态文案。所以要么每次重跑后重补，要么把切片做成渲染器的
   可选输入。**交给用户的报告里如果含手补内容，要当面说清这一点**——否则用户
   以为它跟正文一样是自动产出的。
@@ -579,11 +590,11 @@ print("天数", len(per_date), "样本", int(sub["n_valid"].astype(int).sum()),
 4. 不要把全球行与纬度带行混着平均（见 §1.3）；
 5. 不要用"结果里没有"反推"数据源里没有"（ACC/FA 缺席多半是没配气候态；
    谱曲线缺席多半是没挂 `spectrum` writer；球谐带认不出多半是旧产物没有 `group` 列）；
-6. 不要把集合的产物喂给 `generate_det_report.py`——**形状一样、读得进去**，
+6. 不要把集合的产物喂给 `render_det_report.py`——**形状一样、读得进去**，
    出的却是 `_single` 的章节口径，**拿错模板比报错危险**；
 7. 不要跨口径比较（不同起报集合、不同 `acc` 口径、不同气候态平滑窗、
    不同 `max_wavenumber`、不同 `regions` 区划的结果不可直接横向比）；
-8. 不要跨份报告比「频谱对数 RMS」——三条支线的底数不一致（见 §3.4）。
+8. 不要跨份报告比「频谱对数 RMS」——各报告的底数不一致（见 §3.4）。
 
 ---
 

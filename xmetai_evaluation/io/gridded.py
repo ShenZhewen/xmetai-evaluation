@@ -213,10 +213,26 @@ class GriddedCatalog(DataCatalog):
 class GriddedReader(Reader):
     """按布局声明解码的通用格点 Reader。"""
 
-    def __init__(self, source_id: str, layout: GriddedLayout, version: str = "2.0.0"):
+    def __init__(
+        self,
+        source_id: str,
+        layout: GriddedLayout,
+        version: str = "2.0.0",
+        scales: Optional[Dict[str, float]] = None,
+    ):
         super().__init__(source_id=source_id, version=version)
         self.layout = layout
         self.step_hours = layout.step_hours
+        #: 配置级单位系数 ``{标准变量名: 系数}``，在布局换算之后按报告单位再乘
+        #: 一次。用于复用同一布局、但落盘单位不同的模型（如 AIFS / FengQing
+        #: 的 q 是 kg/kg，而 FuXi 物理口径的 q 是 g/kg，需要 ×1000）。
+        self.scales = {str(key): float(value) for key, value in (scales or {}).items()}
+        unknown = sorted(set(self.scales) - set(layout.variables))
+        if unknown:
+            # 写错变量名时宁可报错，也不要静默不生效（单位错会污染整批结果）
+            raise ValueError(
+                f"scales 里有布局 {layout.name} 未声明的变量: {', '.join(unknown)}"
+            )
 
     def read(self, request: DataRequest, index: DataIndex) -> DataBundle:
         return self._read_records(request, self.records_from_index(index))
@@ -446,6 +462,16 @@ class GriddedReader(Reader):
                 dataset[name].attrs["units"] = spec.unit
                 if spec.source_unit:
                     dataset[name].attrs["original_units"] = spec.source_unit
+
+        # 配置级系数：布局之外再乘一次，落点仍是布局声明的报告单位。
+        for name in available:
+            factor = self.scales.get(name)
+            if factor is None or factor == 1.0:
+                continue
+            dataset[name] = dataset[name] * factor
+            spec = self.layout.spec_for(name)
+            if spec is not None:
+                dataset[name].attrs["units"] = spec.unit
 
         if self.layout.squeeze_dims:
             singleton = [

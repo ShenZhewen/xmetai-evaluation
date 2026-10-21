@@ -2,9 +2,8 @@
 # -*- coding: utf-8 -*-
 """产物目录 → 报告：认能力 + 派发。
 
-一句话用法::
-
-    python -m xmetai_evaluation.visualization.report <产物目录> [--result 输出目录]
+命令行入口 ``skills/xmetai-evaluation/scripts/render_report.py``；本模块只提供
+实现，不自带 CLI。
 
 **能力身份从产物自己认，不靠目录名**：``manifest.json`` 里的
 ``resolved_config.pipeline`` 是权威判据（``runner`` 无条件写它）。目录名与
@@ -20,13 +19,12 @@
 
 能力先归到**报告家族**（``IMPLEMENTED`` 的值），再按家族派发：同一家族的流程
 写出的产物表结构相同，共用一套模板与图表。目前三个家族——``field``
-（连续场，吃 ``scores.csv``）与 ``ts``（降水分类检验，吃
-``diagnostics/categorical_wide.csv``），``typhoon`` 吃场次曲线与元数据。
+（连续场，吃 ``scores.csv``）、``ts``（降水分类检验，吃
+``diagnostics/categorical_wide.csv``）与 ``typhoon``（场次曲线与元数据）。
 """
 
 from __future__ import annotations
 
-import argparse
 import json
 from pathlib import Path
 from typing import Dict, Optional, Sequence
@@ -172,7 +170,7 @@ def build_report(
     Args:
         output_dir: ``--config`` 里的 output_dir，里面应有 ``manifest.json``
             以及该能力对应的结果表——连续场是 ``scores.csv``，
-            TS 系列是 ``diagnostics/categorical_wide.csv``。
+            TS 系列是 ``diagnostics/categorical_wide.csv``，台风是场次曲线与元数据。
         out_dir: 报告输出目录；默认 ``reports/<run_id>``（相对当前目录）。
         model_name: 报告标题里的模型名；默认取 ``run_id``。**不要用 manifest 的
             ``forecast_source``**——那是 reader 类型（如 ``"fuxi"``），不是模型名，
@@ -192,7 +190,7 @@ def build_report(
             ``spectrum_init`` 省略时取最后一个起报。
 
     Raises:
-        ValueError: 该能力要的结果表不存在，或认不出能力，或 ``compare`` 不合法。
+        ValueError: 结果表不存在、认不出能力，或 ``compare`` 不合法。
         ImportError: 没装 matplotlib（``pip install -e .[viz]``）。
     """
     output_dir = Path(output_dir)
@@ -401,56 +399,3 @@ def _render_field(
         manifest_info=info,
         change_description=change_description,
     )
-
-
-def main(argv: Optional[Sequence[str]] = None) -> int:
-    parser = argparse.ArgumentParser(
-        description="按评测产物目录自动选模板，出图并写 Markdown 报告",
-        epilog="示例: python -m xmetai_evaluation.visualization.report "
-        "evaluation_results/weather_ts_single_fgvp --result reports/weather_ts_single_fgvp",
-    )
-    parser.add_argument("output_dir", type=Path, help="评测产物目录（含 scores.csv 与 manifest.json）")
-    parser.add_argument("--result", type=Path, default=None, help="报告输出目录（默认 reports/<run_id>）")
-    parser.add_argument("--model", default=None, help="模型名（默认取 manifest 的 run_id）")
-    parser.add_argument("--primary-model", help="台风分析主模型")
-    parser.add_argument("--previous-model", help="台风主模型的旧版本显示名")
-    parser.add_argument("--primary-leads", type=float, nargs="+", help="台风主要讨论时效")
-    parser.add_argument("--exploratory-leads", type=float, nargs="+", help="台风探索性讨论时效")
-    parser.add_argument(
-        "--spectrum-variable", default=None, help="要看谱曲线的变量（需变量真的算过纬向谱）"
-    )
-    parser.add_argument(
-        "--spectrum-init", default=None,
-        help="谱曲线的起报时刻，按子串匹配 init_time（如 20250102），省略取最后一个起报",
-    )
-    parser.add_argument("--change", default=None, help="本次改动说明，写进报告第一节")
-    parser.add_argument(
-        "--members", type=int, default=None,
-        help="集合成员数（只在 weather_ts_ens 上有意义）。产物里没有这个字段，"
-        "报告里凡要写成员数的地方都靠它；不给就省略数字",
-    )
-    parser.add_argument(
-        "--compare", action="append", default=None, metavar="名字=CSV路径",
-        help="可重复：TS 为 NAME=宽表CSV；台风为 NAME=产物目录",
-    )
-    args = parser.parse_args(argv)
-
-    artifacts = build_report(
-        args.output_dir,
-        out_dir=args.result,
-        model_name=args.model,
-        spectrum_variable=args.spectrum_variable,
-        spectrum_init=args.spectrum_init,
-        change_description=args.change,
-        compare=args.compare,
-        members=args.members,
-        primary_model=args.primary_model, previous_model=args.previous_model,
-        primary_leads=args.primary_leads, exploratory_leads=args.exploratory_leads,
-    )
-    for name, path in artifacts.items():
-        print(f"  {name}: {path}")
-    return 0
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())

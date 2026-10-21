@@ -1,42 +1,29 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""TS 结果表 → Markdown 报告。
+"""TS 结果表 → Markdown 报告（多模型对比骨架）。
 
-一句话用法::
+命令行入口 ``skills/xmetai-evaluation/scripts/render_report.py``（按产物目录
+自动认能力、选模板）；本模块只提供实现。
 
-    python -m xmetai_evaluation.visualization.ts_report --csv ts.csv --result reports/fgvp --model FGVP
+报告固定六章 + 附录，结构参考 ``weather_rmse_single.md``：
 
-报告按**论文实验章节**的写法组织：每一节都是「引导句 → 图表 → 定量分析」。
-图就地带着图注出现（`图 N：…` / `表 N：…`，按出现顺序编号），图下必有图注、
-表上必有表题，每节末尾有一段**小结**——小结里的每个论断都带具体数值，由
-``analysis_*`` 系列函数从已经算好的统计量里推出来，不是套话。
+``# 1. 摘要`` / ``# 2. 样本口径与数据质量`` / ``# 3. 评估指标与解释`` /
+``# 4. 总体评估结果``（4.1 TS、4.2 POD、4.3 FAR、4.4 BIAS、4.5 跨时效稳定性、
+4.6 性能图、4.7 概率评分[集合]） / ``# 5. 分时效表现`` / ``# 6. 结论与建议`` /
+``# 附录``。第 4 章的四个指标各自独占一节、各配一张随时效曲线图。
 
-章节：结论摘要（含评估对象与口径）→ 逐等级表现 → 随时效变化 → 误差形态与偏差结构 →
-跨时效分布（箱线图）→（可选，集合）概率评分 AROC/BSS →（可选）与对比模型的比较 →
-（多模型）模型能力雷达图 → 改进建议 → 口径与注意事项。
+表**不编号**（每张表由上方粗体小标题引导），图按在正文中出现的顺序编号
+``图 N：``。概率评分只在集合产物里出现，AROC 与 BSS 各占一张（固定的
+``图 9``、``图 10`` 两位），因此 §5 分时效点图在集合报告里是图 11、在确定性
+报告里是图 9。图号由 :class:`_Numbering` 跟着实际出图现算，缺图不占号；
+集合报告即使没有概率表也会**保留节位与图号**。
 
-**概率评分那一节只在拿到概率宽表时出现**（``diagnostics/probability_wide.csv``，
-由 ``weather_ts_ens_prob`` 能力写出）。它的累积窗口与阈值都和 TS 不同，所以
-单独立节、单独编号；它一出现，后面所有章节号整体后移一位。产物里没有这张表时
-整节不出现，章节号原样——**编号跟着实际出现了什么走**，这是 ``_Numbering`` 的
-同一条规矩。集合专属的措辞（标题的「集合预报」、第一节的「集合口径」段、
-第十节的两条集合提示）则统一由 ``build_ts_report(ensemble=True)`` 打开，
-默认关：确定性与 FDP 两条流程共用本模块，不能被牵连。
-
-雷达图那一节把前面几张表的**综合评分**摆成多边形（批内 min-max，1 = 本批最好），
-只在两个及以上模型时出现——一个多边形没有比较对象。「综合」是硬要求：
-POD / FAR 和 TS 是恒等式关系，不能各占一根轴。
-
-结论摘要**整段成文、不列点**：开头先把「评的是谁、多少天、什么指标」交代清楚，
-再接一整段判断，末尾是业务定性与指标定义。
-
-``analysis_*`` 函数只吃 ``summarize()`` / ``box_stats()`` 已经算好的数字，
-不重新读表、不重新实现指标——口径只有一处，表、图、文字不可能各说各话。
+``analysis_*`` 只吃 ``summarize()`` / ``box_stats()`` 算好的数字，不重新读表、
+不重算指标——口径只有一处，表、图、文字就不会各说各话。
 """
 
 from __future__ import annotations
 
-import argparse
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
@@ -44,51 +31,68 @@ from typing import Dict, List, Optional, Sequence, Tuple
 import numpy as np
 import pandas as pd
 
-#: 第五节（跨时效分布）里逐字固定的三行。``assets/templates/weather_ts_single.md`` 的骨架要抄同一份字节，
-#: 两边差一个全角/半角字符测试就会红——所以只在**这里**定义一次。
+from xmetai_evaluation.visualization._common import (
+    bullet_lines,
+    cn_number,
+    fmt_number,
+    source_of,
+    table_lines,
+)
+
+#: §4.5（跨时效稳定性）里逐字固定的三行。``assets/templates/weather_ts_single.md``
+#: 与 ``weather_ts_ens.md`` 的骨架要抄同一份字节，两边差一个全角/半角字符就会漂。
 _BOX_HEADER = "| 模型 | 降水等级 | 中位数 | IQR | Q1–Q3 | 须线范围 | 离群时效 | 时效数 |"
 _BOX_SEP = "|---|---|---|---|---|---|---|---|"
-#: 概率评分宽表的必需列。缺任一列就不是这份表——**不猜、不补**（见 ``load_probability``）。
-PROBABILITY_COLUMNS = (
-    "lead_h", "grade", "threshold_mm", "AROC", "BS", "BS_ref", "BSS",
-    "base_rate", "n_points",
-)
 
 _BOX_NOTE = (
     "> 每个箱体的样本是**同模型、同量级在全部时效上的 TS 取值**"
     "（无有效 TS 的时效不计入，样本数见「时效数」列）：箱体为四分位距（IQR），中线为中位数，"
     "须线延伸到 1.5×IQR 内最远的点，空心圆为离群时效。**TS 越高越优**，"
     "所以箱体**越高**表示该量级整体技巧越好、**越窄**表示跨时效越稳定；"
-    "这里的统计量与第二节的「全时效平均」不是同一个量（等权平均 vs 中位数/IQR），不可互相替代。"
+    "这里的统计量与 4.1 节的「全时效平均」不是同一个量（等权平均 vs 中位数/IQR），不可互相替代。"
+)
+
+#: 概率评分宽表的必需列。缺任一列就不是这份表——**不猜、不补**。
+PROBABILITY_COLUMNS = (
+    "lead_h", "grade", "threshold_mm", "AROC", "BS", "BS_ref", "BSS",
+    "base_rate", "n_points",
+)
+
+#: 强降水那一档：不低于这个阈值（mm）的**最小**一档；全批取同一个门槛。
+HEAVY_RAIN_THRESHOLD = 25.0
+
+#: 「最低可用技巧」门槛：有效时效上限按综合 TS 首次跌破它来判。
+USABLE_TS = 0.10
+
+#: 分带小节的图名：既是 ``artifacts`` 里的键，也是报告里 ``![…]()`` 的标签。
+REGION_FIGURE = "region_TS_vs_lead"
+
+#: 这份产物**一条带都没落数**时的说明。
+_REGION_MISSING_NOTE = (
+    "这份产物的宽表里没有 `region` 行：本次评测没配 `options[\"regions\"]`"
+    "（或者配了但没有任何一条带算出结果）。"
 )
 
 
-def _fmt(value: Optional[float], digits: int = 3) -> str:
-    if value is None or (isinstance(value, float) and not np.isfinite(value)):
-        return "—"
-    return f"{value:.{digits}f}"
-
-
 class _Numbering:
-    """图和表**按在报告里出现的顺序**编号，图注/表题由它生成。
+    """图按在正文里出现的顺序编号。
 
-    编号跟着出现顺序走而不是写死，是因为图会缺：某份结果表没有 POD/FAR 就没有
-    性能图，单模型分支没有 multi_model_TS_delta。缺图时**连图注一起不出现**，
-    序号仍然连续（图 1、图 2…），不会出现「图 3 不见了」这种断号。
+    图会缺（确定性产物没有概率评分图），缺图时**连图注一起不出现**、序号仍然
+    连续；集合报告的概率评分节虽然可能没有数据，但**节位与图号都保留**——由
+    :meth:`reserve` 占号，这样 §5 的点图在两种报告里分别落到 9 / 11。
     """
 
     def __init__(self) -> None:
         self._figures: Dict[str, int] = {}
-        self._tables = 0
 
     def figure(self, name: str) -> int:
         number = len(self._figures) + 1
         self._figures[name] = number
         return number
 
-    def table(self) -> int:
-        self._tables += 1
-        return self._tables
+    def reserve(self, name: str) -> int:
+        """给一个**本节可能出现但本批没有图**的位置占号。"""
+        return self.figure(name)
 
 
 def _figure_block(
@@ -105,9 +109,18 @@ def _figure_block(
     return [f"![{name}]({Path(path).name})", "", f"图 {number}：{caption}", ""]
 
 
-def _table_caption(numbering: _Numbering, text: str) -> List[str]:
-    """表题**在表上方**（图注在下方）——这是中文论文的排版惯例。"""
-    return [f"表 {numbering.table()}：{text}", ""]
+def _table_title(text: str) -> List[str]:
+    """表题**在表上方**，不编号——条件章节增删时不用重排全篇表号。"""
+    return [f"**{text}**", ""]
+
+
+def _threshold_cell(value: object) -> str:
+    """阈值显示成 ``0.1`` / ``13``，不补小数位。"""
+    try:
+        number = float(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return "—"
+    return f"{number:g}" if np.isfinite(number) else "—"
 
 
 def _grade_sort_key(grade: str, threshold: Optional[float]) -> float:
@@ -202,7 +215,7 @@ def summarize(data: pd.DataFrame) -> Dict[str, object]:
 
 
 def diagnose(summary: Dict[str, object]) -> List[str]:
-    """规则化诊断：每条结论都带具体数值。"""
+    """规则化诊断（主模型）：每条结论都带具体数值。"""
     grades = summary["grades"]
     findings: List[str] = []
     if not grades:
@@ -213,14 +226,19 @@ def diagnose(summary: Dict[str, object]) -> List[str]:
     overall = summary["overall_ts"]
     level = "较好" if overall >= 0.3 else ("中等" if overall >= 0.2 else "偏弱")
     findings.append(
-        f"整体技巧 **{level}**：各等级全时效平均 TS = {_fmt(overall)}"
+        f"整体技巧 **{level}**：各等级全时效平均 TS = {fmt_number(overall)}"
         f"（参考经验分级：≥0.3 较好 / 0.2–0.3 中等 / <0.2 偏弱）。"
     )
 
     if len(grades) > 1:
+        steps = [
+            grades[index]["TS"] - grades[index + 1]["TS"]
+            for index in range(len(grades) - 1)
+        ]
+        trend = "**单调衰减**" if all(step >= -1e-12 for step in steps) else "总体随量级下降"
         findings.append(
-            f"技巧随量级**单调衰减**：{weak['grade']}mm 的 TS {_fmt(weak['TS'])}"
-            f" → {strong['grade']}mm 的 TS {_fmt(strong['TS'])}"
+            f"技巧随量级{trend}：{weak['grade']}mm 的 TS {fmt_number(weak['TS'])}"
+            f" → {strong['grade']}mm 的 TS {fmt_number(strong['TS'])}"
             f"（高量级命中数 {strong['hits']}，样本 {strong['n_pairs']}）。"
         )
 
@@ -230,7 +248,7 @@ def diagnose(summary: Dict[str, object]) -> List[str]:
         direction = "系统性高报" if worst_bias["BIAS"] > 1 else "系统性漏报"
         findings.append(
             f"偏差结构：偏离理想值 1 最多的是 {worst_bias['grade']}mm，"
-            f"BIAS = {_fmt(worst_bias['BIAS'])}（{direction}）；"
+            f"BIAS = {fmt_number(worst_bias['BIAS'])}（{direction}）；"
             f"BIAS 是频率偏差（预报事件数/观测事件数），不是平均误差。"
         )
 
@@ -241,9 +259,7 @@ def diagnose(summary: Dict[str, object]) -> List[str]:
     ]
     if far_entries:
         entry = far_entries[-1]
-        far_text, miss_text = _fmt(entry["FAR"]), _fmt(entry["漏报率"])
-        # 比**格式化之后**的文本：两个值差在小数点后第四位时，正文里看到的仍是
-        # 「1.000 高于 1.000」——按显示值判平，才不会写出这种自相矛盾的句子。
+        far_text, miss_text = fmt_number(entry["FAR"]), fmt_number(entry["漏报率"])
         if far_text == miss_text:
             findings.append(
                 f"误差形态：{entry['grade']}mm 的 FAR 与漏报率均为 {far_text}，"
@@ -263,17 +279,17 @@ def diagnose(summary: Dict[str, object]) -> List[str]:
     decay = summary.get("decay")
     if decay:
         findings.append(
-            f"时效衰减：TS 从 {decay['first_lead']:g}h 的 {_fmt(decay['first_ts'])}"
-            f" 降到 {decay['last_lead']:g}h 的 {_fmt(decay['last_ts'])}"
-            f"（绝对 -{_fmt(decay['drop'])}，约 {_fmt(decay['per_day'])}/天）。"
+            f"时效衰减：综合 TS 从 {decay['first_lead']:g}h 的 {fmt_number(decay['first_ts'])}"
+            f" 降到 {decay['last_lead']:g}h 的 {fmt_number(decay['last_ts'])}"
+            f"（绝对 -{fmt_number(decay['drop'])}，约 {fmt_number(decay['per_day'])}/天）。"
         )
 
-    zero_hit = [entry for entry in grades if entry["hits"] == 0]
+    zero_hit = [entry for entry in grades if entry["hits"] == 0 and entry["events"] > 0]
     if zero_hit:
         names = "、".join(entry["grade"] for entry in zero_hit)
         findings.append(
-            f"{names}mm 在全部时效中**命中为 0**，因此 TS/漏报率 显示为 —（无有效配对或无事件），"
-            f"这与「评分为 0.000」含义不同，解读时注意区分。"
+            f"{names}mm 在全部时效中**命中为 0**（观测事件确实存在、只是没有报中），"
+            f"因此 TS = 0.000；这与缺测的「—」含义不同，解读时注意区分。"
         )
     no_event = [entry for entry in grades if entry["events"] == 0]
     if no_event:
@@ -295,71 +311,6 @@ def diagnose(summary: Dict[str, object]) -> List[str]:
     return findings
 
 
-def _grade_table(grades: Sequence[Dict[str, object]]) -> str:
-    """（见 _source_of 与表格生成）"""
-    header = (
-        "| 降水等级 | 阈值(mm) | TS | POD | FAR | 漏报率 | BIAS "
-        "| TS(等权平均) | 命中 | 漏报 | 空报 | 样本合计 |"
-    )
-    lines = [header, "|---|---|---|---|---|---|---|---|---|---|---|---|"]
-    for entry in grades:
-        lines.append(
-            f"| {entry['grade']} | {_fmt(entry['threshold'], 3)} "
-            f"| {_fmt(entry['TS'])} {_ts_mark(entry['TS'])}"
-            f" | {_fmt(entry['POD'])} | {_fmt(entry['FAR'])} | {_fmt(entry['漏报率'])}"
-            f" | {_fmt(entry['BIAS'])} | {_fmt(entry['TS_mean'])}"
-            f" | {entry['hits']} | {entry['misses']} | {entry['false_alarms']}"
-            f" | {entry['n_pairs']} |"
-        )
-    return "\n".join(lines)
-
-
-def _ts_mark(value: float) -> str:
-    """技巧分级标记：≥0.3 好 / 0.2–0.3 中 / <0.2 弱。"""
-    if not np.isfinite(value):
-        return "—"
-    if value >= 0.3:
-        return "🟢"
-    if value >= 0.2:
-        return "🟡"
-    return "🔴"
-
-
-def _source_of(sources: Optional[Dict[str, str]], name: str) -> str:
-    """报告头里的来源标注：给了文件路径就写路径，否则如实写"未提供"。"""
-    if sources and sources.get(name):
-        return f"`{sources[name]}`"
-    return "未提供（调用方应在 sources 里给出文件路径）"
-
-
-def _coverage_sentence(coverage: Optional[Dict[str, int]]) -> str:
-    """第一节的实测覆盖句：各份给了多少对有效样本。
-
-    这句必须存在：对比表只写分数、不写样本量，而各份来源的起报日数可以差一个
-    量级（本批是 29 天对 348 天）。不写出来，读者会把样本最少的那份的名次当成
-    结论。样本数取**最小阈值档的全时效合计**，与第二节「样本合计」列同口径。
-
-    只有一个对象（或全都是空值）时返回空串——单模型报告里这句话没有比较对象，
-    留着只是噪音。
-    """
-    entries = [(str(name), int(value)) for name, value in (coverage or {}).items() if value]
-    if len(entries) < 2:
-        return ""
-    primary, base = entries[0]
-    detail = "、".join(f"{name} {value:,}" for name, value in entries)
-    text = (
-        f"**本批实测覆盖并不齐**（最小阈值档的全时效配对样本数）：{detail}。"
-        f"站点数每天大体固定，这组数的比值基本就是各份起报日数的比值。"
-    )
-    lowest = min(entries, key=lambda item: item[1])
-    if base and lowest[0] != primary and lowest[1] / base < 0.5:
-        text += (
-            f"样本最少的是 {lowest[0]}，只有 {primary} 的 {lowest[1] / base:.1%}——"
-            f"它的分数抽样波动明显更大，名次不宜当结论用。"
-        )
-    return text
-
-
 def business_conclusion(grades: Sequence[Dict[str, object]]) -> str:
     """把技巧水平翻译成业务语言（基于数据自动生成，不是套话）。"""
     def _entry(threshold: float):
@@ -375,14 +326,14 @@ def business_conclusion(grades: Sequence[Dict[str, object]]) -> str:
     parts: List[str] = []
     if light:
         usable = "可作为有无降水的定性参考" if light["TS"] >= 0.3 else "仅能给出粗略的有雨/无雨趋势"
-        parts.append(f"小雨（≥0.1mm）TS {_fmt(light['TS'])}，{usable}")
+        parts.append(f"小雨（≥0.1mm）TS {fmt_number(light['TS'])}，{usable}")
     if moderate:
         parts.append(
-            f"中雨（≥{_fmt(moderate['threshold'], 0)}mm）TS {_fmt(moderate['TS'])}，"
+            f"中雨（≥{fmt_number(moderate['threshold'], 0)}mm）TS {fmt_number(moderate['TS'])}，"
             + ("可作量级参考" if moderate["TS"] >= 0.2 else "已基本失去量级判别能力")
         )
     if heavy:
-        parts.append(f"强降水（≥{_fmt(heavy['threshold'], 0)}mm）TS {_fmt(heavy['TS'])}")
+        parts.append(f"强降水（≥{fmt_number(heavy['threshold'], 0)}mm）TS {fmt_number(heavy['TS'])}")
 
     conclusion = "；".join(parts)
     if heavy and np.isfinite(heavy["TS"]) and heavy["TS"] < 0.15:
@@ -402,13 +353,13 @@ def recommendations(grades: Sequence[Dict[str, object]]) -> List[str]:
 
     if light and np.isfinite(light["BIAS"]) and light["BIAS"] > 1.3 and light["FAR"] > 0.45:
         items.append(
-            f"小雨量级 BIAS {_fmt(light['BIAS'])}、FAR {_fmt(light['FAR'])} → "
+            f"小雨量级 BIAS {fmt_number(light['BIAS'])}、FAR {fmt_number(light['FAR'])} → "
             f"模型倾向「到处报小雨」、空间上过度平滑。损失函数可引入**焦点损失（Focal Loss）**"
             f"降低无雨背景点权重，并在频次上做**频率匹配**订正。"
         )
     if heavy and np.isfinite(heavy["TS"]) and heavy["TS"] < 0.15:
         items.append(
-            f"强降水（≥{_fmt(heavy['threshold'], 0)}mm）TS {_fmt(heavy['TS'])} → "
+            f"强降水（≥{fmt_number(heavy['threshold'], 0)}mm）TS {fmt_number(heavy['TS'])} → "
             f"高频细节丢失。可引入**空间谱损失（Spectral Loss）**恢复小尺度结构，"
             f"并对极端事件做**样本重加权**以缓解长尾稀疏。"
         )
@@ -428,553 +379,358 @@ def recommendations(grades: Sequence[Dict[str, object]]) -> List[str]:
 
 
 # --------------------------------------------------------------------------- #
-# 各节小结
-#
-# 这些函数是报告的「分析」部分：只吃 summarize() / box_stats() 已经算好的数字，
-# **不重新读表、不重新实现指标**——口径只有一处，表、图、文字就不可能各说各话。
-#
-# 一条硬规矩：每句话都得带具体数值，或者是个能被数据证伪的判断。
-# 写不出结论时如实说「数据不足以判断」，不拿「表现良好」这类话凑数。
+# 共用统计
 # --------------------------------------------------------------------------- #
-def analysis_by_grade(grades: Sequence[Dict[str, object]]) -> str:
-    """第二节小结：量级维度——技巧分级、单调性、断崖在哪一档、样本随量级的收缩。"""
-    usable = [entry for entry in grades if np.isfinite(entry.get("TS", np.nan))]
-    if not usable:
-        return "各降水等级的 TS 均不可定义（无有效配对或无命中），无法做量级间比较。"
+def _coverage_sentence(coverage: Optional[Dict[str, int]]) -> List[str]:
+    """§2 与各节共用的实测覆盖句：各份给了多少对有效样本。
 
-    marks = [_ts_mark(entry["TS"]) for entry in usable]
-    tally = "、".join(
-        f"{mark} {marks.count(mark)} 档" for mark in ("🟢", "🟡", "🔴") if marks.count(mark)
-    )
-    parts = [f"{len(usable)} 个可评定的降水等级里 {tally}。"]
-
-    steps = [
-        (usable[index], usable[index + 1], usable[index]["TS"] - usable[index + 1]["TS"])
-        for index in range(len(usable) - 1)
-    ]
-    rises = [step for step in steps if step[2] < -0.005]
-    if rises:
-        where = "、".join(f"{left['grade']}→{right['grade']}" for left, right, _ in rises)
-        parts.append(
-            f"TS 并非随量级单调下降：{where} 处出现回升，说明该处的样本波动已经盖过技巧的真实差异，"
-            f"这个位置上的名次不可当真。"
-        )
-    elif steps:
-        parts.append(
-            f"TS 随量级**单调下降**，从 {usable[0]['grade']}mm 的 {_fmt(usable[0]['TS'])} "
-            f"一路降到 {usable[-1]['grade']}mm 的 {_fmt(usable[-1]['TS'])}。"
-        )
-    if steps:
-        left, right, drop = max(steps, key=lambda step: step[2])
-        if drop > 0:
-            parts.append(
-                f"相邻量级之间落差最大的是 **{left['grade']}→{right['grade']}**"
-                f"（{_fmt(left['TS'])} → {_fmt(right['TS'])}，掉 {_fmt(drop)}），"
-                f"技巧的断崖就出现在这一档之间。"
-            )
-
-    business = [entry for entry in usable if entry["TS"] >= 0.2]
-    if business:
-        best = business[-1]
-        parts.append(
-            f"以 TS ≥ 0.2（🟡 及以上）作为最低可用门槛，可用量级最高到 {best['grade']}mm"
-            f"（TS {_fmt(best['TS'])}），再往上不具备定量判别能力。"
-        )
-    else:
-        parts.append("没有任何量级达到 TS ≥ 0.2，全部等级都不满足最低可用门槛。")
-
-    first, last = usable[0], usable[-1]
-    if first["events"] > 0 and 0 < last["events"] < first["events"]:
-        ratio = first["events"] / last["events"]
-        parts.append(
-            f"观测事件数从 {first['grade']}mm 的 {first['events']:,} 次收缩到 "
-            f"{last['grade']}mm 的 {last['events']:,} 次"
-            + (f"（约 1/{ratio:.0f}）" if ratio >= 10 else "")
-            + "，高量级的统计不确定性随之放大，其 TS 的小数位不宜过度解读。"
-        )
-    return "".join(parts)
-
-
-def analysis_by_lead(summary: Dict[str, object], *, floor: float = 0.10) -> str:
-    """第三节小结：时效维度——有效时效上限、单调性、平台期、衰减速度。"""
-    pivot = summary.get("pivot")
-    leads = list(summary.get("leads") or [])
-    if pivot is None or len(pivot.index) < 2 or len(leads) < 2:
-        return "时效点不足两个，无法判断技巧的时效衰减。"
-
-    limits: List[tuple] = []
-    for grade in pivot.columns:
-        series = pivot[grade].dropna()
-        below = series[series < floor]
-        limits.append((str(grade), float(below.index.min()) if len(below) else None))
-
-    parts: List[str] = []
-    broken = [(grade, lead) for grade, lead in limits if lead is not None]
-    kept = [grade for grade, lead in limits if lead is None]
-    if broken:
-        detail = "、".join(f"{grade}mm 在 {lead:g}h" for grade, lead in broken)
-        parts.append(
-            f"以 **TS 首次跌破 {floor:g}** 作为「有效时效上限」：{detail} 已跌破"
-            + (f"；{'、'.join(f'{grade}mm' for grade in kept)} 全程未跌破。" if kept else "。")
-        )
-    else:
-        parts.append(
-            f"全部等级到 {leads[-1]:g}h 都未跌破 {floor:g}，时效衰减不构成本次评估的限制因素。"
-        )
-
-    curve = pivot.mean(axis=1).dropna()
-    if len(curve) >= 2:
-        steps = curve.diff().dropna()
-        rises = steps[steps > 0.005]
-        if rises.empty:
-            parts.append(
-                f"各等级等权平均的 TS 随时效**单调下降**"
-                f"（{curve.index[0]:g}h 的 {_fmt(curve.iloc[0])} → "
-                f"{curve.index[-1]:g}h 的 {_fmt(curve.iloc[-1])}）。"
-            )
-        else:
-            parts.append(
-                f"等权平均 TS 总体随时效下降，但在 {float(rises.idxmax()):g}h 出现 "
-                f"+{_fmt(float(rises.max()))} 的回升，属于抽样波动而非真实的技巧反转。"
-            )
-        tail = steps.tail(3)
-        if len(tail) == 3 and bool((tail.abs() < 0.005).all()):
-            parts.append(
-                f"最后三个时效区间（{float(tail.index[0]):g}–{curve.index[-1]:g}h）的相邻变化都小于 0.005，"
-                f"技巧已进入平台期：再往后延长时间不会带来等比例的进一步损失。"
-            )
-
-    decay = summary.get("decay") or {}
-    if decay and np.isfinite(decay.get("relative", np.nan)):
-        judge = (
-            "相对衰减已超过 50%，长时效技巧明显退化，结论应限定在较短时效内。"
-            if decay["relative"] > 0.5
-            else "相对衰减未超过 50%，长时效仍保有一定技巧。"
-        )
-        parts.append(
-            f"整体来看，等权平均 TS 从 {decay['first_lead']:g}h 的 {_fmt(decay['first_ts'])} 降到 "
-            f"{decay['last_lead']:g}h 的 {_fmt(decay['last_ts'])}：绝对衰减 {_fmt(decay['drop'])}、"
-            f"相对衰减 {decay['relative']:.0%}、约 {_fmt(decay['per_day'])}/天。{judge}"
-        )
-
-    speeds = []
-    for grade in pivot.columns:
-        series = pivot[grade].dropna()
-        if len(series) >= 2 and series.iloc[0] > 0:
-            speeds.append((str(grade), float((series.iloc[0] - series.iloc[-1]) / series.iloc[0])))
-    speeds = [item for item in speeds if item[1] > 0]
-    if speeds:
-        grade, relative = max(speeds, key=lambda item: item[1])
-        parts.append(f"逐等级比较，相对衰减最快的是 {grade}mm（{relative:.0%}）。")
-    return "".join(parts)
-
-
-def analysis_error_structure(grades: Sequence[Dict[str, object]]) -> str:
-    """第四节小结：误差形态——空报与漏报谁主导、在哪一档反转、BIAS 的走向。"""
-    parts: List[str] = []
-    pairs = [
-        entry for entry in grades
-        if np.isfinite(entry.get("FAR", np.nan)) and np.isfinite(entry.get("漏报率", np.nan))
-    ]
-    if not pairs:
-        parts.append("FAR 与漏报率在各等级上都不可用，无法判断误差形态。")
-    else:
-        dominant = [entry["FAR"] > entry["漏报率"] for entry in pairs]
-        flips = [
-            index for index in range(1, len(dominant)) if dominant[index] != dominant[index - 1]
+    对比表只写分数、不写样本量，而各份来源的起报日数可以差一个量级。不写出来，
+    读者会把样本最少的那份的名次当成结论。样本数取**最小阈值档的全时效合计**，
+    与 §2「最小阈值档配对样本」列同口径。
+    """
+    entries = [(str(name), int(value)) for name, value in (coverage or {}).items() if value]
+    if len(entries) < 2:
+        return ["本批只有一份来源，样本量见第 2 节的样本覆盖表；不存在跨来源的样本量差异。"]
+    values = [value for _, value in entries]
+    if max(values) == min(values):
+        return [
+            f"各模型的配对样本一致（{values[0]:,}，最小阈值档全时效合计），"
+            f"样本量不构成名次差异的来源。"
         ]
-        if not flips:
-            kind = "空报" if dominant[0] else "漏报"
-            span = (
-                f"{pairs[0]['grade']}–{pairs[-1]['grade']}mm"
-                if len(pairs) > 1
-                else f"{pairs[0]['grade']}mm"
-            )
-            parts.append(f"{span} 全部以**{kind}为主**，误差形态在量级之间没有反转。")
-        else:
-            index = flips[0]
-            before, after = pairs[index - 1], pairs[index]
-            parts.append(
-                f"误差形态在 {before['grade']} 与 {after['grade']} 之间**发生反转**："
-                f"{before['grade']} 以空报为主（FAR {_fmt(before['FAR'])} > 漏报率 {_fmt(before['漏报率'])}），"
-                f"{after['grade']} 转为漏报为主（漏报率 {_fmt(after['漏报率'])} > FAR {_fmt(after['FAR'])}）。"
-            )
-            if len(flips) > 1:
-                parts.append(
-                    f"整条量级链上共有 {len(flips)} 处反转，说明该模型没有贯穿各量级的一致误差倾向，"
-                    f"订正策略需要分档设定。"
-                )
-        entry = max(pairs, key=lambda item: abs(item["FAR"] - item["漏报率"]))
-        kind = "空报" if entry["FAR"] > entry["漏报率"] else "漏报"
-        parts.append(
-            f"空报与漏报相差最悬殊的是 {entry['grade']}mm"
-            f"（FAR {_fmt(entry['FAR'])} 对漏报率 {_fmt(entry['漏报率'])}，{kind}主导）。"
-        )
-
-    biases = [entry for entry in grades if np.isfinite(entry.get("BIAS", np.nan))]
-    if biases:
-        low, high = biases[0], biases[-1]
-        closest = min(biases, key=lambda item: abs(item["BIAS"] - 1.0))
-        drift = high["BIAS"] - low["BIAS"]
-        trend = (
-            "随量级升高而下降" if drift < -0.05
-            else ("随量级升高反而上升" if drift > 0.05 else "在各量级之间大致持平")
-        )
-        parts.append(
-            f"BIAS 从 {low['grade']}mm 的 {_fmt(low['BIAS'])} 变到 {high['grade']}mm 的 "
-            f"{_fmt(high['BIAS'])}（{trend}）；最接近理想值 1 的是 {closest['grade']}mm"
-            f"（{_fmt(closest['BIAS'])}）。"
-        )
-        if low["BIAS"] > 1.1 and high["BIAS"] < 0.9:
-            parts.append(
-                "**小雨偏多、强降水偏少**，这是空间过度平滑的典型征兆："
-                "模式把小尺度强中心抹成了大范围弱降水，既抬高小雨的空报，也吃掉强降水的命中。"
-            )
-    return "".join(parts) or "误差形态与偏差结构均不可评定。"
-
-
-def analysis_stability(
-    models: Dict[str, pd.DataFrame], primary: str, metric: str = "TS"
-) -> str:
-    """第五节小结：跨时效稳定性——谁最稳、离群时效落在哪、两种口径的名次是否一致。"""
-    per_model: Dict[str, List[Dict[str, object]]] = {}
-    for name, frame in models.items():
-        rows = [row for row in box_stats_by_grade(frame, metric=metric) if row["n"]]
-        if rows:
-            per_model[name] = rows
-    if not per_model:
-        return "各模型在各量级上都没有有效样本，无法评估跨时效稳定性。"
-
-    parts: List[str] = []
-    spread = {
-        name: float(np.median([row["iqr"] for row in rows]))
-        for name, rows in per_model.items()
-    }
-    ranked = sorted(spread, key=lambda name: spread[name])
-    if len(ranked) == 1:
-        parts.append(
-            f"单模型评估：{ranked[0]} 各量级 IQR 的中位数为 {_fmt(spread[ranked[0]])}，"
-            f"这是本次评估的跨时效稳定性基准。"
-        )
-    elif spread[ranked[-1]] - spread[ranked[0]] < 0.01:
-        parts.append(
-            f"各模型的跨时效稳定性接近（IQR 中位数 {_fmt(spread[ranked[0]])}–"
-            f"{_fmt(spread[ranked[-1]])}，极差不足 0.01），稳定性不构成它们之间的区分度。"
-        )
-    else:
-        parts.append(
-            f"按各量级 IQR 的中位数排序，跨时效最稳定的是 **{ranked[0]}**"
-            f"（{_fmt(spread[ranked[0]])}），最不稳定的是 **{ranked[-1]}**"
-            f"（{_fmt(spread[ranked[-1]])}）——箱体越窄，说明该模型各时效的技巧越均衡。"
-        )
-
-    outliers = sorted(
-        {float(lead) for row in per_model.get(primary, []) for lead in row["outlier_leads"]}
+    detail = "、".join(f"{name} {value:,}" for name, value in entries)
+    lowest = min(entries, key=lambda item: item[1])
+    highest = max(entries, key=lambda item: item[1])
+    ratio = lowest[1] / highest[1] if highest[1] else float("nan")
+    if ratio >= 0.9:
+        return [
+            f"各模型的配对样本**基本一致**（{detail}；最少的是最多的 {ratio:.1%}），"
+            f"样本量不构成名次差异的来源。"
+        ]
+    text = (
+        f"**各模型的实测覆盖并不齐**（最小阈值档的全时效配对样本数）：{detail}。"
+        f"站点数每天大体固定，这组数的比值基本就是各份起报日数的比值"
+        f"（最少的是最多的 {ratio:.1%}）。"
     )
-    if outliers and primary in models:
-        all_leads = sorted(float(value) for value in pd.unique(models[primary]["lead_h"]))
-        middle = (all_leads[0] + all_leads[-1]) / 2
-        early = sum(1 for lead in outliers if lead <= middle)
-        where = (
-            "短时效段" if early * 2 > len(outliers)
-            else ("长时效段" if early * 2 < len(outliers) else "首尾两端")
+    if ratio < 0.5:
+        text += (
+            f"{lowest[0]} 的抽样波动明显更大，它的名次不宜当结论用。"
         )
-        shown = "、".join(f"{lead:g}h" for lead in outliers[:6])
-        parts.append(
-            f"{primary} 的离群时效共 {len(outliers)} 个（{shown}"
-            + ("…" if len(outliers) > 6 else "")
-            + f"），偏向{where}——这些时效的技巧与其余时效明显脱节，"
-            f"只看等权平均会把这种脱节抹平。"
-        )
-    elif primary in models:
-        parts.append(f"{primary} 的各量级都没有离群时效，TS 的跨时效分布连续、没有突变的时效点。")
-
-    flips = []
-    for grade in ordered_grades(list(models.values())):
-        medians: Dict[str, float] = {}
-        means: Dict[str, float] = {}
-        for name, frame in models.items():
-            subset = frame[frame["grade"].astype(str) == grade]
-            values = pd.to_numeric(subset[metric], errors="coerce").dropna()
-            if values.empty:
-                continue
-            medians[name] = float(values.median())
-            means[name] = float(values.mean())
-        if len(medians) < 2:
-            continue
-        by_median = max(medians, key=medians.get)
-        by_mean = max(means, key=means.get)
-        if by_median != by_mean:
-            flips.append((grade, by_median, by_mean))
-    if flips:
-        detail = "、".join(
-            f"{grade}（中位数 {left} 领先、等权平均 {right} 领先）" for grade, left, right in flips
-        )
-        parts.append(
-            f"**注意口径**：{detail}。本节表里的统计量是中位数/IQR，第二节表里的是等权平均，"
-            f"两者给出不同的领先者是正常现象（前者抗离群、后者被离群时效拉动），不可互相替代。"
-        )
-    return "".join(parts)
+    return [text]
 
 
-def analysis_comparison(
-    data: pd.DataFrame, comparisons: Dict[str, pd.DataFrame], lead: float
-) -> str:
-    """第六节小结：对比维度——谁在哪些量级领先、名次是否随量级翻转、差距分布。
-
-    ``comparisons`` 既可以是多个对比模型，也可以是单个基准——单基准时
-    「领先者随量级翻转」照样能看出两者的互补性，所以两种分支共用这一个函数。
-    """
-    frames: Dict[str, pd.DataFrame] = {"本模型": data, **comparisons}
-    table: Dict[str, Dict[str, float]] = {}
-    for grade in ordered_grades(list(frames.values())):
-        row: Dict[str, float] = {}
-        for name, frame in frames.items():
-            subset = frame[
-                (pd.to_numeric(frame["lead_h"], errors="coerce") == lead)
-                & (frame["grade"].astype(str) == grade)
-            ]
-            values = pd.to_numeric(subset["TS"], errors="coerce").dropna()
-            if len(values):
-                row[name] = float(values.iloc[0])
-        if len(row) >= 2:
-            table[grade] = row
-    if not table:
-        return f"{lead:g}h 时效上没有两个及以上对象同时有有效 TS，无法比较。"
-
-    parts: List[str] = []
-    # 差距小于 0.005 视为并列——和 `_baseline_table` 里 ↑/↓/≈ 的门槛同一个数，
-    # 免得表里写着「≈」、正文却说某一方领先。
-    def _tie(row: Dict[str, float]) -> bool:
-        order = sorted(row.values(), reverse=True)
-        return len(order) > 1 and order[0] - order[1] < 0.005
-
-    tied = [grade for grade, row in table.items() if _tie(row)]
-    winners = {
-        grade: max(row, key=row.get) for grade, row in table.items() if grade not in tied
+def _consistency_sentences(models: Dict[str, pd.DataFrame]) -> List[str]:
+    """各模型的时效/等级/阈值集合是否一致；不一致时逐条写明差在哪。"""
+    leads = {
+        name: tuple(sorted(float(v) for v in pd.unique(frame["lead_h"])))
+        for name, frame in models.items()
     }
-    if not winners:
-        parts.append(
-            f"各对象在 {lead:g}h、各量级上的差距都小于 0.005，视为并列，无法据此分出高下。"
+    grades = {
+        name: tuple(str(v) for v in ordered_grades([frame])) for name, frame in models.items()
+    }
+    thresholds = {
+        name: tuple(
+            sorted({
+                float(value)
+                for value in pd.to_numeric(
+                    frame.get("threshold_mm", pd.Series(dtype=float)), errors="coerce"
+                ).dropna()
+            })
+        )
+        for name, frame in models.items()
+    }
+    lines: List[str] = []
+    if len(set(leads.values())) == 1:
+        values = next(iter(leads.values()))
+        lines.append(
+            f"各模型的时效集合一致（{values[0]:g}–{values[-1]:g}h，共 {len(values)} 个），"
+            f"横向比较不受时效口径差影响。"
         )
     else:
-        counts: Dict[str, int] = {}
-        for winner in winners.values():
-            counts[winner] = counts.get(winner, 0) + 1
-        if len(counts) == 1:
-            only = next(iter(counts))
-            parts.append(
-                f"{lead:g}h 时效上，**{only}** 在全部 {len(winners)} 个可分出高下的量级上都领先。"
-            )
-        else:
-            detail = "、".join(f"{grade} 由{winner}领先" for grade, winner in winners.items())
-            parts.append(f"{lead:g}h 时效上的领先者随量级变化：{detail}。")
-    if tied:
-        # 并列要说清是"谁和谁并列"——只写"各对象并列"会把差距明显的第三名也算进去
         detail = "；".join(
-            f"{grade} 的前两名 "
-            + "与".join(
-                f"{name}（{table[grade][name]:.3f}）"
-                for name in sorted(table[grade], key=table[grade].get, reverse=True)[:2]
-            )
-            for grade in tied
+            f"{name} {len(value)} 个（{value[0]:g}–{value[-1]:g}h）"
+            for name, value in leads.items()
         )
-        parts.append(f"{detail} 差距不足 0.005，分不出领先者。")
+        lines.append(f"**各模型的时效集合并不一致**：{detail}。横向比较只在共同时效上有意义。")
+    if len(set(grades.values())) == 1:
+        values = next(iter(grades.values()))
+        lines.append(
+            f"各模型的降水等级一致（{'、'.join(values)}），逐等级对比同源。"
+        )
+    else:
+        detail = "；".join(
+            f"{name} {'、'.join(value)}" for name, value in grades.items()
+        )
+        lines.append(f"**各模型的降水等级集合并不一致**：{detail}。缺档的模型在该等级上记 —。")
+    if len(set(thresholds.values())) > 1:
+        detail = "；".join(
+            f"{name} {'/'.join(f'{v:g}' for v in value) or '—'}mm"
+            for name, value in thresholds.items()
+        )
+        lines.append(f"阈值集合不一致：{detail}。")
+    return lines
 
-    sequence = list(winners.items())
-    crossovers = [
-        index for index in range(1, len(sequence)) if sequence[index][1] != sequence[index - 1][1]
+
+def _heavy_threshold(models: Dict[str, pd.DataFrame]) -> Optional[float]:
+    """强降水档的门槛，**全批取同一个**；缺这一档的模型按缺值处理。"""
+    thresholds = set()
+    for frame in models.values():
+        if "threshold_mm" not in frame.columns:
+            continue
+        values = pd.to_numeric(frame["threshold_mm"], errors="coerce").dropna()
+        thresholds |= {float(value) for value in values if float(value) >= HEAVY_RAIN_THRESHOLD}
+    return min(thresholds) if thresholds else None
+
+
+def _heavy_entry(summary: Dict[str, object], heavy: Optional[float]) -> Optional[Dict[str, object]]:
+    if heavy is None:
+        return None
+    for entry in summary["grades"]:
+        if entry["threshold"] is not None and np.isclose(float(entry["threshold"]), heavy):
+            return entry
+    return None
+
+
+def _mean_iqr(frame: pd.DataFrame, metric: str = "TS") -> float:
+    """各等级跨时效 IQR 的等权平均。"""
+    values = [
+        float(box_stats(frame[frame["grade"].astype(str) == grade], metric)["iqr"])
+        for grade in ordered_grades([frame])
     ]
-    if crossovers:
-        index = crossovers[0]
-        before, after = sequence[index - 1], sequence[index]
-        parts.append(
-            f"名次在 {before[0]} 与 {after[0]} 之间**发生翻转**（领先者由{before[1]}变为"
-            f"{after[1]}）——两者的优势区间不同，只报一个跨量级平均值会把这种互补性掩盖掉。"
-        )
-        if len(crossovers) > 1:
-            parts.append(f"整条量级链上共出现 {len(crossovers)} 处领先者交替。")
-
-    gaps: Dict[str, float] = {}
-    for grade, row in table.items():
-        if "本模型" in row:
-            others = [value for name, value in row.items() if name != "本模型"]
-            if others:
-                gaps[grade] = row["本模型"] - max(others)
-    # 各量级的差距都一样（比如全部并列）时，这句话不含信息，不如不说
-    if gaps and max(gaps.values()) - min(gaps.values()) >= 0.005:
-        best = max(gaps, key=gaps.get)
-        worst = min(gaps, key=gaps.get)
-        parts.append(
-            f"以最强的对比对象为参照，本模型相对领先最多的是 {best}（{gaps[best]:+.3f}）、"
-            f"相对落后最多的是 {worst}（{gaps[worst]:+.3f}）。"
-        )
-
-    # 名次只在分得出高下的量级上算——并列的量级硬排名次就是在报告噪声
-    ranks = []
-    for grade in winners:
-        row = table[grade]
-        if "本模型" in row:
-            better = sum(1 for value in row.values() if value > row["本模型"] + 1e-12)
-            ranks.append(better + 1)
-    if ranks:
-        widest = max(len(row) for row in table.values())
-        parts.append(f"本模型在 {len(ranks)} 个量级上的平均名次为 {np.mean(ranks):.1f}/{widest}。")
-    return "".join(parts)
+    values = [value for value in values if np.isfinite(value)]
+    return float(np.mean(values)) if values else float("nan")
 
 
-def analysis_probability(summaries: Dict[str, Dict[str, object]]) -> str:
-    """第六节小结：区分能力、Brier 技巧的正负与走向、高阈值档的样本、AVG 的时效衰减。
-
-    与其余 ``analysis_*`` 同一条规矩：只吃 ``probability_summary`` 已经算好的数字，
-    不重新读表；每句话都要带具体数值，写不出结论时如实说。
-    """
-    if not summaries:
-        return "没有概率评分结果，本节无法给出定量分析。"
-    names = list(summaries)
-    primary = names[0]
-    rows = summaries[primary]["rows"]
-    average = summaries[primary]["average"]
-    parts: List[str] = []
-
-    usable = [entry for entry in rows if np.isfinite(entry.get("AROC", np.nan))]
-    if usable:
-        best = max(usable, key=lambda item: item["AROC"])
-        worst = min(usable, key=lambda item: item["AROC"])
-        below = [entry for entry in usable if entry["AROC"] <= 0.5]
-        head = (
-            f"{primary} 各档 AROC 在 {_fmt(worst['AROC'])}–{_fmt(best['AROC'])} 之间，"
-        )
-        if below:
-            head += (
-                "其中 " + "、".join(entry["grade"] for entry in below)
-                + " 未超过 0.5 的无技巧线，这几档的概率预报分不开事件与非事件；"
-            )
-        else:
-            head += (
-                f"全部高于 0.5 的无技巧线（最低的 {worst['grade']} 档高出 "
-                f"{_fmt(worst['AROC'] - 0.5)}）；"
-            )
-        parts.append(
-            head + f"区分能力最强的是 {best['grade']}（{_fmt(best['AROC'])}）。"
-        )
-
-    scored = [entry for entry in rows if np.isfinite(entry.get("BSS", np.nan))]
-    if scored:
-        positive = [entry for entry in scored if entry["BSS"] > 0]
-        best = max(scored, key=lambda item: item["BSS"])
-        worst = min(scored, key=lambda item: item["BSS"])
-        parts.append(
-            f"BSS 有 {len(positive)}/{len(scored)} 档为正：最好的是 {best['grade']}"
-            f"（{_fmt(best['BSS'])}），最差的是 {worst['grade']}（{_fmt(worst['BSS'])}）。"
-        )
-        if worst["BSS"] < 0:
-            parts.append(
-                f"{worst['grade']} 档为负，说明这一档的概率预报**还不如气候基准**——"
-                f"它的 BS {_fmt(worst['BS'])} 高于 BS_ref {_fmt(worst['BS_ref'])}，"
-                f"即预报概率的分布比「一律报基准率 {_fmt(worst['base_rate'])}」还差。"
-            )
-
-    if rows:
-        lightest, heaviest = rows[0], rows[-1]
-        # 各档的 ``n_points`` 是**同一个数**（阈值只改事件的定义，不改配对点），
-        # 真正随量级收缩的是**事件次数** = n_points × 基准率。写成「样本量收缩」
-        # 是错的，而且两档数字并排一样，一眼就露馅。
-        if (
-            lightest is not heaviest
-            and lightest.get("n_points")
-            and np.isfinite(lightest.get("base_rate", np.nan))
-            and np.isfinite(heaviest.get("base_rate", np.nan))
-            and heaviest["base_rate"] > 0
-        ):
-            ratio = lightest["base_rate"] / heaviest["base_rate"]
-            extra = f"（约 {ratio:.0f} 分之一）" if ratio >= 2 else ""
-            parts.append(
-                f"各档的样本点数相同（{lightest['n_points']:,} 对——阈值只改事件的定义、"
-                f"不改配对点），但**事件次数**随量级急剧收缩：{lightest['grade']} 档的"
-                f"基准率 {_fmt(lightest['base_rate'])}、{heaviest['grade']} 档只剩 "
-                f"{_fmt(heaviest['base_rate'])}{extra}"
-                f"——高阈值档的 AROC/BSS 波动更大，小数位不宜过度解读。"
-            )
-
-    by_lead = summaries[primary].get("by_lead")
-    if by_lead is not None and len(by_lead) >= 2:
-        first_lead, last_lead = float(by_lead.index[0]), float(by_lead.index[-1])
-        aroc_first, aroc_last = float(by_lead["AROC"].iloc[0]), float(by_lead["AROC"].iloc[-1])
-        bss_first, bss_last = float(by_lead["BSS"].iloc[0]), float(by_lead["BSS"].iloc[-1])
-        parts.append(
-            f"AVG 档随时效：AROC 从 {first_lead:g}h 的 {_fmt(aroc_first)} 变到 "
-            f"{last_lead:g}h 的 {_fmt(aroc_last)}（{aroc_last - aroc_first:+.3f}），"
-            f"BSS 从 {_fmt(bss_first)} 变到 {_fmt(bss_last)}（{bss_last - bss_first:+.3f}）——"
-            + (
-                "区分能力随时效退化，长时效的结论同样要限定范围。"
-                if aroc_last < aroc_first
-                else "区分能力并不随时效单调下降，这时段内的分档主要由样本波动支配。"
-            )
-        )
-
-    if len(names) > 1:
-        pool = {
-            name: summary["average"]
-            for name, summary in summaries.items()
-            if np.isfinite(summary["average"].get("AROC", np.nan))
-            and np.isfinite(summary["average"].get("BSS", np.nan))
+def overview_metrics(models: Dict[str, pd.DataFrame]) -> Dict[str, Dict[str, float]]:
+    """总体表的四个统计量（逐模型）：综合 TS、强降水 TS、|BIAS−1|、跨时效 IQR。"""
+    heavy = _heavy_threshold(models)
+    result: Dict[str, Dict[str, float]] = {}
+    for name, frame in models.items():
+        summary = summarize(frame)
+        grades = summary["grades"]
+        heavy_entry = _heavy_entry(summary, heavy)
+        biases = [
+            abs(float(entry["BIAS"]) - 1.0)
+            for entry in grades
+            if np.isfinite(entry.get("BIAS", np.nan))
+        ]
+        result[name] = {
+            "ts": float(summary["overall_ts"]),
+            "heavy": float("nan") if heavy_entry is None else float(heavy_entry["TS_sum"]),
+            "bias": float(np.mean(biases)) if biases else float("nan"),
+            "iqr": _mean_iqr(frame),
         }
-        if len(pool) >= 2:
-            best_aroc = max(pool, key=lambda name: pool[name]["AROC"])
-            best_bss = max(pool, key=lambda name: pool[name]["BSS"])
-            parts.append(
-                f"AVG 档上 AROC 最高的是 {best_aroc}（{_fmt(pool[best_aroc]['AROC'])}）、"
-                f"BSS 最高的是 {best_bss}（{_fmt(pool[best_bss]['BSS'])}）。"
-                f"各模型的概率样本量并不相同（见「样本点数」列），样本少的那个名次波动更大。"
+    return result
+
+
+def average_ranks(models: Dict[str, pd.DataFrame]) -> Dict[str, float]:
+    """按「等级 × 时效」逐格竞争排名（1 = 该格最好），再对各格取平均。
+
+    只在同一格有 ≥2 个模型有有效值时计名次；缺值不计、不拿 0 顶替。
+    """
+    collected: Dict[str, List[float]] = {name: [] for name in models}
+    grades = ordered_grades(list(models.values()))
+    for grade in grades:
+        series = {
+            name: frame[frame["grade"].astype(str) == grade]
+            .set_index("lead_h")["TS"]
+            .apply(pd.to_numeric, errors="coerce")
+            for name, frame in models.items()
+        }
+        leads = sorted({float(lead) for value in series.values() for lead in value.index})
+        for lead in leads:
+            values = {
+                name: float(value.get(lead, np.nan))
+                for name, value in series.items()
+            }
+            values = {name: value for name, value in values.items() if np.isfinite(value)}
+            if len(values) < 2:
+                continue
+            for name, value in values.items():
+                collected[name].append(1 + sum(1 for other in values.values() if other > value + 1e-12))
+    return {
+        name: float(np.mean(values)) if values else float("nan")
+        for name, values in collected.items()
+    }
+
+
+def _leaders(values: Dict[str, float], higher: bool = True) -> set:
+    """按**显示精度**判并列：表上一样的两家不会在文字里分高下。"""
+    finite = {name: float(value) for name, value in values.items() if np.isfinite(value)}
+    if not finite:
+        return set()
+    best = max(finite.values()) if higher else min(finite.values())
+    key = fmt_number(best)
+    return {name for name, value in finite.items() if fmt_number(value) == key}
+
+
+def _closest_to_one(values: Dict[str, float]) -> set:
+    finite = {name: float(value) for name, value in values.items() if np.isfinite(value)}
+    if not finite:
+        return set()
+    best = min(abs(value - 1.0) for value in finite.values())
+    key = fmt_number(abs(best))
+    return {name for name, value in finite.items() if fmt_number(abs(value - 1.0)) == key}
+
+
+def _best_cell(name: str, leaders: set, value: float) -> str:
+    text = fmt_number(value)
+    return f"**{text}**" if name in leaders else text
+
+
+def _best_names(leaders: set) -> str:
+    return "、".join(sorted(leaders)) if leaders else "—"
+
+
+# --------------------------------------------------------------------------- #
+# 表格
+# --------------------------------------------------------------------------- #
+def _grade_metric_table(
+    models: Dict[str, pd.DataFrame],
+    summaries: Dict[str, Dict[str, object]],
+    *,
+    key: str,
+    best_label: str,
+    closer: bool = False,
+    lower: bool = False,
+) -> str:
+    """行 = 降水等级，列 = 各模型 + 最佳。
+
+    ``closer`` 用于 BIAS（按离 1 的距离判），``lower`` 用于 FAR（越低越好）。
+    """
+    names = list(models)
+    grades = ordered_grades(list(models.values()))
+    rows: List[List[str]] = []
+    for grade in grades:
+        values: Dict[str, float] = {}
+        threshold = None
+        for name in names:
+            entry = next(
+                (item for item in summaries[name]["grades"] if item["grade"] == grade),
+                None,
             )
+            if entry is None:
+                continue
+            threshold = entry["threshold"]
+            values[name] = float(entry.get(key, np.nan))
+        if closer:
+            leaders = _closest_to_one(values)
+        else:
+            leaders = _leaders(values, higher=not lower)
+        cells = [_best_cell(name, leaders, values.get(name, np.nan)) for name in names]
+        rows.append([grade, _threshold_cell(threshold), *cells, _best_names(leaders)])
+    header = (
+        ["降水等级", "阈值(mm)"]
+        + names
+        + [best_label]
+    )
+    return "\n".join(table_lines(header, rows))
 
-    if np.isfinite(average.get("AROC", np.nan)):
-        parts.append(
-            f"{primary} 的 AVG 档：AROC {_fmt(average['AROC'])}、BSS {_fmt(average['BSS'])}"
-            f"（对 {average['n_grades']} 个可算阈值等权平均）。"
-        )
-    return "".join(parts) or "概率评分的各档取值都不可用，本节无法给出定量分析。"
 
-
-def _lead_table(pivot: pd.DataFrame) -> str:
-    columns = [str(column) for column in pivot.columns]
-    lines = ["| 时效(h) | " + " | ".join(columns) + " |", "|---|" + "---|" * len(columns)]
-    for lead, row in pivot.iterrows():
-        values = " | ".join(_fmt(row[column]) for column in pivot.columns)
-        lines.append(f"| {lead:g} | {values} |")
-    return "\n".join(lines)
-
-
-def _baseline_table(data: pd.DataFrame, baseline: pd.DataFrame, lead: float) -> str:
-    left = data[data["lead_h"] == lead].set_index("grade")["TS"]
-    right = baseline[baseline["lead_h"] == lead].set_index("grade")["TS"]
-    lines = [
-        "| 降水等级 | 本模型 TS | 对比模型 TS | 差值 |",
-        "|---|---|---|---|",
+def _grade_counts_table(summary: Dict[str, object]) -> str:
+    rows = [
+        [
+            entry["grade"],
+            str(entry["hits"]),
+            str(entry["misses"]),
+            str(entry["false_alarms"]),
+            f"{entry['n_pairs']:,}",
+        ]
+        for entry in summary["grades"]
     ]
-    for grade in left.index:
-        if grade in right.index:
-            delta = float(left[grade]) - float(right[grade])
-            flag = "↑" if delta > 0.005 else ("↓" if delta < -0.005 else "≈")
-            lines.append(
-                f"| {grade} | {_fmt(left[grade])} | {_fmt(right[grade])} | {flag} {delta:+.3f} |"
-            )
-    return "\n".join(lines)
+    return "\n".join(
+        table_lines(["降水等级", "命中", "漏报", "空报", "样本合计"], rows)
+    )
+
+
+def _lead_mean_values(models: Dict[str, pd.DataFrame]) -> pd.DataFrame:
+    """index = 时效，columns = 模型，值 = 该时效各降水等级 TS 的等权平均。"""
+    series = {}
+    for name, frame in models.items():
+        values = (
+            frame.groupby("lead_h")["TS"].mean().sort_index()
+        )
+        series[name] = values
+    table = pd.DataFrame(series)
+    table.index = [float(index) for index in table.index]
+    return table.sort_index()
+
+
+def _lead_mean_table(models: Dict[str, pd.DataFrame]) -> str:
+    table = _lead_mean_values(models)
+    rows: List[List[str]] = []
+    for lead, row in table.iterrows():
+        values = {name: float(row.get(name, np.nan)) for name in table.columns}
+        leaders = _leaders(values)
+        cells = [_best_cell(name, leaders, values[name]) for name in table.columns]
+        rows.append([f"{float(lead):g}", *cells, _best_names(leaders)])
+    return "\n".join(
+        table_lines(["时效(h)", *list(table.columns), "最佳"], rows)
+    )
+
+
+def _lead_decay_table(models: Dict[str, pd.DataFrame]) -> str:
+    """逐模型的首末时效技巧与衰减幅度（**不列全时效**，全表在 §5）。"""
+    table = _lead_mean_values(models)
+    if table.empty:
+        return "\n".join(table_lines(["模型", "有效时效"], [["—", "0"]]))
+    rows: List[List[str]] = []
+    for name in table.columns:
+        series = table[name].dropna()
+        if series.empty:
+            rows.append([name, "—", "—", "—", "—", "—"])
+            continue
+        start, end = float(series.iloc[0]), float(series.iloc[-1])
+        drop = start - end
+        relative = drop / start if start else float("nan")
+        below = series[series < USABLE_TS]
+        first_below = f"{float(below.index[0]):g}" if len(below) else "—"
+        rows.append([
+            name,
+            f"{fmt_number(start)}（{float(series.index[0]):g}h）",
+            f"{fmt_number(end)}（{float(series.index[-1]):g}h）",
+            fmt_number(drop),
+            f"−{relative:.0%}" if np.isfinite(relative) else "—",
+            first_below,
+        ])
+    return "\n".join(
+        table_lines(
+            ["模型", "首时效TS（时效）", "末时效TS（时效）", "绝对下降",
+             "相对下降", f"首次低于{USABLE_TS:g}的时效(h)"],
+            rows,
+        )
+    )
+
+
+def _performance_table(models: Dict[str, pd.DataFrame], lead: float) -> str:
+    rows: List[List[str]] = []
+    for name, frame in models.items():
+        subset = frame[pd.to_numeric(frame["lead_h"], errors="coerce") == lead]
+        pod = pd.to_numeric(subset["POD"], errors="coerce").dropna() if "POD" in subset else pd.Series(dtype=float)
+        far = pd.to_numeric(subset["FAR"], errors="coerce").dropna() if "FAR" in subset else pd.Series(dtype=float)
+        pod_value = float(pod.mean()) if len(pod) else float("nan")
+        far_value = float(far.mean()) if len(far) else float("nan")
+        distance = (
+            float(np.hypot(1.0 - pod_value, far_value))
+            if np.isfinite(pod_value) and np.isfinite(far_value)
+            else float("nan")
+        )
+        rows.append([
+            name,
+            fmt_number(pod_value),
+            fmt_number(far_value),
+            fmt_number(1.0 - far_value if np.isfinite(far_value) else float("nan")),
+            fmt_number(distance),
+        ])
+    return "\n".join(
+        table_lines(["模型", "平均POD", "平均FAR", "平均1−FAR", "距右上角"], rows)
+    )
 
 
 def box_stats(data: pd.DataFrame, metric: str = "TS") -> Dict[str, object]:
     """一个箱体的 Tukey 统计量——**与 matplotlib 的 boxplot 同口径**。
 
     样本是"同一模型、同一量级在全部时效上的取值"，一行一个时效。
-    放进 ``ts_report`` 而不是画图模块，是为了让**报告表格和图上箱体同源**：
-    两边都调这个函数，就不存在"表里的中位数和图上的线对不上"。
-
-    返回 ``{"n", "q1", "median", "q3", "iqr", "whisker_lo", "whisker_hi",
-    "outlier_leads", "outlier_values"}``；没有有效值时 ``n=0``、统计量为 ``nan``、列表为空。
-
-    Raises:
-        KeyError: 表里没有 ``metric`` 列。
+    放进 ``ts_report`` 而不是画图模块，是为了让**报告表格和图上箱体同源**。
     """
     if metric not in data.columns:
         raise KeyError(f"结果表里没有指标列 '{metric}'")
@@ -985,7 +741,6 @@ def box_stats(data: pd.DataFrame, metric: str = "TS") -> Dict[str, object]:
         if "lead_h" in data.columns
         else np.full(values.shape, np.nan)
     )
-    # 与 prepare_ts_dataframe 的 dropna(subset=["lead_h","TS"]) 同口径：非有限值一律不算样本
     keep = np.isfinite(values)
     values, leads = values[keep], leads[keep]
 
@@ -1002,8 +757,6 @@ def box_stats(data: pd.DataFrame, metric: str = "TS") -> Dict[str, object]:
     q1, median, q3 = (float(value) for value in np.percentile(values, [25, 50, 75]))
     iqr = q3 - q1
     low_fence, high_fence = q1 - 1.5 * iqr, q3 + 1.5 * iqr
-    # 须线画到"栅栏内最远的点"，不是把极值夹到栅栏上；栅栏内一个点都没有（全是离群点）
-    # 时退回四分位——这是 matplotlib 的规则，不是常见的 max(min, Q1-1.5*IQR) 写法。
     inside = values[(values >= low_fence) & (values <= high_fence)]
     outliers = (values < low_fence) | (values > high_fence)
     return {
@@ -1040,11 +793,7 @@ def box_stats_by_grade(data: pd.DataFrame, metric: str = "TS") -> List[Dict[str,
 
 
 def ordered_grades(frames: Sequence[pd.DataFrame]) -> List[str]:
-    """多张结果表里出现过的降水等级**并集**，按 ``threshold_mm`` 升序。
-
-    缺 ``threshold_mm`` 时退回解析 ``"≥X"`` 文本（``_grade_sort_key`` 已经带了这条路）。
-    各模型的等级集合未必一样（``ts_multi_fuxi_ens`` 就只有 5 档），所以要取并集。
-    """
+    """多张结果表里出现过的降水等级**并集**，按 ``threshold_mm`` 升序。"""
     thresholds: Dict[str, float] = {}
     for frame in frames:
         if "grade" not in frame.columns:
@@ -1070,10 +819,7 @@ def collect_box_models(
     baseline_name: Optional[str] = None,
     baselines: Optional[Dict[str, pd.DataFrame]] = None,
 ) -> Dict[str, pd.DataFrame]:
-    """箱线图画哪些模型：本模型在前，然后是单基准、各对比模型。
-
-    图和表都调这一个函数，免得两边的模型集合悄悄分叉。
-    """
+    """报告里参与对比的模型：本模型在前，然后是单基准、各对比模型。"""
     models: Dict[str, pd.DataFrame] = {model_name: data}
     if baseline_df is not None and baseline_name:
         models[baseline_name] = baseline_df
@@ -1095,17 +841,15 @@ def _box_table(models: Dict[str, pd.DataFrame], metric: str = "TS") -> str:
         for name in names:
             row = stats[name].get(grade)
             if row is None or row["n"] == 0:
-                # 该模型没有这个量级（或全无有效值）：照出一行全 —，和图上那个空槽位对齐。
-                # 五格 —— 对应中位数/IQR/Q1–Q3/须线/离群时效，末格才是时效数 0；
-                # 写成 6 格会多出一列，Markdown 表格跟着错位。
+                # 五格 —— 对应中位数/IQR/Q1–Q3/须线/离群时效，末格才是时效数 0。
                 cells = ["—"] * 5 + ["0"]
             else:
                 leads = "、".join(f"{lead:g}h" for lead in sorted(row["outlier_leads"])) or "—"
                 cells = [
-                    _fmt(row["median"]),
-                    _fmt(row["iqr"]),
-                    f"{_fmt(row['q1'])}–{_fmt(row['q3'])}",
-                    f"{_fmt(row['whisker_lo'])}–{_fmt(row['whisker_hi'])}",
+                    fmt_number(row["median"]),
+                    fmt_number(row["iqr"]),
+                    f"{fmt_number(row['q1'])}–{fmt_number(row['q3'])}",
+                    f"{fmt_number(row['whisker_lo'])}–{fmt_number(row['whisker_hi'])}",
                     leads,
                     str(row["n"]),
                 ]
@@ -1113,60 +857,19 @@ def _box_table(models: Dict[str, pd.DataFrame], metric: str = "TS") -> str:
     return "\n".join(lines)
 
 
-def _multi_baseline_table(
-    data: pd.DataFrame, baselines: Dict[str, pd.DataFrame], lead: float
-) -> str:
-    """一行一个降水等级，一列一个模型（本模型 + 各对比模型）。"""
-    names = list(baselines.keys())
-    left = data[data["lead_h"] == lead].set_index("grade")["TS"]
-    columns = {
-        name: frame[frame["lead_h"] == lead].set_index("grade")["TS"]
-        for name, frame in baselines.items()
-    }
-    header = "| 降水等级 | 本模型 | " + " | ".join(names) + " | 本模型名次 |"
-    lines = [header, "|---|" + "---|" * (len(names) + 2)]
-    for grade in left.index:
-        values = {name: columns[name].get(grade, float("nan")) for name in names}
-        pool = {**{name: float(value) for name, value in values.items() if np.isfinite(value)},
-                "本模型": float(left[grade]) if np.isfinite(left[grade]) else float("nan")}
-        ranked = [name for name, value in pool.items() if np.isfinite(value)]
-        # 并列同名次（competition ranking）：名次 = 比自己高的对象个数 + 1。
-        # 若按 sorted 的下标算，数值相同的两家谁在前全看字典插入顺序，
-        # 表里会出现「3/3」而正文按同一套数据算出「并列第 2」。
-        rank = (
-            1 + sum(1 for value in pool.values() if value > pool["本模型"])
-            if np.isfinite(pool["本模型"]) else 0
-        )
-        cells = " | ".join(_fmt(values[name]) for name in names)
-        lines.append(
-            f"| {grade} | {_fmt(left[grade])} | {cells} | {rank}/{len(ranked) if ranked else 0} |"
-        )
-    return "\n".join(lines)
-
-
-# ------------------------------------------------------------- 概率评分（第六节）
-#
-# 这一节吃的是**另一张表**：``diagnostics/probability_wide.csv``，由
-# ``weather_ts_ens_prob`` 能力写出（6h 累积窗、逐成员概率、需要外部气候概率参考）。
-# 它的窗口与阈值都和 TS 那套不同，所以单独立节、单独编号——见骨架
-# ``assets/templates/weather_ts_ens.md`` 第六节。
-
-
+# ------------------------------------------------------------- 概率评分（§4.7）
 def _members_phrase(members: Optional[int]) -> str:
-    """``51个成员`` / ``集合成员``。
+    """``" 51 个成员"`` / ``"集合成员"``（与 §1「集合每例 51 个成员」同一排版）。
 
-    产物里**没有**成员数（``manifest.json`` 不写这个字段），所以拿不到时老老实实
-    写「集合成员」，不编一个数字出来。拿到时由调用方的 ``--members`` 给。
+    产物里**没有**成员数（``manifest.json`` 不写这个字段），拿不到时老老实实
+    写「集合成员」，不编一个数字出来。数字前带一个空格，是因为两处调用都直接
+    接在中文动词后面（「均在…」「都是…」），中英文之间要留白；没有数字时不留。
     """
-    return f"{int(members)}个成员" if members else "集合成员"
+    return f" {int(members)} 个成员" if members else "集合成员"
 
 
 def load_probability(frame: Optional[pd.DataFrame]) -> Optional[pd.DataFrame]:
-    """校验概率宽表。
-
-    ``None`` 原样返回 ``None``——这份产物没跑概率评分那一段（比如对比模型给的是
-    确定性的裸宽表），第六节整节不出现。给了表但缺列则**报错**：少一列的表算出来的
-    AROC/BSS 与评测流程自己写的不是一回事，宁可停下。
+    """校验概率宽表；``None`` 原样返回，缺列则报错。
 
     Raises:
         ValueError: 表里缺 :data:`PROBABILITY_COLUMNS` 里的列。
@@ -1185,18 +888,7 @@ def load_probability(frame: Optional[pd.DataFrame]) -> Optional[pd.DataFrame]:
 
 
 def probability_summary(frame: pd.DataFrame) -> Dict[str, object]:
-    """单模型的概率评分汇总：逐档一行 + 一行 ``AVG`` + ``by_lead``。
-
-    每一档的取值是**各时效等权平均**——AROC / BSS 没有可加的充分统计量，不像 TS
-    那样能「先合计列联表再算比率」，逐时效平均是这里唯一站得住的做法。
-    ``AVG`` 行再对**可算阈值**等权平均（某档全无有效值时跳过，不拿 0 顶替）。
-    ``n_points`` 是该档**全时效合计**的配对数，与第二节的「样本合计」同口径；
-    ``AVG`` 行的这一格写的是**参与平均的档数**（老表里叫 ``n_used``），
-    不是样本数——它本来就没有单一阈值可数。
-
-    产物自己带的 ``grade="AVG"`` 行**丢掉不要**：那份是产物按它自己的口径折的，
-    与本报告「可算阈值等权平均」未必是同一个数，两行并排会自相矛盾。
-    """
+    """单模型的概率评分汇总：逐档一行 + 一行 ``AVG`` + ``by_lead``。"""
     if "grade" in frame.columns:
         frame = frame[frame["grade"].astype(str) != "AVG"]
 
@@ -1245,7 +937,7 @@ def _probability_window(frame: pd.DataFrame) -> Optional[float]:
 
 
 def _threshold_list(frame: pd.DataFrame) -> str:
-    """``0.1/4/13/25mm``——引用块里要和 TS 的阈值列表并排写，得各自现取。"""
+    """``0.1/4/13/25mm``——引用块里要和 TS 的阈值列表并排写。"""
     values = sorted(
         {float(value) for value in pd.to_numeric(frame["threshold_mm"], errors="coerce").dropna()}
     )
@@ -1253,16 +945,12 @@ def _threshold_list(frame: pd.DataFrame) -> str:
 
 
 def _probability_note(window: Optional[float]) -> str:
-    """概率评分表下的口径引用块——与骨架第六节逐字一致。
-
-    只有累积窗口那一处是变量：骨架写死的 ``6h`` 就是本仓库当前的概率窗口常量，
-    换个窗口这句话会变成假话，所以从表里现取。
-    """
+    """概率评分表下的口径引用块。"""
     span = f"{window:g}h" if window else "概率"
     return (
         f"> BS_ref 是气候基准的 Brier 分数，**只有外部给了气候概率参考的 {span} 窗才有值**，"
         f"其余窗口整列写 —；BSS = 1 − BS/BS_ref。AROC 在**逐成员插值后**按超越式阈值"
-        f'（x ≥ 阈值）计算，与前面章节"插值到站再配对"的做法不是一回事。'
+        f"（x ≥ 阈值）计算，与前面各节「插值到站再配对」的做法不是一回事。"
         f"AVG 行是对**可算阈值**的等权平均（该档无事件的跳过），不是按样本数加权。"
     )
 
@@ -1270,26 +958,20 @@ def _probability_note(window: Optional[float]) -> str:
 def _probability_table(
     summaries: Dict[str, Dict[str, object]], *, with_model: bool
 ) -> str:
-    """概率评分表：一行一个「模型 × 降水等级」，每个模型末尾再加一行 ``AVG``。
-
-    ``with_model`` 由调用方按模型数决定——骨架单模型分支的表头里没有「模型」列，
-    多模型分支才需要它来分清是谁的行。
-    """
+    """概率评分表：一行一个「模型 × 降水等级」，每个模型末尾再加一行 ``AVG``。"""
     header = (["模型"] if with_model else []) + [
         "降水等级", "阈值(mm)", "AROC", "BS", "BS_ref", "BSS", "基准率", "样本点数",
     ]
     lines = ["| " + " | ".join(header) + " |", "|" + "---|" * len(header)]
     for name, summary in summaries.items():
         for entry in list(summary["rows"]) + [summary["average"]]:
-            # AVG 行没有单一阈值/基准率/样本数，那三格写 —；末格改成**参与平均的档数**
-            # （老表里那一列的 ``n_used`` 就是这个意思），比一个空的「—」有信息量。
             cells = [
-                _fmt(entry.get("threshold"), 3),
-                _fmt(entry.get("AROC")),
-                _fmt(entry.get("BS")),
-                _fmt(entry.get("BS_ref")),
-                _fmt(entry.get("BSS")),
-                _fmt(entry.get("base_rate")),
+                _threshold_cell(entry.get("threshold")),
+                fmt_number(entry.get("AROC")),
+                fmt_number(entry.get("BS")),
+                fmt_number(entry.get("BS_ref")),
+                fmt_number(entry.get("BSS")),
+                fmt_number(entry.get("base_rate")),
                 (
                     f"{entry['n_points']:,}" if entry.get("n_points")
                     else (f"{entry['n_grades']} 档" if entry.get("n_grades") else "—")
@@ -1300,437 +982,1210 @@ def _probability_table(
     return "\n".join(lines)
 
 
-def _section_probability(
-    probability: Dict[str, pd.DataFrame],
-    artifacts: Optional[Dict[str, Path]],
-    numbering: _Numbering,
-    *,
-    number: str = "六",
-    members: Optional[int] = None,
-    ts_window: Optional[float] = None,
-    ts_thresholds: str = "—",
-) -> List[str]:
-    """「概率评分（AROC / BSS）」一节——只在拿到概率宽表时出现。
+def analysis_probability(summaries: Dict[str, Dict[str, object]]) -> List[str]:
+    """概率评分判读：区分能力、Brier 技巧的正负与走向、高阈值档的样本。
 
-    引导语、引用块、表头都照骨架写；只有那一堆数字和窗口/阈值是从表里现取的。
-    ``number`` 是章号（默认「六」）：这一节之后所有节号都要顺延，所以由调用方给。
+    一条一行，由调用方套 ``• `` ——与其余各节的判读同一种排版（``_analysis_*``）。
     """
-    summaries = {name: probability_summary(frame) for name, frame in probability.items()}
-    primary = next(iter(probability))
-    window = _probability_window(probability[primary])
-    window_text = f"{window:g}h" if window else "概率"
+    if not summaries:
+        return ["没有概率评分结果，本节无法给出定量分析。"]
+    names = list(summaries)
+    primary = names[0]
+    rows = summaries[primary]["rows"]
+    average = summaries[primary]["average"]
+    parts: List[str] = []
 
-    leads = sorted(
-        float(value) for value in pd.to_numeric(probability[primary]["lead_h"], errors="coerce").dropna()
-    )
-    span = f"{leads[0]:g}–{leads[-1]:g}h" if leads else "各时效"
-
-    lines = [f"## {number}、概率评分（AROC / BSS，{window_text} 累积窗口）", ""]
-    lines += [
-        f"前面五节评的都是{_members_phrase(members)}的**平均场**，成员之间的离散信息"
-        f"一点没进指标——一个成员高度一致、另一个成员四散分布的集合，前五节的分数"
-        f"可以完全相同。本节改用全体成员的概率分布：AROC 衡量预报概率把事件与非事件"
-        f"分开的能力（0.5 为无技巧），BSS 衡量相对气候基准的 Brier 技巧（>0 才算有正技巧）。",
-        "",
-        f"**本节与前面五节不同口径**：概率评分用 {window_text} 累积窗口、"
-        f"阈值 {_threshold_list(probability[primary])}，与前面 "
-        + (f"{ts_window:g}h / " if ts_window else "")
-        + f"{ts_thresholds} 既不可比，也不要画进同一张图。",
-        "",
-    ]
-    lines += _table_caption(
-        numbering, "各降水等级的概率评分（各时效等权平均；AVG 为可算阈值的等权平均）"
-    )
-    lines.append(_probability_table(summaries, with_model=len(summaries) > 1))
-    lines.append("")
-    lines.append(_probability_note(window))
-    lines.append("")
-    caption = (
-        f"{span} 概率评分的 AROC（上排，虚线为 0.5 的无技巧线）与 BSS（下排，虚线为 0 的"
-        f"无正技巧线）随时效变化，每列一个阈值；AROC 越靠上区分能力越强，"
-        f"BSS 越靠上越优于气候基准"
-    )
-    lines += _figure_block(artifacts, numbering, "AROC_BSS_vs_lead", caption)
-    lines.append(f"**小结**：{analysis_probability(summaries)}")
-    lines.append("")
-    return lines
-
-
-def _figure_captions(
-    summary: Dict[str, object], *, window: Optional[float], lead: float, model_name: str
-) -> Dict[str, str]:
-    """每张图的图注——说明**怎么读这张图**，而不是重复图的标题。"""
-    leads = summary["leads"]
-    span = f"{leads[0]:g}–{leads[-1]:g}h"
-    window_text = f"{window:g}h 累积窗口" if window else "本次评估窗口"
-    return {
-        "metrics_by_threshold": (
-            f"{lead:g}h 时效（{window_text}）各降水等级的 TS、POD、FAR 与 BIAS 对比"
-        ),
-        "TS_vs_lead": (
-            f"{span} 各降水等级的 TS 曲线；线越靠上技巧越好，"
-            f"虚线表示该等级事件数不足 50、仅作参照"
-        ),
-        "TS_heatmap": (
-            f"降水等级 × 预报时效的 TS 热力图（{window_text}）；"
-            f"颜色越深技巧越高，格子里的数字随底色自动切黑/白"
-        ),
-        "POD_vs_lead": (
-            f"{span} 各降水等级的命中率 POD；POD 低意味着漏报多，"
-            f"但单独抬高 POD 往往以增大空报为代价，需与下一张 FAR 图联合判读"
-        ),
-        "FAR_vs_lead": f"{span} 各降水等级的空报率 FAR（纵轴锁定 0–1）；FAR 越低误报越少",
-        "BIAS_vs_lead": (
-            f"{span} 各降水等级的频率偏差 BIAS，虚线为理想值 1（纵轴自适应、不截断）；"
-            f"曲线在 1 上方表示预报事件偏多、下方表示偏少"
-        ),
-        "performance_diagram": (
-            f"{lead:g}h 时效的性能图：横轴为成功比 1−FAR、纵轴为命中率 POD，"
-            f"灰色虚线为 TS 等值线、蓝色点线为 BIAS 参考线；点越靠近右上角技巧越好"
-        ),
-        "TS_boxplot": (
-            "各模型 TS 的跨时效分布；箱体越高表示该量级整体技巧越好、"
-            "越窄表示跨时效越稳定，空心圆为离群时效"
-        ),
-        "multi_model_TS_delta": (
-            f"{span} 各对比模型相对 {model_name} 的 TS 差值"
-            f"（纵轴是「对比模型 − 本模型」：正值表示对比模型领先，负值表示本模型领先）"
-        ),
-    }
-
-
-# ------------------------------------------------------------- 能力雷达图
-#
-# 选轴有一条硬约束：**恒等式的两端不能各占一根轴**。TS = f(POD, FAR)
-# （1/TS = 1/POD + 1/(1−FAR) − 1），三根同放是同一件事计三次分，多边形会被这组
-# 强相关的轴带偏——POD / FAR 的绝对水平回第四节那张表里看，不进雷达图。
-
-#: 雷达图至少两个模型才画：一个多边形没有比较对象。
-CAPABILITY_MIN_MODELS = 2
-
-#: 强降水那根轴取哪一档：不低于这个阈值（mm）的**最小**一档。
-HEAVY_RAIN_THRESHOLD = 25.0
-
-_CN_NUM = {1: "一", 2: "二", 3: "三", 4: "四", 5: "五", 6: "六", 7: "七", 8: "八", 9: "九", 10: "十"}
-
-
-def _model_count_word(count: int) -> str:
-    """模型数的中文写法——报告其余部分一律写「二模型」，这里不能冒出「2模型」。"""
-    return _CN_NUM.get(int(count), str(int(count)))
-
-
-def _heavy_grade_threshold(models: Dict[str, pd.DataFrame]) -> Optional[float]:
-    """强降水轴的档位门槛，**全批取同一个**。
-
-    逐模型各取各的会出现「甲模型比 ≥25mm、乙模型比 ≥50mm」——名次没法解释，
-    而且雷达图上完全看不出来。所以按全批的阈值集合定一档，缺这一档的模型
-    那条轴按缺值处理（整根剔除，见 ``radar_scores``）。
-    """
-    thresholds = set()
-    for frame in models.values():
-        if "threshold_mm" not in frame.columns:
-            continue
-        values = pd.to_numeric(frame["threshold_mm"], errors="coerce").dropna()
-        thresholds |= {float(value) for value in values if float(value) >= HEAVY_RAIN_THRESHOLD}
-    return min(thresholds) if thresholds else None
-
-
-def capability_profile(
-    models: Dict[str, pd.DataFrame],
-) -> Tuple[List[str], Dict[str, Dict[str, Optional[float]]], Dict[str, bool]]:
-    """雷达图的三样东西：轴序、``{模型: {轴: 原始值}}``、各轴方向。
-
-    四根轴都取自前面几节**已经算好的统计量**（``summarize`` 的总体 TS 与 BIAS、
-    ``box_stats`` 的跨时效 IQR），不另算一套指标——图、表、正文同源。
-
-    返回的取值**还没归一化**：归一化只有 ``det_plots.radar_scores`` 一处实现，
-    绘图和正文的判读句都从那里拿分。
-    """
-    heavy = _heavy_grade_threshold(models)
-    heavy_label = f"强降水 TS（≥{heavy:g}mm）" if heavy is not None else "强降水 TS"
-    labels = [
-        "TS（全等级等权平均）",
-        heavy_label,
-        "|BIAS−1|（全等级平均）",
-        "跨时效 TS 的 IQR（全等级平均）",
-    ]
-    higher = {
-        labels[0]: True,
-        labels[1]: True,
-        labels[2]: False,
-        labels[3]: False,
-    }
-
-    raw: Dict[str, Dict[str, Optional[float]]] = {}
-    for name, frame in models.items():
-        summary = summarize(frame)
-        grades = summary["grades"]
-        heavy_entry = None
-        if heavy is not None:
-            heavy_entry = next(
-                (
-                    item
-                    for item in grades
-                    if item["threshold"] is not None
-                    and np.isclose(float(item["threshold"]), heavy)
-                ),
-                None,
+    usable = [entry for entry in rows if np.isfinite(entry.get("AROC", np.nan))]
+    if usable:
+        best = max(usable, key=lambda item: item["AROC"])
+        worst = min(usable, key=lambda item: item["AROC"])
+        below = [entry for entry in usable if entry["AROC"] <= 0.5]
+        head = f"{primary} 各档 AROC 在 {fmt_number(worst['AROC'])}–{fmt_number(best['AROC'])} 之间，"
+        if below:
+            head += (
+                "其中 " + "、".join(entry["grade"] for entry in below)
+                + " 未超过 0.5 的无技巧线，这几档的概率预报分不开事件与非事件；"
             )
-        # BIAS 与 IQR 都按等级等权平均：各档样本量差几个量级，按样本数加权会让
-        # 小量级那几档把整根轴吃掉，而这根轴问的是「整体偏差/整体稳定性」。
-        bias = [
-            abs(float(item["BIAS"]) - 1.0)
-            for item in grades
-            if np.isfinite(item.get("BIAS", np.nan))
-        ]
-        iqr = [
-            float(box_stats(frame[frame["grade"] == item["grade"]], "TS")["iqr"])
-            for item in grades
-        ]
-        iqr = [value for value in iqr if np.isfinite(value)]
-        raw[str(name)] = {
-            labels[0]: float(summary["overall_ts"]),
-            labels[1]: None if heavy_entry is None else float(heavy_entry["TS_sum"]),
-            labels[2]: float(np.mean(bias)) if bias else None,
-            labels[3]: float(np.mean(iqr)) if iqr else None,
+        else:
+            head += (
+                f"全部高于 0.5 的无技巧线（最低的 {worst['grade']} 档高出 "
+                f"{fmt_number(worst['AROC'] - 0.5)}）；"
+            )
+        parts.append(head + f"区分能力最强的是 {best['grade']}（{fmt_number(best['AROC'])}）。")
+
+    scored = [entry for entry in rows if np.isfinite(entry.get("BSS", np.nan))]
+    if scored:
+        positive = [entry for entry in scored if entry["BSS"] > 0]
+        best = max(scored, key=lambda item: item["BSS"])
+        worst = min(scored, key=lambda item: item["BSS"])
+        if positive:
+            parts.append(
+                f"BSS 有 {len(positive)}/{len(scored)} 档为正：最好的是 {best['grade']}"
+                f"（{fmt_number(best['BSS'])}），最差的是 {worst['grade']}"
+                f"（{fmt_number(worst['BSS'])}）。"
+            )
+        else:
+            parts.append(
+                f"BSS **一档都没有为正**（最好的是 {best['grade']}，"
+                f"{fmt_number(best['BSS'])}），整批概率预报都不及气候基准。"
+            )
+        if worst["BSS"] < 0 and positive:
+            parts.append(
+                f"{worst['grade']} 档为负，说明这一档的概率预报**还不如气候基准**——"
+                f"它的 BS {fmt_number(worst['BS'])} 高于 BS_ref {fmt_number(worst['BS_ref'])}。"
+            )
+        elif not positive:
+            parts.append(
+                f"最差的 {worst['grade']} 档 BS {fmt_number(worst['BS'])} "
+                f"远高于 BS_ref {fmt_number(worst['BS_ref'])}。"
+            )
+
+    if rows:
+        lightest, heaviest = rows[0], rows[-1]
+        if (
+            lightest is not heaviest
+            and lightest.get("n_points")
+            and np.isfinite(lightest.get("base_rate", np.nan))
+            and np.isfinite(heaviest.get("base_rate", np.nan))
+            and heaviest["base_rate"] > 0
+        ):
+            ratio = lightest["base_rate"] / heaviest["base_rate"]
+            extra = f"（约 {ratio:.0f} 分之一）" if ratio >= 2 else ""
+            parts.append(
+                f"各档的样本点数相同（{lightest['n_points']:,} 对——阈值只改事件的定义、"
+                f"不改配对点），但**事件次数**随量级急剧收缩：{lightest['grade']} 档的"
+                f"基准率 {fmt_number(lightest['base_rate'])}、{heaviest['grade']} 档只剩 "
+                f"{fmt_number(heaviest['base_rate'])}{extra}——高阈值档的 AROC/BSS 波动更大。"
+            )
+
+    by_lead = summaries[primary].get("by_lead")
+    if by_lead is not None and len(by_lead) >= 2:
+        first_lead, last_lead = float(by_lead.index[0]), float(by_lead.index[-1])
+        aroc_first, aroc_last = float(by_lead["AROC"].iloc[0]), float(by_lead["AROC"].iloc[-1])
+        bss_first, bss_last = float(by_lead["BSS"].iloc[0]), float(by_lead["BSS"].iloc[-1])
+        parts.append(
+            f"AVG 档随时效：AROC 从 {first_lead:g}h 的 {fmt_number(aroc_first)} 变到 "
+            f"{last_lead:g}h 的 {fmt_number(aroc_last)}（{aroc_last - aroc_first:+.3f}），"
+            f"BSS 从 {fmt_number(bss_first)} 变到 {fmt_number(bss_last)}（{bss_last - bss_first:+.3f}）——"
+            + (
+                "区分能力随时效退化，长时效的结论同样要限定范围。"
+                if aroc_last < aroc_first
+                else "区分能力并不随时效单调下降，这时段内的分档主要由样本波动支配。"
+            )
+        )
+
+    if len(names) > 1:
+        pool = {
+            name: summary["average"]
+            for name, summary in summaries.items()
+            if np.isfinite(summary["average"].get("AROC", np.nan))
+            and np.isfinite(summary["average"].get("BSS", np.nan))
         }
-    return labels, raw, higher
+        if len(pool) >= 2:
+            best_aroc = max(pool, key=lambda name: pool[name]["AROC"])
+            best_bss = max(pool, key=lambda name: pool[name]["BSS"])
+            parts.append(
+                f"AVG 档上 AROC 最高的是 {best_aroc}（{fmt_number(pool[best_aroc]['AROC'])}）、"
+                f"BSS 最高的是 {best_bss}（{fmt_number(pool[best_bss]['BSS'])}）。"
+                f"各模型的概率样本量并不相同（见「样本点数」列），样本少的那个名次波动更大。"
+            )
+
+    if np.isfinite(average.get("AROC", np.nan)):
+        parts.append(
+            f"{primary} 的 AVG 档：AROC {fmt_number(average['AROC'])}、BSS {fmt_number(average['BSS'])}"
+            f"（对 {average['n_grades']} 个可算阈值等权平均）。"
+        )
+    return parts or ["概率评分的各档取值都不可用，本节无法给出定量分析。"]
 
 
-def _section_grade(
-    summary: Dict[str, object], artifacts, numbering: _Numbering, captions: Dict[str, str]
-) -> List[str]:
-    grades = summary["grades"]
-    lines = ["## 二、逐降水等级表现（全时效平均）", ""]
-    lines.append(
-        "下表汇总各降水等级在整个时效范围内的表现，"
-        "用于判断模型在不同量级上的技巧水平与偏差结构。"
-    )
-    lines.append("")
-    lines += _table_caption(numbering, "各降水等级的全时效平均技巧与列联表计数（按阈值升序）")
-    lines.append(_grade_table(grades))
-    lines.append("")
-    lines.append(
-        "> 全时效平均为**各时效等权平均**（不是按样本数加权）；判断强降水能力请看 ≥25mm 及以上等级。"
-    )
-    lines.append("")
-    lines += _figure_block(artifacts, numbering, "metrics_by_threshold", captions["metrics_by_threshold"])
-    lines.append(f"**小结**：{analysis_by_grade(grades)}")
-    lines.append("")
-    return lines
+# --------------------------------------------------------------------------- #
+# 判读（只读已算好的统计量）
+# --------------------------------------------------------------------------- #
+def _sort_value(value: float) -> float:
+    return float(value) if np.isfinite(value) else -np.inf
 
 
-def _section_lead(
-    summary: Dict[str, object], artifacts, numbering: _Numbering, captions: Dict[str, str]
-) -> List[str]:
-    leads = summary["leads"]
-    lines = [f"## 三、TS 随时效变化（{leads[0]:g}–{leads[-1]:g}h）", ""]
-    lines.append(
-        "按预报时效展开，用于确定该模型的有效预报时效——技巧掉到不可用之前能推多远。"
-    )
-    lines.append("")
-    for name in ("TS_vs_lead", "TS_heatmap"):
-        lines += _figure_block(artifacts, numbering, name, captions[name])
-    lines += _table_caption(numbering, "各降水等级在各预报时效上的 TS")
-    lines.append(_lead_table(summary["pivot"]))
-    lines.append("")
-    lines.append(
-        "> 单元格是该时效该等级的 TS；同一行内横向比较看衰减速度，同一列内纵向比较看量级差异。"
-    )
-    lines.append("")
-    lines.append(f"**小结**：{analysis_by_lead(summary)}")
-    lines.append("")
-    return lines
-
-
-def _section_error_shape(
-    summary: Dict[str, object], artifacts, numbering: _Numbering, captions: Dict[str, str]
-) -> List[str]:
-    lines = ["## 四、误差形态与偏差结构", ""]
-    lines.append(
-        "技巧高低之外还要看误差从哪来：本节从命中率、空报率与频率偏差三个方面拆解误差的来源与形态。"
-    )
-    lines.append("")
-    for name in ("POD_vs_lead", "FAR_vs_lead", "BIAS_vs_lead", "performance_diagram"):
-        lines += _figure_block(artifacts, numbering, name, captions[name])
-    lines.append(f"**小结**：{analysis_error_structure(summary['grades'])}")
-    lines.append("")
-    return lines
-
-
-def _section_boxplot(
+def _comparison_sentence(
     models: Dict[str, pd.DataFrame],
-    artifacts,
-    numbering: _Numbering,
-    captions: Dict[str, str],
+    overview: Dict[str, Dict[str, float]],
+    ranks: Dict[str, float],
+) -> str:
+    if len(models) < 2:
+        return ""
+    order = sorted(overview, key=lambda name: _sort_value(overview[name]["ts"]), reverse=True)
+    best, worst = order[0], order[-1]
+    if not np.isfinite(overview[best]["ts"]):
+        return ""
+    text = (
+        f"本批 {len(models)} 个模型中，综合 TS 最高的是 **{best}**"
+        f"（{fmt_number(overview[best]['ts'])}），最低的是 **{worst}**"
+        f"（{fmt_number(overview[worst]['ts'])}）；"
+    )
+    rank_pool = {name: value for name, value in ranks.items() if np.isfinite(value)}
+    if rank_pool:
+        rank_best = min(rank_pool, key=rank_pool.get)
+        text += f"按等级×时效逐格排名的平均名次最好是 **{rank_best}**（{fmt_number(rank_pool[rank_best], 2)}）。"
+    return text
+
+
+def _analysis_overview(
+    models: Dict[str, pd.DataFrame],
+    overview: Dict[str, Dict[str, float]],
+    ranks: Dict[str, float],
+    heavy: Optional[float],
+) -> List[str]:
+    if len(models) < 2:
+        name = next(iter(models))
+        values = overview[name]
+        return [
+            f"单模型评估：综合 TS {fmt_number(values['ts'])}、强降水 TS "
+            f"{fmt_number(values['heavy'])}、|BIAS−1| {fmt_number(values['bias'])}、"
+            f"跨时效 IQR {fmt_number(values['iqr'])}。"
+        ]
+    lines: List[str] = []
+    order = sorted(overview, key=lambda name: _sort_value(overview[name]["ts"]), reverse=True)
+    best, worst = order[0], order[-1]
+    if np.isfinite(overview[best]["ts"]) and np.isfinite(overview[worst]["ts"]):
+        lines.append(
+            f"综合 TS 最高的是 {best}（{fmt_number(overview[best]['ts'])}），"
+            f"最低的是 {worst}（{fmt_number(overview[worst]['ts'])}），"
+            f"相差 {fmt_number(overview[best]['ts'] - overview[worst]['ts'])}。"
+        )
+    # 综合 TS 在显示精度上恒为 0 的模型，柱状图里几乎看不见——先说明是数值趋零。
+    zero_skill = {
+        name for name, values in overview.items() if fmt_number(values["ts"]) == "0.000"
+    }
+    if zero_skill:
+        lines.append(
+            f"{'、'.join(sorted(zero_skill))} 的全等级平均 TS 为 0.000"
+            f"（各时效都接近 0），本章开头的基准时效柱状图里它的柱高几乎不可见——"
+            f"这是数值趋零，不是缺数据；建议先核查该份宽表的口径。"
+        )
+    heavy_values = {
+        name: values["heavy"] for name, values in overview.items() if np.isfinite(values["heavy"])
+    }
+    if heavy_values:
+        leaders = _leaders(heavy_values)
+        top = max(heavy_values.values())
+        bottom = min(heavy_values.values())
+        label = f"≥{heavy:g}mm" if heavy is not None else "强降水档"
+        lines.append(
+            f"{label} 的 TS 最高的是 {'、'.join(sorted(leaders))}（{fmt_number(top)}），"
+            f"最低 {fmt_number(bottom)}；高量级样本稀疏，这一项的小数位不宜过度解读。"
+        )
+    bias_values = {
+        name: values["bias"] for name, values in overview.items() if np.isfinite(values["bias"])
+    }
+    if bias_values:
+        closest = _leaders(bias_values, higher=False)
+        lines.append(
+            f"|BIAS−1| 最小的是 {'、'.join(sorted(closest))}"
+            f"（{fmt_number(min(bias_values.values()))}），频率偏差在全等级上最接近无偏。"
+        )
+    # 综合 TS 在显示精度上恒为 0 的模型，IQR 也恒为 0——不能读成「最均衡」。
+    iqr_values = {
+        name: values["iqr"] for name, values in overview.items()
+        if np.isfinite(values["iqr"]) and name not in zero_skill
+    }
+    if iqr_values:
+        stable = _leaders(iqr_values, higher=False)
+        text = (
+            f"跨时效 IQR 中位数最小的是 {'、'.join(sorted(stable))}"
+            f"（{fmt_number(min(iqr_values.values()))}），各时效的技巧最均衡"
+        )
+        if zero_skill:
+            text += f"（{'、'.join(sorted(zero_skill))} 的 TS 恒为 0，不参与这一项）"
+        lines.append(text + "。")
+    rank_pool = {name: value for name, value in ranks.items() if np.isfinite(value)}
+    if rank_pool:
+        rank_best = min(rank_pool, key=rank_pool.get)
+        detail = "、".join(
+            f"{name} {fmt_number(value, 2)}" for name, value in sorted(rank_pool.items(), key=lambda item: item[1])
+        )
+        lines.append(
+            f"按等级×时效逐格排名的平均名次（1 = 每格最好）：{detail}；"
+            f"最好的是 {rank_best}。"
+        )
+    leaders_all = {
+        "综合 TS": set(_leaders({n: v["ts"] for n, v in overview.items()})),
+        "强降水 TS": set(_leaders(heavy_values)) if heavy_values else set(),
+        "无偏": set(_leaders(bias_values, higher=False)) if bias_values else set(),
+        "稳定": set(_leaders(iqr_values, higher=False)) if iqr_values else set(),
+    }
+    leaders_all = {key: value for key, value in leaders_all.items() if value}
+    if leaders_all:
+        union = set().union(*leaders_all.values())
+        if len(union) == 1:
+            lines.append(
+                f"四个维度由同一个模型 {'、'.join(sorted(union))} 领先，模型之间没有互补性。"
+            )
+        else:
+            lines.append(
+                "四个维度的领先者不是同一个模型，说明各模型的能力形状不同，"
+                "单看综合 TS 会掩盖这些差别。"
+            )
+    return lines
+
+
+def _analysis_grades(
+    models: Dict[str, pd.DataFrame],
+    summaries: Dict[str, Dict[str, object]],
     primary: str,
 ) -> List[str]:
-    lines = ["## 五、跨时效分布（箱线图，TS）", ""]
+    names = list(models)
+    grades = ordered_grades(list(models.values()))
+    lines: List[str] = []
+    for grade in grades:
+        values: Dict[str, float] = {}
+        for name in names:
+            entry = next(
+                (item for item in summaries[name]["grades"] if item["grade"] == grade), None
+            )
+            if entry is not None:
+                values[name] = float(entry["TS_sum"])
+        finite = {name: value for name, value in values.items() if np.isfinite(value)}
+        if not finite:
+            lines.append(f"{grade}mm：各模型都没有有效 TS，该档不可评定。")
+            continue
+        leaders = _leaders(values)
+        top = max(finite.values())
+        others = [value for name, value in finite.items() if name not in leaders]
+        if len(finite) > 1 and others:
+            runner = max(others)
+            lines.append(
+                f"{grade}mm：{'、'.join(sorted(leaders))} 领先（TS {fmt_number(top)}），"
+                f"比次优高 {fmt_number(top - runner)}。"
+            )
+        elif len(leaders) > 1:
+            lines.append(
+                f"{grade}mm：{'、'.join(sorted(leaders))} 并列领先（TS {fmt_number(top)}）。"
+            )
+        else:
+            lines.append(f"{grade}mm：只有 {next(iter(finite))} 有有效 TS（{fmt_number(top)}）。")
+
+    entries = summaries[primary]["grades"]
+    usable = [entry for entry in entries if np.isfinite(entry.get("TS", np.nan))]
+    if len(usable) > 1:
+        steps = [
+            (usable[index], usable[index + 1], usable[index]["TS"] - usable[index + 1]["TS"])
+            for index in range(len(usable) - 1)
+        ]
+        left, right, drop = max(steps, key=lambda step: step[2])
+        if drop > 0:
+            lines.append(
+                f"{primary} 的相邻量级落差最大的是 {left['grade']}→{right['grade']}"
+                f"（{fmt_number(left['TS'])} → {fmt_number(right['TS'])}，掉 {fmt_number(drop)}）。"
+            )
+        rises = [step for step in steps if step[2] < -0.005]
+        if rises:
+            where = "、".join(f"{a['grade']}→{b['grade']}" for a, b, _ in rises)
+            lines.append(
+                f"{primary} 的 TS 并非随量级单调下降：{where} 处出现回升，"
+                f"该位置的样本波动已经盖过真实差异。"
+            )
+        first, last = usable[0], usable[-1]
+        if first["events"] > 0 and 0 < last["events"] < first["events"]:
+            ratio = first["events"] / last["events"]
+            lines.append(
+                f"{primary} 的观测事件数从 {first['grade']} 的 {first['events']:,} 次"
+                f"收缩到 {last['grade']} 的 {last['events']:,} 次"
+                + (f"（约 1/{ratio:.0f}）" if ratio >= 10 else "")
+                + "，高量级的 TS 小数位不宜过度解读。"
+            )
+    return lines
+
+
+def _analysis_leads(models: Dict[str, pd.DataFrame]) -> List[str]:
+    table = _lead_mean_values(models)
+    if table.empty:
+        return ["没有可用的时效数据。"]
+    leads = [float(lead) for lead in table.index]
+    lines: List[str] = []
+    for name in table.columns:
+        series = table[name].dropna()
+        if len(series) < 2:
+            continue
+        first, last = float(series.index[0]), float(series.index[-1])
+        start, end = float(series.iloc[0]), float(series.iloc[-1])
+        drop = start - end
+        relative = drop / start if start else float("nan")
+        below = series[series < USABLE_TS]
+        effective = f"在 {float(below.index[0]):g}h 首次跌破 {USABLE_TS:g}" if len(below) else f"全程未跌破 {USABLE_TS:g}"
+        lines.append(
+            f"{name}：综合 TS 从 {first:g}h 的 {fmt_number(start)} 降到 {last:g}h 的 "
+            f"{fmt_number(end)}（−{fmt_number(drop)}，相对 −{relative:.0%}），{effective}。"
+        )
+    if len(leads) >= 2:
+        first_values = {
+            name: float(table.loc[leads[0], name])
+            for name in table.columns
+            if np.isfinite(table.loc[leads[0], name])
+        }
+        last_values = {
+            name: float(table.loc[leads[-1], name])
+            for name in table.columns
+            if np.isfinite(table.loc[leads[-1], name])
+        }
+        if first_values and last_values:
+            first_leaders = _leaders(first_values)
+            last_leaders = _leaders(last_values)
+            lines.append(
+                f"{leads[0]:g}h 由 {'、'.join(sorted(first_leaders))} 领先"
+                f"（{fmt_number(max(first_values.values()))}），"
+                f"{leads[-1]:g}h 由 {'、'.join(sorted(last_leaders))} 领先"
+                f"（{fmt_number(max(last_values.values()))}）；"
+                + (
+                    "领先者随时效发生变化。"
+                    if first_leaders != last_leaders
+                    else "领先者在首末时效上一致。"
+                )
+            )
+    decays = {}
+    for name in table.columns:
+        series = table[name].dropna()
+        if len(series) >= 2 and series.iloc[0]:
+            decays[name] = float((series.iloc[0] - series.iloc[-1]) / series.iloc[0])
+    if len(decays) > 1:
+        fastest = max(decays, key=decays.get)
+        slowest = min(decays, key=decays.get)
+        if f"{decays[fastest]:.0%}" == f"{decays[slowest]:.0%}":
+            lines.append(
+                f"各模型的相对衰减相当（都在 {decays[slowest]:.0%} 左右），"
+                f"看不出谁抗衰减。"
+            )
+        else:
+            lines.append(
+                f"相对衰减最快的是 {fastest}（{decays[fastest]:.0%}），"
+                f"最慢的是 {slowest}（{decays[slowest]:.0%}）。"
+            )
+    return lines
+
+
+def _analysis_metric(
+    models: Dict[str, pd.DataFrame],
+    summaries: Dict[str, Dict[str, object]],
+    *,
+    key: str,
+    label: str,
+    higher: bool = True,
+    closer: bool = False,
+) -> List[str]:
+    """单个分等级指标：领先次数 + 首末量级对照（POD / FAR / BIAS 共用）。"""
+    names = list(models)
+    if not names:
+        return []
+    grades = [str(entry["grade"]) for entry in summaries[names[0]]["grades"]]
+    values: Dict[str, Dict[str, float]] = {
+        name: {
+            str(entry["grade"]): float(entry.get(key, np.nan))
+            for entry in summaries[name]["grades"]
+        }
+        for name in names
+    }
+    counts = {name: 0 for name in names}
+    total = 0
+    for grade in grades:
+        row = {
+            name: values[name].get(grade, np.nan) for name in names
+        }
+        row = {name: value for name, value in row.items() if np.isfinite(value)}
+        if not row:
+            continue
+        total += 1
+        for name in (_closest_to_one(row) if closer else _leaders(row, higher=higher)):
+            counts[name] += 1
+    if total == 0:
+        return [f"各等级都没有有效 {label}，本节无法比较。"]
+
+    lines: List[str] = []
+    best_count = max(counts.values())
+    best = [name for name in names if counts[name] == best_count]
+    if len(best) == len(names):
+        lines.append(f"{label}：各模型在 {total} 个等级上互有胜负，没有一致领先者。")
+    else:
+        direction = "最接近 1 的" if closer else ("最高" if higher else "最低")
+        detail = "、".join(f"{name} {counts[name]}/{total}" for name in names)
+        lines.append(f"{label} {direction}次数：{detail}。")
+
+    def describe(grade: str) -> Optional[str]:
+        row = {
+            name: values[name].get(grade, np.nan) for name in names
+        }
+        row = {name: value for name, value in row.items() if np.isfinite(value)}
+        if not row:
+            return None
+        if closer:
+            winners = _closest_to_one(row)
+            value = min(row.values(), key=lambda item: abs(item - 1.0))
+            worst = max(row, key=lambda name: abs(row[name] - 1.0))
+            return (
+                f"{grade}mm 上最接近无偏的是 {'、'.join(sorted(winners))}"
+                f"（BIAS {fmt_number(value)}），最偏的是 {worst}"
+                f"（{fmt_number(row[worst])}）。"
+            )
+        winners = _leaders(row, higher=higher)
+        value = max(row.values()) if higher else min(row.values())
+        word = "最高" if higher else "最低"
+        return (
+            f"{grade}mm 上 {label} {word}的是 {'、'.join(sorted(winners))}"
+            f"（{fmt_number(value)}）。"
+        )
+
+    for grade in ([grades[0], grades[-1]] if len(grades) > 1 else grades):
+        line = describe(grade)
+        if line:
+            lines.append(line)
+    return lines
+
+
+def _analysis_far_bias(
+    models: Dict[str, pd.DataFrame], summaries: Dict[str, Dict[str, object]]
+) -> List[str]:
+    """FAR 与漏报率的对照：误差到底偏向哪一侧。"""
+    lines: List[str] = []
+    for name in models:
+        entries = [
+            entry
+            for entry in summaries[name]["grades"]
+            if np.isfinite(entry.get("FAR", np.nan)) and np.isfinite(entry.get("漏报率", np.nan))
+        ]
+        if not entries:
+            lines.append(f"{name}：各等级的 FAR / 漏报率都不可用，无法判断误差形态。")
+            continue
+        entry = entries[-1]
+        far_text, miss_text = fmt_number(entry["FAR"]), fmt_number(entry["漏报率"])
+        if far_text == miss_text:
+            kind = "空报与漏报相当"
+        elif entry["FAR"] > entry["漏报率"]:
+            kind = "以空报为主"
+        else:
+            kind = "以漏报为主"
+        lines.append(
+            f"{name}：{entry['grade']}mm 的 FAR {far_text}、漏报率 {miss_text}，{kind}。"
+        )
+    return lines
+
+
+def _analysis_stability(
+    models: Dict[str, pd.DataFrame], primary: str
+) -> List[str]:
+    per_model: Dict[str, List[Dict[str, object]]] = {}
+    for name, frame in models.items():
+        rows = [row for row in box_stats_by_grade(frame, metric="TS") if row["n"]]
+        if rows:
+            per_model[name] = rows
+    if not per_model:
+        return ["各模型在各量级上都没有有效样本，无法评估跨时效稳定性。"]
+
+    lines: List[str] = []
+    # 各量级中位数在显示精度上仍是 0.000 的模型（几乎不报事件）IQR 也恒为 0，
+    # 不能读成「跨时效最稳定」。
+    skilled = {
+        name: rows
+        for name, rows in per_model.items()
+        if any(
+            np.isfinite(row["median"]) and fmt_number(row["median"]) != "0.000"
+            for row in rows
+        )
+    }
+    if skilled and len(skilled) < len(per_model):
+        skipped = "、".join(name for name in per_model if name not in skilled)
+        lines.append(
+            f"{skipped} 的 TS 在各量级上恒为 0（几乎不报事件），IQR 也恒为 0，"
+            f"不参与稳定性排序。"
+        )
+    pool = skilled or per_model
+    spread = {
+        name: float(np.median([row["iqr"] for row in rows]))
+        for name, rows in pool.items()
+    }
+    ranked = sorted(spread, key=lambda name: spread[name])
+    if len(ranked) == 1:
+        if len(models) == 1:
+            lines.append(
+                f"单模型评估：{ranked[0]} 各量级 IQR 的中位数为 "
+                f"{fmt_number(spread[ranked[0]])}。"
+            )
+        else:
+            lines.append(
+                f"参与稳定性排序的只有 {ranked[0]}，各量级 IQR 的中位数为 "
+                f"{fmt_number(spread[ranked[0]])}。"
+            )
+    elif spread[ranked[-1]] - spread[ranked[0]] < 0.01:
+        lines.append(
+            f"各模型的跨时效稳定性接近（IQR 中位数 {fmt_number(spread[ranked[0]])}–"
+            f"{fmt_number(spread[ranked[-1]])}，极差不足 0.01），稳定性不构成区分度。"
+        )
+    else:
+        lines.append(
+            f"按各量级 IQR 的中位数排序，跨时效最稳定的是 {ranked[0]}"
+            f"（{fmt_number(spread[ranked[0]])}），最不稳定的是 {ranked[-1]}"
+            f"（{fmt_number(spread[ranked[-1]])}）。"
+        )
+
+    outliers = sorted(
+        {float(lead) for row in per_model.get(primary, []) for lead in row["outlier_leads"]}
+    )
+    if outliers and primary in models:
+        all_leads = sorted(float(value) for value in pd.unique(models[primary]["lead_h"]))
+        middle = (all_leads[0] + all_leads[-1]) / 2
+        early = sum(1 for lead in outliers if lead <= middle)
+        where = (
+            "短时效段" if early * 2 > len(outliers)
+            else ("长时效段" if early * 2 < len(outliers) else "首尾两端")
+        )
+        shown = "、".join(f"{lead:g}h" for lead in outliers[:6])
+        lines.append(
+            f"{primary} 的离群时效共 {len(outliers)} 个（{shown}"
+            + ("…" if len(outliers) > 6 else "")
+            + f"），偏向{where}。"
+        )
+    elif primary in models:
+        lines.append(f"{primary} 的各量级都没有离群时效，TS 的跨时效分布连续。")
+
+    flips = []
+    for grade in ordered_grades(list(models.values())):
+        medians: Dict[str, float] = {}
+        means: Dict[str, float] = {}
+        for name, frame in models.items():
+            subset = frame[frame["grade"].astype(str) == grade]
+            values = pd.to_numeric(subset["TS"], errors="coerce").dropna()
+            if values.empty:
+                continue
+            medians[name] = float(values.median())
+            means[name] = float(values.mean())
+        if len(medians) < 2:
+            continue
+        median_leaders = _leaders(medians)
+        mean_leaders = _leaders(means)
+        # 按显示精度并列时不算翻转：两个量级都只剩噪声的档（各家显示值一样）
+        # 不该被写成「谁领先」。
+        if len(median_leaders) != 1 or len(mean_leaders) != 1:
+            continue
+        by_median = next(iter(median_leaders))
+        by_mean = next(iter(mean_leaders))
+        if by_median != by_mean:
+            flips.append((grade, by_median, by_mean))
+    if flips:
+        detail = "、".join(
+            f"{grade}（中位数 {left} 领先、等权平均 {right} 领先）"
+            for grade, left, right in flips[:3]
+        )
+        lines.append(
+            f"**注意口径**：{detail}。本节表里的统计量是中位数/IQR，4.1 节表里的是等权平均，"
+            f"两者给出不同的领先者是正常现象，不可互相替代。"
+        )
+    return lines
+
+
+def _analysis_performance(models: Dict[str, pd.DataFrame], lead: float) -> List[str]:
+    values: Dict[str, Tuple[float, float]] = {}
+    for name, frame in models.items():
+        subset = frame[pd.to_numeric(frame["lead_h"], errors="coerce") == lead]
+        pod = pd.to_numeric(subset["POD"], errors="coerce").dropna() if "POD" in subset else pd.Series(dtype=float)
+        far = pd.to_numeric(subset["FAR"], errors="coerce").dropna() if "FAR" in subset else pd.Series(dtype=float)
+        if len(pod) and len(far):
+            values[name] = (float(pod.mean()), float(far.mean()))
+    if not values:
+        return [f"{lead:g}h 时效上没有可用的 POD/FAR，无法画出性能图。"]
+    distance = {
+        name: float(np.hypot(1.0 - pod, far)) for name, (pod, far) in values.items()
+    }
+    lines: List[str] = []
+    ranked = sorted(distance, key=lambda name: distance[name])
+    if len(ranked) == 1:
+        name = ranked[0]
+        lines.append(
+            f"单模型评估：{name} 在 {lead:g}h 的等级平均 POD {fmt_number(values[name][0])}、"
+            f"FAR {fmt_number(values[name][1])}，距右上角 {fmt_number(distance[name])}。"
+        )
+        return lines
+    if distance[ranked[-1]] - distance[ranked[0]] < 0.01:
+        lines.append(
+            f"各模型到右上角的距离接近（{fmt_number(distance[ranked[0]])}–"
+            f"{fmt_number(distance[ranked[-1]])}，极差不足 0.01），性能图的相对位置不构成区分度。"
+        )
+    else:
+        lines.append(
+            f"按到右上角的距离（√((1−POD)² + FAR²)）排序，{ranked[0]} 最近"
+            f"（{fmt_number(distance[ranked[0]])}），{ranked[-1]} 最远"
+            f"（{fmt_number(distance[ranked[-1]])}）。"
+        )
+    best_pod = max(values, key=lambda name: values[name][0])
+    best_far = min(values, key=lambda name: values[name][1])
+    lines.append(
+        f"POD 最高的是 {best_pod}（{fmt_number(values[best_pod][0])}），"
+        f"FAR 最低的是 {best_far}（{fmt_number(values[best_far][1])}）；"
+        + (
+            "同一模型同时拿下这两项，命中与空报没有此消彼长。"
+            if best_pod == best_far
+            else "两项不是同一个模型，说明命中与空报之间存在权衡。"
+        )
+    )
+    detail = "、".join(
+        f"{name}（POD {fmt_number(pod)} / FAR {fmt_number(far)}）"
+        for name, (pod, far) in sorted(values.items(), key=lambda item: distance[item[0]])
+    )
+    lines.append(f"各模型的等级平均位置：{detail}。")
+    return lines
+
+
+def _analysis_lead_rank(models: Dict[str, pd.DataFrame]) -> List[str]:
+    table = _lead_mean_values(models)
+    if table.empty:
+        return ["没有可用的时效数据。"]
+    lines: List[str] = []
+    winners: List[Tuple[float, Tuple[str, ...]]] = []
+    for lead, row in table.iterrows():
+        values = {name: float(row.get(name, np.nan)) for name in table.columns}
+        leaders = _leaders(values)
+        if leaders:
+            winners.append((float(lead), tuple(sorted(leaders))))
+    counts: Dict[str, int] = {}
+    for _, leaders in winners:
+        for name in leaders:
+            counts[name] = counts.get(name, 0) + 1
+    if len(table.columns) == 1:
+        name = str(table.columns[0])
+        lines.append(
+            f"单模型评估：{name} 在 {len(winners)} 个时效上都有有效 TS，"
+            f"各时效综合 TS 见上表。"
+        )
+        return lines
+    if counts:
+        detail = "、".join(
+            f"{name} {count} 个" for name, count in sorted(counts.items(), key=lambda item: -item[1])
+        )
+        lines.append(
+            f"在 {len(winners)} 个有时效可比的行里，各模型拿到头名的次数：{detail}。"
+        )
+    switches = [
+        index for index in range(1, len(winners)) if winners[index][1] != winners[index - 1][1]
+    ]
+    if switches:
+        index = switches[0]
+        before, after = winners[index - 1], winners[index]
+        lines.append(
+            f"领先者在 {before[0]:g}h 与 {after[0]:g}h 之间由 {'、'.join(before[1])} 变为 "
+            f"{'、'.join(after[1])}（整段共 {len(switches)} 处变化）。"
+        )
+    else:
+        lines.append("领先者在全部时效上保持不变。")
+    return lines
+
+
+# --------------------------------------------------------------------------- #
+# 分节渲染
+# --------------------------------------------------------------------------- #
+def _section_summary(
+    model_name: str,
+    models: Dict[str, pd.DataFrame],
+    summaries: Dict[str, Dict[str, object]],
+    overview: Dict[str, Dict[str, float]],
+    ranks: Dict[str, float],
+    *,
+    sources: Optional[Dict[str, str]],
+    coverage: Optional[Dict[str, int]],
+    change_description: Optional[str],
+    ensemble: bool,
+    members: Optional[int],
+    has_probability: bool,
+) -> List[str]:
+    summary = summaries[model_name]
+    leads = summary["leads"]
+    window = None
+    frame = models[model_name]
+    if "window_h" in frame.columns and frame["window_h"].notna().any():
+        window = float(frame["window_h"].dropna().iloc[0])
+    names = "、".join(models)
+    lines = ["# 1. 摘要", ""]
+    lines.append(
+        f"本报告评估 {names} 共 {len(models)} 个模型"
+        f"（{model_name} 的来源：{source_of(sources, model_name)}），"
+        + (f"集合每例 {int(members)} 个成员，" if (ensemble and members) else "")
+        + "".join(_coverage_sentence(coverage))
+        + "评估口径为站点分类检验（"
+        + (f"{window:g}h 累积窗口，" if window else "")
+        + f"时效 {leads[0]:g}–{leads[-1]:g}h 共 {len(leads)} 个，"
+        + f"每份 {summary['n_rows']} 条记录），指标为 TS、POD、FAR、漏报率与 BIAS。"
+        + (f"本次改动：{change_description}。" if change_description else "")
+        + f"报告生成时间：{datetime.now():%Y-%m-%d %H:%M}。"
+    )
+    lines.append("")
+    lines.append("".join(diagnose(summary)) + _comparison_sentence(models, overview, ranks))
+    lines.append("")
+    lines.append(f"**业务定性**：{business_conclusion(summary['grades'])}")
+    lines.append("")
+    if ensemble:
+        lines.append(
+            f"集合口径：TS / POD / FAR / 漏报率 / BIAS 均在{_members_phrase(members)}的"
+            f"**平均场**上计算（确定性口径），不是逐成员评分后再平均；"
+            + (
+                "成员离散信息只在 4.7 节的概率评分里体现。"
+                if has_probability
+                else "本批没有概率评分表，成员离散信息在这份报告里没有体现。"
+            )
+        )
+        lines.append("")
+    lines.append(
+        "本报告中的BIAS指频率偏差（预报事件数/观测事件数），BIAS > 1 表示预报事件偏多、"
+        "< 1 表示偏少，与平均误差不是同一个量。"
+    )
+    lines.append("")
+    return lines
+
+
+def _section_samples(
+    models: Dict[str, pd.DataFrame],
+    summaries: Dict[str, Dict[str, object]],
+    coverage: Optional[Dict[str, int]],
+) -> List[str]:
+    lines = ["# 2. 样本口径与数据质量", ""]
+    rows: List[List[str]] = []
+    for name, frame in models.items():
+        summary = summaries[name]
+        leads = summary["leads"]
+        window = None
+        if "window_h" in frame.columns and frame["window_h"].notna().any():
+            window = float(frame["window_h"].dropna().iloc[0])
+        thresholds = sorted({
+            float(value)
+            for value in pd.to_numeric(
+                frame.get("threshold_mm", pd.Series(dtype=float)), errors="coerce"
+            ).dropna()
+        })
+        pairs = coverage.get(name) if coverage else None
+        rows.append([
+            name,
+            fmt_number(window, 0),
+            f"{leads[0]:g}–{leads[-1]:g}",
+            str(len(leads)),
+            str(len(summary["grades"])),
+            "/".join(f"{value:g}" for value in thresholds) or "—",
+            str(summary["n_rows"]),
+            f"{int(pairs):,}" if pairs else "—",
+        ])
+    lines += _table_title(f"{cn_number(len(models))}模型样本覆盖")
+    lines += table_lines(
+        ["模型", "累积窗口(h)", "时效范围(h)", "时效数", "降水等级数",
+         "阈值(mm)", "记录数", "最小阈值档配对样本"],
+        rows,
+    )
+    lines.append("")
+    lines += bullet_lines(_coverage_sentence(coverage) + _consistency_sentences(models))
+    lines.append("")
+    lines.append(
+        "> 宽表不记录起报日期，本节无法给出日期跨度；样本量一律以**配对数**为准，"
+        "各份来源的起报日数差异只能从配对样本的比值反推。"
+    )
+    lines.append("")
+    return lines
+
+
+def _section_metrics(ensemble: bool = False) -> List[str]:
+    rows = [
+        ["TS", "hits/(hits+misses+false_alarms)", "越高越好"],
+        ["POD", "hits/(hits+misses)", "越高越好"],
+        ["FAR", "false_alarms/(hits+false_alarms)", "越低越好"],
+        ["漏报率", "1−POD", "越低越好"],
+        ["BIAS", "(hits+false_alarms)/(hits+misses)，频率偏差", "越接近 1 越好"],
+        ["综合TS", "各降水等级的 TS 等权平均（先合计列联表再算比率）", "越高越好"],
+    ]
+    if ensemble:
+        # 集合专属：成员离散信息只在这三个指标里出现。
+        rows += [
+            ["AROC", "概率评分：ROC 曲线下面积（逐成员概率）", "越高越好，0.5 为无技巧"],
+            ["BS", "Brier 分数（概率预报的均方误差）", "越低越好"],
+            ["BSS", "1 − BS/BS_ref，相对气候基准的 Brier 技巧", "越高越好，≤ 0 无正技巧"],
+        ]
+    lines = ["# 3. 评估指标与解释", ""]
+    lines += _table_title("指标口径")
+    lines += table_lines(["指标", "定义/口径", "方向"], rows)
+    lines.append("")
+    lines.append(
+        "「全时效平均」指**各时效等权平均**，不是按样本数加权；TS 为 “—” 表示该等级"
+        "没有有效配对或观测事件为 0，与「评分为 0.000」含义不同。"
+    )
+    lines.append("")
+    lines.append(
+        "TS = f(POD, FAR)（1/TS = 1/POD + 1/(1−FAR) − 1），三者是同一件事的三种写法；"
+        "总体表只保留综合 TS，POD / FAR 的绝对水平分别放在 4.2 / 4.3 节读。"
+    )
+    lines.append("")
+    if ensemble:
+        lines.append(
+            "概率评分使用独立的累积窗口与阈值，与上面 TS 那套不可混比；"
+            "AROC / BS / BSS 的口径与数值见 4.7 节。"
+        )
+        lines.append("")
+    return lines
+
+
+def _section_overall(
+    models: Dict[str, pd.DataFrame],
+    overview: Dict[str, Dict[str, float]],
+    ranks: Dict[str, float],
+    heavy: Optional[float],
+    artifacts: Optional[Dict[str, Path]],
+    numbering: _Numbering,
+    caption: str,
+    grades_caption: str,
+) -> List[str]:
+    lines = ["# 4. 总体评估结果", ""]
+    lines.append(
+        "本章先给总体排序与基准时效上的分等级对照，再按 TS / POD / FAR / BIAS 四个"
+        "指标各占一节展开，最后是跨时效稳定性、性能图与（集合报告的）概率评分。"
+    )
+    lines.append("")
+    labels = {
+        "ts": "综合TS",
+        "heavy": f"强降水TS（≥{heavy:g}mm）" if heavy is not None else "强降水TS",
+        "bias": "平均BIAS偏离度",
+        "iqr": "跨时效IQR（全等级平均）",
+        "rank": "平均名次",
+    }
+    order = sorted(
+        models,
+        key=lambda name: (
+            _sort_value(overview[name]["ts"]),
+            -_sort_value(ranks.get(name, float("nan"))),
+        ),
+        reverse=True,
+    )
+    rank_numbers: Dict[str, int] = {}
+    for name in order:
+        rank_numbers[name] = 1 + sum(
+            1 for other in order
+            if np.isfinite(overview[other]["ts"])
+            and np.isfinite(overview[name]["ts"])
+            and overview[other]["ts"] > overview[name]["ts"] + 1e-12
+        )
+    rows: List[List[str]] = []
+    for name in order:
+        values = overview[name]
+        rows.append([
+            f"{name}（第{rank_numbers[name]}）",
+            fmt_number(values["ts"]),
+            fmt_number(values["heavy"]),
+            fmt_number(values["bias"]),
+            fmt_number(values["iqr"]),
+            fmt_number(ranks.get(name, float("nan")), 2),
+        ])
+    lines += _table_title(f"{cn_number(len(models))}模型总体指标")
+    lines += table_lines(
+        ["模型（相对排序）", labels["ts"], labels["heavy"], labels["bias"],
+         labels["iqr"], labels["rank"]],
+        rows,
+    )
+    lines.append("")
+    lines += bullet_lines(_analysis_overview(models, overview, ranks, heavy))
+    lines.append("")
+    lines += _figure_block(artifacts, numbering, "overall_heatmap", caption)
+    lines += _figure_block(artifacts, numbering, "metrics_at_lead", grades_caption)
+    return lines
+
+
+def _section_ts(
+    models: Dict[str, pd.DataFrame],
+    summaries: Dict[str, Dict[str, object]],
+    primary: str,
+    artifacts: Optional[Dict[str, Path]],
+    numbering: _Numbering,
+    caption: str,
+) -> List[str]:
+    lines = ["## 4.1 TS（技巧评分）", ""]
+    lines.append(
+        "TS 同时惩罚漏报与空报，是这一批的主排序指标。下表按降水等级展开，"
+        "其后是主模型的列联表计数与各模型的时效衰减——技巧掉到不可用之前能推多远。"
+    )
+    lines.append("")
+    lines += _table_title("各模型各降水等级的全时效平均TS")
+    lines.append(
+        _grade_metric_table(
+            models, summaries, key="TS_sum", best_label="最佳"
+        )
+    )
+    lines.append("")
+    lines += _table_title(f"{primary}的逐等级列联表计数（全时效合计）")
+    lines.append(_grade_counts_table(summaries[primary]))
+    lines.append("")
+    lines += _table_title("各模型的时效衰减（等级等权平均TS）")
+    lines.append(_lead_decay_table(models))
+    lines.append("")
+    lines += _figure_block(artifacts, numbering, "ts_vs_lead", caption)
+    lines += bullet_lines(
+        _analysis_grades(models, summaries, primary) + _analysis_leads(models)
+    )
+    lines.append("")
+    return lines
+
+
+def _section_pod(
+    models: Dict[str, pd.DataFrame],
+    summaries: Dict[str, Dict[str, object]],
+    artifacts: Optional[Dict[str, Path]],
+    numbering: _Numbering,
+    caption: str,
+) -> List[str]:
+    lines = ["## 4.2 POD（命中率）", ""]
+    lines.append(
+        "POD = hits/(hits+misses)，回答「实际下了的雨，预报到了多少」。POD 高不代表"
+        "技巧好——把所有格点都报成有雨同样能把 POD 做高，必须与 4.3 的 FAR 一起读。"
+    )
+    lines.append("")
+    lines += _table_title("各模型各降水等级的POD（全时效平均，越高越好）")
+    lines.append(
+        _grade_metric_table(models, summaries, key="POD_sum", best_label="最佳")
+    )
+    lines.append("")
+    lines += _figure_block(artifacts, numbering, "pod_vs_lead", caption)
+    lines += bullet_lines(
+        _analysis_metric(models, summaries, key="POD", label="POD", higher=True)
+    )
+    lines.append("")
+    return lines
+
+
+def _section_far(
+    models: Dict[str, pd.DataFrame],
+    summaries: Dict[str, Dict[str, object]],
+    artifacts: Optional[Dict[str, Path]],
+    numbering: _Numbering,
+    caption: str,
+) -> List[str]:
+    lines = ["## 4.3 FAR（空报率）", ""]
+    lines.append(
+        "FAR = false_alarms/(hits+false_alarms)，回答「报了雨的格点里，有多少其实没下」，"
+        "越低越好。把它与漏报率（1−POD）放在一起看，才知道误差偏向空报还是漏报。"
+    )
+    lines.append("")
+    lines += _table_title("各模型各降水等级的FAR（全时效平均，越低越好）")
+    lines.append(
+        _grade_metric_table(
+            models, summaries, key="FAR_sum", best_label="最佳", lower=True
+        )
+    )
+    lines.append("")
+    lines += _figure_block(artifacts, numbering, "far_vs_lead", caption)
+    lines += bullet_lines(
+        _analysis_metric(models, summaries, key="FAR", label="FAR", higher=False)
+        + _analysis_far_bias(models, summaries)
+    )
+    lines.append("")
+    return lines
+
+
+def _section_bias(
+    models: Dict[str, pd.DataFrame],
+    summaries: Dict[str, Dict[str, object]],
+    artifacts: Optional[Dict[str, Path]],
+    numbering: _Numbering,
+    caption: str,
+) -> List[str]:
+    lines = ["## 4.4 BIAS（频率偏差）", ""]
+    lines.append(
+        "BIAS = (hits+false_alarms)/(hits+misses)，1 为无偏、>1 为报得偏多、<1 为偏少。"
+        "它只看次数不看强度，量级正确与否由 TS 与 FAR 负责。"
+    )
+    lines.append("")
+    lines += _table_title("各模型各降水等级的BIAS（全时效平均，越接近1越好）")
+    lines.append(
+        _grade_metric_table(
+            models, summaries, key="BIAS_sum", best_label="最接近1", closer=True
+        )
+    )
+    lines.append("")
+    lines += _figure_block(artifacts, numbering, "bias_vs_lead", caption)
+    lines += bullet_lines(
+        _analysis_metric(
+            models, summaries, key="BIAS", label="BIAS", closer=True
+        )
+    )
+    lines.append("")
+    return lines
+
+
+def _section_stability(
+    models: Dict[str, pd.DataFrame],
+    primary: str,
+    artifacts: Optional[Dict[str, Path]],
+    numbering: _Numbering,
+    caption: str,
+) -> List[str]:
+    lines = ["## 4.5 跨时效稳定性", ""]
     lines.append(
         "把同一模型、同一量级在各时效上的 TS 视为一个样本，用箱线图刻画其离散程度——"
         "平均技巧相同的两个模型，稳定性可能差很远。"
     )
     lines.append("")
-    lines += _table_caption(numbering, "各模型 × 各降水等级 TS 的跨时效分布统计量")
+    lines += _table_title("各模型 × 各降水等级 TS 的跨时效分布统计量")
     lines.append(_box_table(models))
     lines.append("")
     lines.append(_BOX_NOTE)
     lines.append("")
-    lines += _figure_block(artifacts, numbering, "TS_boxplot", captions["TS_boxplot"])
-    lines.append(f"**小结**：{analysis_stability(models, primary)}")
+    lines += _figure_block(artifacts, numbering, "TS_boxplot", caption)
+    lines += bullet_lines(_analysis_stability(models, primary))
     lines.append("")
     return lines
 
 
-def _section_comparison(
-    data: pd.DataFrame,
-    comparisons: Dict[str, pd.DataFrame],
-    artifacts,
+def _section_performance(
+    models: Dict[str, pd.DataFrame],
+    lead: float,
+    artifacts: Optional[Dict[str, Path]],
+    numbering: _Numbering,
+    caption: str,
+) -> List[str]:
+    lines = ["## 4.6 性能图", ""]
+    lines.append(
+        f"性能图把 POD 与 1−FAR 放在同一平面上：点越靠近右上角，命中越多、空报越少。"
+        f"下表取 {lead:g}h 时效、各等级等权平均。"
+    )
+    lines.append("")
+    lines += _table_title(f"{lead:g}h 时效各模型的命中率与空报率")
+    lines.append(_performance_table(models, lead))
+    lines.append("")
+    lines += _figure_block(artifacts, numbering, "performance_diagram", caption)
+    lines += bullet_lines(_analysis_performance(models, lead))
+    lines.append("")
+    return lines
+
+
+def _section_probability(
+    probability: Optional[Dict[str, pd.DataFrame]],
+    artifacts: Optional[Dict[str, Path]],
     numbering: _Numbering,
     captions: Dict[str, str],
     *,
-    lead: float,
-    heading: str,
-    caption: str,
-    note: Optional[str],
+    members: Optional[int],
+    ts_window: Optional[float],
+    ts_thresholds: str,
 ) -> List[str]:
-    lines = [heading, ""]
-    lines.append("以下比较在同一时效、同一阈值口径下进行。")
+    """「4.7 概率评分（AROC / BSS）」——集合报告固定占位，确定性不调用。
+
+    AROC 与 BSS 各占一张图（两张分开出），缺表时两个图号一起保留。
+    """
+    lines = ["## 4.7 概率评分（AROC / BSS）", ""]
+    if not probability:
+        numbering.reserve("aroc_vs_lead")
+        numbering.reserve("bss_vs_lead")
+        lines += [
+            "**本批未出。** 产物里没有 `diagnostics/probability_wide.csv`；"
+            "这份表由独立能力 `weather_ts_ens_prob` 写出，只有配置里写 "
+            '`pipeline=["weather_ts_ens", "weather_ts_ens_prob"]` 才会落盘。',
+            "",
+            "因此本节无表、无图，保留节位与图号以便将来补数后直接填入。",
+            "",
+        ]
+        return lines
+
+    summaries = {name: probability_summary(frame) for name, frame in probability.items()}
+    primary = next(iter(probability))
+    window = _probability_window(probability[primary])
+    window_text = f"{window:g}h" if window else "概率"
+    lines[0] = f"## 4.7 概率评分（AROC / BSS，{window_text} 累积窗口）"
+
+    leads = sorted(
+        float(value)
+        for value in pd.to_numeric(probability[primary]["lead_h"], errors="coerce").dropna()
+    )
+    span = f"{leads[0]:g}–{leads[-1]:g}h" if leads else "各时效"
+
+    lines += [
+        f"前面各节评的都是{_members_phrase(members)}的**平均场**，成员之间的离散信息"
+        f"一点没进指标——一个成员高度一致、另一个成员四散分布的集合，前面的分数"
+        f"可以完全相同。本节改用全体成员的概率分布：AROC 衡量预报概率把事件与非事件"
+        f"分开的能力（0.5 为无技巧），BSS 衡量相对气候基准的 Brier 技巧（>0 才算有正技巧）。",
+        "",
+        f"**本节与前面各节不同口径**：概率评分用 {window_text} 累积窗口、"
+        f"阈值 {_threshold_list(probability[primary])}，与前面 "
+        + (f"{ts_window:g}h / " if ts_window else "")
+        + f"{ts_thresholds} 既不可比，也不要画进同一张图。",
+        "",
+    ]
+    lines += _table_title("各降水等级的概率评分（各时效等权平均；AVG 为可算阈值的等权平均）")
+    lines.append(_probability_table(summaries, with_model=len(summaries) > 1))
     lines.append("")
-    lines += _table_caption(numbering, caption)
-    lines.append(_table_body_of(comparisons, data, lead))
+    lines.append(_probability_note(window))
     lines.append("")
-    if note:
-        lines.append(note)
-        lines.append("")
-    lines += _figure_block(artifacts, numbering, "multi_model_TS_delta", captions["multi_model_TS_delta"])
-    lines.append(f"**小结**：{analysis_comparison(data, comparisons, lead)}")
+    lines += _figure_block(artifacts, numbering, "aroc_vs_lead", captions["aroc_vs_lead"])
+    lines += _figure_block(artifacts, numbering, "bss_vs_lead", captions["bss_vs_lead"])
+    lines += bullet_lines(analysis_probability(summaries))
     lines.append("")
     return lines
 
 
-def _table_body_of(
-    comparisons: Dict[str, pd.DataFrame], data: pd.DataFrame, lead: float
-) -> str:
-    """单基准是多模型的一个特例——表体按对比对象的个数选，别让两个分支各写一遍。"""
-    if len(comparisons) == 1:
-        name, frame = next(iter(comparisons.items()))
-        return _baseline_table(data, frame, lead)
-    return _multi_baseline_table(data, comparisons, lead)
-
-
-def _section_capability(
+def _section_lead_rank(
     models: Dict[str, pd.DataFrame],
+    artifacts: Optional[Dict[str, Path]],
     numbering: _Numbering,
-    *,
-    heading: str,
-    radar_path: Optional[Path],
+    caption: str,
 ) -> List[str]:
-    """「模型能力雷达图」一节——综合评分的批内归一化对比。
+    lines = ["# 5. 分时效表现", ""]
+    lines.append(
+        "把每个时效、各降水等级的 TS 做等权平均，得到该时效的综合 TS——"
+        "它回答「换一个预报时效，领先者会不会换人」。"
+    )
+    lines.append("")
+    lines += _table_title("各时效各模型的综合TS")
+    lines.append(_lead_mean_table(models))
+    lines.append("")
+    lines += _figure_block(artifacts, numbering, "lead_dot", caption)
+    lines += bullet_lines(_analysis_lead_rank(models))
+    lines.append("")
+    return lines
 
-    轴与原始值来自 :func:`capability_profile`，归一化来自 ``det_plots.radar_scores``，
-    这一节只把结果写成文；判读句也读同一份 ``scores``，免得图和文字各算一遍。
-    """
-    # 延迟导入：``det_plots`` 在模块层 import 了 ``precipitation_plots``，后者又
-    # import 本模块——放模块层会绕成一个环，``import ts_report`` 直接失败。
-    from xmetai_evaluation.visualization.det_plots import radar_scores
 
-    axes, raw, higher = capability_profile(models)
-    scores = radar_scores(raw, axes, higher)
-    names = [str(name) for name in models]
-    kept = [axis for axis in axes if names and axis in scores[names[0]]]
-    dropped = [axis for axis in axes if axis not in kept]
-
-    lines = [heading, ""]
-    lines += [
-        "这一节把前面几张表的**综合评分**摆成多边形：每根轴一种能力，每个模型一个",
-        "多边形，**越靠外越好**。它不引入任何新算法，只是把前面的数换个读法——",
-        "看的是「能力形状」，不是「谁排第一」：两个模型综合分接近时，雷达图能显出",
-        "差距集中在哪几项上。",
-        "",
-        f"共 {len(kept)} 根轴，方向已在括号里标明（越高越好 / 越低越好）："
-        + "；".join(
-            f"{axis}（{'越高越好' if higher[axis] else '越低越好'}）" for axis in kept
+def _section_conclusions(
+    models: Dict[str, pd.DataFrame],
+    summaries: Dict[str, Dict[str, object]],
+    primary: str,
+    *,
+    ensemble: bool,
+    has_probability: bool,
+    coverage: Optional[Dict[str, int]],
+) -> List[str]:
+    lines = ["# 6. 结论与建议", ""]
+    lines += _table_title("改进建议")
+    for index, item in enumerate(recommendations(summaries[primary]["grades"]), start=1):
+        lines.append(f"{index}. {item}")
+    lines.append("")
+    lines += _table_title("口径与注意事项")
+    lines.append("- **值缺失的含义**：TS 为 “—” 表示该等级没有有效配对或无事件，与“评分为 0”不同；")
+    lines.append("- **BIAS 不是平均误差**：它是频率偏差，>1 表示预报事件偏多，<1 表示偏少；")
+    if ensemble:
+        lines.append(
+            "- **前面各节评的是集合平均场**：TS / POD / FAR / 漏报率 / BIAS 都不含成员离散信息，"
+            + ("成员分布要看 4.7 节；" if has_probability else "本批未跑概率评分；")
         )
-        + "。",
-        "",
-    ]
-    if dropped:
-        lines += [
-            f"**有 {len(dropped)} 根轴本批未画**：{'、'.join(dropped)}——"
-            "这些轴上有模型缺值。雷达图没有断点，少画一个顶点会把多边形拉歪，"
-            "所以整根剔除，不拿 0 顶替（那是「这项能力为零」，不是「没有这项能力」）。",
-            "",
-        ]
-    lines += [
-        "**读法**：纵轴 0–1 是**批内相对分**，每根轴上 1 = 本批最好、0 = 本批最差",
-        "（各轴方向先行统一）。"
-        f"这是{_model_count_word(len(names))}模型互比出来的相对位置，**不是绝对能力分**",
-        "——全批都差时每根轴照样有人拿 1；只有两个模型时必然是 1 和 0。某一根轴上所有",
-        "模型打平时，该轴一律画在满格 1.0（画成 0 会让多边形凭空凹进去），所以**满格",
-        "不代表领先**，要回前面几节看绝对数值。",
-        "",
-    ]
-
-    if radar_path is not None and Path(radar_path).exists():
-        caption = (
-            f"{_model_count_word(len(names))}模型能力雷达图（{len(kept)} 根综合评分轴；"
-            "各轴批内 min-max 归一化，1 = 本批最好）"
+        if has_probability:
+            lines.append(
+                "- **概率评分与 TS 不可混比**：两者的累积窗口与阈值都不同，AROC 还是逐成员概率口径；"
+            )
+    if coverage and len(coverage) > 1:
+        values = [int(value) for value in coverage.values() if value]
+        if values and min(values) < 0.9 * max(values):
+            lines.append(
+                "- **各模型的样本量并不相同**：第二节列的是各份实测配对数，"
+                "差值来自起报日数而非口径；样本最少的那份名次波动最大，横向比高低前先看那一行；"
+            )
+    lines.append("- **跨时效不要直接平均后比较模型**：正式对比应使用共同有效样本与固定验证口径；")
+    lines.append(
+        "- 结果来自统一长表（`scores.csv` / `categorical_wide.csv`"
+        + (
+            "，概率评分另见同目录的 `probability_wide.csv`（老归档叫 `aroc_bss*.csv`）"
+            if has_probability
+            else ""
         )
-        lines += [
-            f"![capability_radar]({Path(radar_path).name})",
-            "",
-            f"图 {numbering.figure('capability_radar')}：{caption}",
-            "",
-        ]
-    else:
-        # 走到这里说明图没落盘。轴有空缺本来就会整根剔除、不至于一根不剩，
-        # 所以这不是「这批数据没跑到」，是渲染器或调用方出了问题。
-        lines += [
-            "**本批未出。** 渲染器没拿到雷达图的落盘路径。这一节**不像别处那样"
-            "依赖可选数据**——综合评分几根轴每个批次都有，正常跑必然出图；"
-            "缺了就是渲染器或调用方出了问题，该回去查，不要当成「这批数据没跑到」。",
-            "",
-        ]
-
-    if names and kept:
-        outer = max(names, key=lambda name: sum(scores[name].values()))
-        inner = min(names, key=lambda name: sum(scores[name].values()))
-        if outer != inner:
-            lines += [
-                f"多边形面积最大的是 {outer}（各轴得分之和 "
-                f"{_fmt(sum(scores[outer].values()), 2)}），"
-                f"最小的是 {inner}（{_fmt(sum(scores[inner].values()), 2)}）。",
-                "",
-            ]
+        + "），逐行可追溯到具体时效与阈值。"
+    )
+    lines.append("")
     return lines
 
 
 # ------------------------------------------------------------- 分纬度带（附 L）
-#: 分带小节的图名：既是 ``artifacts`` 里的键，也是报告里 ``![…]()`` 的标签。
-REGION_FIGURE = "region_TS_vs_lead"
-
-#: 这份产物**一条带都没落数**时的说明。保留节位、写清原因，不静默省略——
-#: 与 ``weather_rmse_wave.md`` 里球谐带那几节、``det_report`` 的「附 L」同一套约定。
-_REGION_MISSING_NOTE = (
-    "这份产物的宽表里没有 `region` 行：本次评测没配 `options[\"regions\"]`"
-    "（或者配了但没有任何一条带算出结果）。"
-)
-
-
 def region_labels_from(root: Path) -> Dict[str, str]:
-    """``{带名: 边界串}``，边界取自产物 ``manifest["regions"]``（形如 ``south[0, 15]``）。
-
-    带名与边界都**照搬配置**的 ``options["regions"]``：报告不翻译、也不写死任何
-    带名，配置里叫什么就显示什么；要换一套切法改配置重跑即可，报告这边一个字
-    都不用动。读不到 manifest（直接调 ``build_ts_report``、产物目录不在手边）就
-    返回空——那时带宽只显示带名，不编一个边界出来。
-
-    实现复用 ``det_report`` 的同一份解析：``manifest["regions"]`` 这个键的形状
-    只有一处定义，两份报告各解析一遍迟早对不上。**延迟导入**是因为
-    ``precipitation_plots`` 在模块层 import 了本模块，本模块在模块层再 import
-    回去就绕成一个环。
-    """
+    """``{带名: 边界串}``，边界取自产物 ``manifest["regions"]``。"""
     from xmetai_evaluation.visualization.det_report import region_labels
 
     try:
@@ -1740,12 +2195,7 @@ def region_labels_from(root: Path) -> Dict[str, str]:
 
 
 def _band_order(names: Sequence[str], labels: Optional[Dict[str, str]]) -> List[str]:
-    """带名按**南界从低到高**排。
-
-    纬度带天生分南北，按名字排中文是乱序（东北 / 南方 / 华北 / 长江中下游），
-    一张按纬度排好的表读者一眼就能扫完。边界只在 manifest 里，取不到（老产物、
-    直接调 ``build_ts_report``）时退回按名字升序——不编一个边界出来排。
-    """
+    """带名按**南界从低到高**排；取不到边界时退回按名字升序。"""
     def key(name: str):
         head = str((labels or {}).get(name, "")).split(",")[0].strip()
         try:
@@ -1759,12 +2209,7 @@ def _band_order(names: Sequence[str], labels: Optional[Dict[str, str]]) -> List[
 def _region_table(
     band_frames: Dict[str, pd.DataFrame], labels: Optional[Dict[str, str]]
 ) -> str:
-    """带 × 降水等级 的 TS 表，末列是各带自己的「全等级等权平均」。
-
-    口径与第二节、能力雷达图的综合轴**完全同源**——都走 ``summarize``
-    （先把列联表合计再算比率，再对各等级等权平均），不在这里另算一遍：
-    同一个「综合」两处各算一遍，迟早只在一处修好。
-    """
+    """带 × 降水等级 的 TS 表，末列是各带自己的「全等级等权平均」。"""
     from xmetai_evaluation.visualization.det_report import region_display
 
     grades = [str(grade) for grade in ordered_grades(list(band_frames.values()))]
@@ -1774,11 +2219,11 @@ def _region_table(
         frame = band_frames[name]
         summary = summarize(frame)
         by_grade = {entry["grade"]: entry for entry in summary["grades"]}
-        cells = [_fmt(by_grade[grade]["TS"]) if grade in by_grade else "—" for grade in grades]
+        cells = [fmt_number(by_grade[grade]["TS"]) if grade in by_grade else "—" for grade in grades]
         lines.append(
             "| "
             + " | ".join(
-                [region_display(name, labels or {})] + cells + [_fmt(summary["overall_ts"])]
+                [region_display(name, labels or {})] + cells + [fmt_number(summary["overall_ts"])]
             )
             + " |"
         )
@@ -1788,11 +2233,7 @@ def _region_table(
 def _region_reading(
     band_frames: Dict[str, pd.DataFrame], labels: Optional[Dict[str, str]]
 ) -> str:
-    """分带判读句：最强的带、最弱的带、差多少，以及头名是否随预报时效翻转。
-
-    「翻转」按各带**逐时效**的 TS（等级等权平均）比：整段平均出来的名次在
-    某些时效上未必成立，而这正是分带要回答的问题。
-    """
+    """分带判读句：最强的带、最弱的带、差多少，以及头名是否随预报时效翻转。"""
     overall = {
         name: float(summarize(frame)["overall_ts"]) for name, frame in band_frames.items()
     }
@@ -1800,26 +2241,24 @@ def _region_reading(
     if len(finite) < 2:
         return "各带的有效样本不足以横向比较（至少要有两条带各自算出 TS）。"
 
-    # 并列判定按**表里显示出来的精度**（三位小数）：表上两行一模一样却写「相差
-    # 0.000」，或者硬点一个第一名出来，都是文字和图各说各话。
     ranked = sorted(finite.items(), key=lambda item: item[1], reverse=True)
 
     def _tied(value: float) -> List[str]:
-        key = _fmt(value)
-        return [name for name, item_value in ranked if _fmt(item_value) == key]
+        key = fmt_number(value)
+        return [name for name, item_value in ranked if fmt_number(item_value) == key]
 
     tops, bottoms = _tied(ranked[0][1]), _tied(ranked[-1][1])
     if tops == bottoms:
         text = (
-            f"各带的全等级等权平均 TS 都是 {_fmt(ranked[0][1])}，"
+            f"各带的全等级等权平均 TS 都是 {fmt_number(ranked[0][1])}，"
             f"带间分不出高下（差距小于表里的显示精度）。"
         )
         best_names = set(tops)
     else:
         text = (
             f"各带之中全等级等权平均 TS 最高的是 {_join_bands(tops, labels)}"
-            f"（{_fmt(ranked[0][1])}），最低的是 {_join_bands(bottoms, labels)}"
-            f"（{_fmt(ranked[-1][1])}），相差 {_fmt(ranked[0][1] - ranked[-1][1])}"
+            f"（{fmt_number(ranked[0][1])}），最低的是 {_join_bands(bottoms, labels)}"
+            f"（{fmt_number(ranked[-1][1])}），相差 {fmt_number(ranked[0][1] - ranked[-1][1])}"
             f"{'——并列。' if len(tops) > 1 else '。'}"
         )
         best_names = set(tops)
@@ -1839,7 +2278,7 @@ def _region_reading(
         if not values:
             continue
         lead_best = max(values.values())
-        lead_tops = {name for name, value in values.items() if _fmt(value) == _fmt(lead_best)}
+        lead_tops = {name for name, value in values.items() if fmt_number(value) == fmt_number(lead_best)}
         if not lead_tops & best_names:
             flips += 1
     if flips:
@@ -1865,11 +2304,7 @@ def _section_regions(
     artifacts: Optional[Dict[str, Path]],
     figure: Optional[Path],
 ) -> List[str]:
-    """「附 L 分纬度带结果（可选）」——空数据时保留节位并写「本批未出」。
-
-    图号走**独立命名空间** `图 L1`：这一块是可选的，删掉它不该动正文任何一个
-    编号（与 ``weather_rmse_single.md`` 的「附 L / 附 S」同一条约定）。
-    """
+    """「附 L 分纬度带结果（可选）」——空数据时保留节位并写「本批未出」。"""
     lines = ["## 附 L 分纬度带结果（可选）", ""]
     if not band_frames:
         lines += [f"**本块本批未出。** {_REGION_MISSING_NOTE}", ""]
@@ -1878,30 +2313,98 @@ def _section_regions(
     lines += [
         "本块把宽表里 `region` 非空的行**单独汇总**，全球行**不参与**——全球平均与",
         "纬度带平均是两个量，混在一起算会把带间差异整个抹平，这一块也就没有意义了。",
-        "带名与边界照搬评测配置 `options[\"regions\"]`：**报告不翻译、也不写死任何带名**，",
-        "配置里叫 `south` 就显示 `south`；要换一套切法改配置重跑即可，报告这边一个字",
-        "都不用动。表里的口径与第二节完全一致（先合计列联表再算比率，再对等级等权平均），",
+        "带名与边界照搬评测配置 `options[\"regions\"]`：**报告不翻译、也不写死任何带名**。",
+        "表里的口径与 4.1 节完全一致（先合计列联表再算比率，再对等级等权平均），",
         "末列的「综合」就是该带自己的全等级等权平均。",
         "",
-        "**分纬度带 TS（各降水等级，全时效平均）**",
-        "",
-        _region_table(band_frames, labels),
-        "",
-        _region_reading(band_frames, labels),
-        "",
-        "> 这一块**只汇总主模型**：按带切和按模型切是两个正交的维度，硬塞进同一张表，",
-        "> 会出现「同一个名字既是带名又是模型名」的歧义。另外，各带的站点数差得远时",
-        "> TS 的抽样噪声也不一样，差一两个百分点不必当结论。",
-        "",
     ]
+    lines += _table_title("分纬度带 TS（各降水等级，全时效平均）")
+    lines.append(_region_table(band_frames, labels))
+    lines.append("")
+    lines.append(_region_reading(band_frames, labels))
+    lines.append("")
+    lines.append(
+        "> 这一块**只汇总主模型**：按带切和按模型切是两个正交的维度，硬塞进同一张表，"
+        "会出现「同一个名字既是带名又是模型名」的歧义。另外，各带的站点数差得远时"
+        "TS 的抽样噪声也不一样，差一两个百分点不必当结论。"
+    )
+    lines.append("")
     if figure is not None and REGION_FIGURE in (artifacts or {}):
         lines += [
             f"![{REGION_FIGURE}]({figure.name})",
             "",
-            "图 L1：各纬度带 TS 随时效变化（每个降水等级一个子图，纵轴 0–1）",
+            "图 L1：各纬度带 TS 随时效变化（每个降水等级一个子图，纵轴 0–1）。",
             "",
         ]
     return lines
+
+
+# --------------------------------------------------------------------------- #
+# 主入口
+# --------------------------------------------------------------------------- #
+def _captions(
+    models: Dict[str, pd.DataFrame],
+    *,
+    window: Optional[float],
+    lead: float,
+    heavy: Optional[float],
+) -> Dict[str, str]:
+    summary = summarize(next(iter(models.values())))
+    span = f"{summary['leads'][0]:g}–{summary['leads'][-1]:g}h"
+    window_text = f"{window:g}h 累积窗口" if window else "本次评估窗口"
+    return {
+        "overall_heatmap": (
+            f"{cn_number(len(models))}模型总体指标热力图。列为指标（综合TS、强降水TS "
+            f"越高越好，|BIAS−1|、跨时效IQR、平均名次越低越好），行按综合 TS 从好到差排列；"
+            f"格内数字为原始值。颜色是该列在本批模型内的归一化相对表现（1 = 最优、0 = 最差），"
+            f"各列量纲不同，颜色只在同一列内可比，不能跨列比较。"
+        ),
+        "metrics_at_lead": (
+            f"基准时效 {lead:g}h（{window_text}）各模型在各降水等级上的 TS、POD、FAR 与 BIAS 对比；"
+            f"每格一组柱、按模型着色，BIAS 格内虚线为理想值 1（纵轴自适应、不截断）。"
+        ),
+        "ts_vs_lead": (
+            f"{span} 各模型分降水等级的 TS 曲线，一个等级一个子图、每个模型一条实线；"
+            f"纵轴按各子图数据范围缩放，便于分辨模型间差异，"
+            f"绝对数值见 §4.1 的逐等级表与时效衰减表。"
+        ),
+        "pod_vs_lead": (
+            f"{span} 各模型分降水等级的 POD 曲线，一个等级一个子图；"
+            f"纵轴锁定 0–1，绝对数值见 §4.2 的逐等级表。"
+        ),
+        "far_vs_lead": (
+            f"{span} 各模型分降水等级的 FAR 曲线，一个等级一个子图；"
+            f"纵轴锁定 0–1、越低越好，绝对数值见 §4.3 的逐等级表。"
+        ),
+        "bias_vs_lead": (
+            f"{span} 各模型分降水等级的 BIAS 曲线，一个等级一个子图；"
+            f"虚线为理想值 1，纵轴自适应、不截断，绝对数值见 §4.4 的逐等级表。"
+        ),
+        "TS_boxplot": (
+            "各模型 TS 的跨时效分布；箱体越高表示该量级整体技巧越好、越窄表示跨时效越稳定，"
+            "空心圆为离群时效。纵轴在 0.6 处断开、上段只标 1 的天花板，"
+            "下段刻度每 0.1 一格。"
+        ),
+        "performance_diagram": (
+            f"{lead:g}h 时效的性能图：横轴为成功比 1−FAR、纵轴为命中率 POD，"
+            f"灰色虚线为 TS 等值线、点线为 BIAS 参考线；每个模型一条线按阈值由小到大连接，"
+            f"点越靠近右上角技巧越好。"
+        ),
+        "aroc_vs_lead": (
+            "概率评分的 AROC 随时效变化，2×2 每格一个阈值；各模型一律实线，"
+            "纵轴从各模型各阈值的最低值稍下起、刻度每 0.1 一格，"
+            "越靠上区分能力越强，0.5 为无技巧（不画辅助线，读数看纵轴）。"
+        ),
+        "bss_vs_lead": (
+            "概率评分的 BSS 随时效变化，2×2 每格一个阈值；各模型一律实线，"
+            "纵轴按各档数据范围自适应，越靠上越优于气候基准，"
+            "0 为无正技巧（不画辅助线，读数看纵轴）。"
+        ),
+        "lead_dot": (
+            "分时效综合 TS 点图（每行一个时效、每个模型一个点，点越靠右技巧越好）；"
+            "竖虚线为 0.1 参考线，点落到线左侧表示该时效综合 TS 已低于 0.1。"
+        ),
+    }
 
 
 def build_ts_report(
@@ -1924,56 +2427,21 @@ def build_ts_report(
     coverage: Optional[Dict[str, int]] = None,
     ensemble: bool = False,
 ) -> Path:
-    """写一份 Markdown 报告。
+    """写一份 Markdown 报告（六章 + 附录，表不编号、图连续编号）。
 
-    每一节都是「引导句 → 图表 → 小结」：图就地带着 `图 N：` 图注出现，
-    表上方带 `表 N：` 表题，节末一段带具体数值的分析。末尾不再有「图表」索引节——
-    图都在正文里，再列一遍只是重复，还会让人以为是两张不同的图。
-
-    Args:
-        box_models: 第五节箱线图的模型集合（本模型 + 各对比模型）。
-            由 ``create_report`` 算好传进来，与它画图用的是**同一个 dict**；
-            不传则按 ``model_name`` + ``baseline_df``/``baseline_name`` + ``baselines``
-            自己拼一份（直接调本函数的场景，比如测试）。
-        region_frames: ``{带名: 该带的宽表行}``，进末尾的「附 L」。不传就自己从
-            ``data`` 的 ``region`` 列里切一份（见 ``precipitation_plots.split_regions``）；
-            ``create_report`` 已经把全球行筛出来传进来了，那时从 ``data`` 里切只能
-            得到空集，所以它显式传这个参数。
-        region_labels: ``{带名: 边界串}``，只影响带名怎么写（``south [0, 15]``），
-            取不到就只显示带名。
-        probability: ``{模型名: 概率宽表}``（``diagnostics/probability_wide.csv``，
-            含主模型）。给了就多出「概率评分（AROC / BSS）」一节，**后面所有章节号
-            顺延一位**；不给（确定性产物、或集合没跑 ``weather_ts_ens_prob`` 那一段）
-            整节不出现，章节号原样。
-        members: 主模型的集合成员数（``--members``）。产物里没有这个字段，
-            拿不到时相关句子里不写数字。只有 ``ensemble=True`` 时用得上。
-        coverage: ``{模型名: 有效配对数}``，进第一节的实测覆盖句。本报告的对比表
-            只写分数、不写样本量，而各份来源的起报日数可以差一个量级——不写出来，
-            读者会把样本最少的那份的名次当成结论。
-        ensemble: 是不是集合产物。打开才出集合专属措辞（标题的「集合预报」、
-            第一节的「集合口径」段、第十节的两条集合提示）。**默认关**：确定性与
-            FDP 两条流程共用本模块，骨架与逐字测试都对着它们，不能被牵连。
+    ``box_models`` 是参与对比的模型集合（主模型在前），``create_report`` 传进来
+    的那一份同时用于画图，两边必须同一份；不传则按 ``model_name`` + ``baseline_*``
+    自拼。``region_frames`` / ``region_labels`` 进「附 L」。``probability`` 只在
+    集合报告里占 §4.7 的固定图号；确定性报告整节省略、图号顺延。
     """
     output_path = Path(output_path)
-    # 全球行与带行分开算：``data`` 里混着带行时，第二～五节会把同一天算好几遍。
-    # 传进来的已经是全球行（create_report 切过）时这一步是恒等的。
-    # 延迟导入：``precipitation_plots`` 在模块层 import 了本模块。
+    # 全球行与带行分开算：``data`` 里混着带行时，各节会把同一天算好几遍。
     from xmetai_evaluation.visualization.precipitation_plots import split_regions
 
     data, derived_regions = split_regions(data)
     if region_frames is None:
         region_frames = derived_regions
-    summary = summarize(data)
-    findings = diagnose(summary)
-    grades = summary["grades"]
-    leads = summary["leads"]
-    window = None
-    if "window_h" in data.columns and data["window_h"].notna().any():
-        window = float(data["window_h"].dropna().iloc[0])
-    lead = float(lead_h) if lead_h is not None else leads[0]
 
-    # 模型集合由 create_report 算好传进来（它同时拿去画图）；直接调 build_ts_report 的
-    # 调用方没给，就按同样的规则自己拼一份，别让表和图用两套模型集合。
     models = box_models if box_models is not None else collect_box_models(
         model_name,
         data,
@@ -1981,261 +2449,163 @@ def build_ts_report(
         baseline_name=baseline_name,
         baselines=baselines,
     )
-    # 单基准和多模型走同一条比较路径——单基准只是"一个对比对象"的特例
-    comparisons: Dict[str, pd.DataFrame] = dict(baselines or {})
-    if baseline_df is not None:
-        comparisons.setdefault(baseline_name or "基准", baseline_df)
+    if model_name not in models:
+        models = {model_name: data, **models}
+    summaries = {name: summarize(frame) for name, frame in models.items()}
+    overview = overview_metrics(models)
+    ranks = average_ranks(models)
+    heavy = _heavy_threshold(models)
+    primary_summary = summaries[model_name]
+    leads = primary_summary["leads"]
+    lead = float(lead_h) if lead_h is not None else leads[0]
+    window = None
+    if "window_h" in data.columns and data["window_h"].notna().any():
+        window = float(data["window_h"].dropna().iloc[0])
 
-    # 概率宽表统一在这里过一遍校验：空表 / 缺列在这里就报出清晰的错，而不是等到
-    # 第六节算到一半才发现是张别的表。``None`` 与空 dict 等价——都表示这份产物
-    # 没有概率评分那一段（确定性产物、或集合没跑 weather_ts_ens_prob）。
-    # 注意别把结果写回 ``probability`` 自己：``probability = {}`` 先执行、
-    # 循环头里的 ``(probability or {})`` 后求值，等于遍历空 dict，整节会静默消失。
+    # 概率宽表统一在这里过一遍校验；``None`` 与空 dict 等价。
     loaded_tables: Dict[str, pd.DataFrame] = {}
     for name, frame in (probability or {}).items():
         loaded = load_probability(frame)
         if loaded is not None:
             loaded_tables[str(name)] = loaded
     probability = loaded_tables
+    ts_thresholds = _threshold_list(data)
 
-    # 雷达图：模型集合与第五节箱线图**用的是同一个 dict**（`models`），免得
-    # "图里少一个模型"这种错从后门溜回来。单模型不画——一个多边形没有比较对象。
-    prefix = f"{window:g}h_" if window else ""
-    radar = len(models) >= CAPABILITY_MIN_MODELS
-    radar_path: Optional[Path] = None
-    if radar:
-        radar_path = output_path.parent / f"{prefix}capability_radar.png"
-        axes, raw, higher = capability_profile(models)
-        # 延迟导入：``det_plots`` 在模块层 import 了 ``precipitation_plots``，
-        # 后者又 import 本模块——放模块层会绕成一个环。
-        from xmetai_evaluation.visualization.det_plots import DetPlotter
+    numbering = _Numbering()
+    captions = _captions(models, window=window, lead=lead, heavy=heavy)
+
+    # 图 1 与 §5 点图由本函数出（它们依赖 overview / models，画在这里最省一次重算）。
+    if artifacts is not None:
+        from xmetai_evaluation.visualization.det_plots import plot_overall_heatmap
+        from xmetai_evaluation.visualization.precipitation_plots import PrecipitationPlotter
 
         output_path.parent.mkdir(parents=True, exist_ok=True)
-        DetPlotter().plot_capability_radar(
-            raw, axes, higher,
-            suptitle=f"{_model_count_word(len(models))}模型能力雷达图"
-                     f"（批内相对分，1 = 本批最好）",
-            save_path=radar_path,
+        heatmap_path = output_path.parent / "overall_heatmap.svg"
+        # 列名进 SVG，必须是英文（图里不放中文）。
+        columns = [
+            ("Composite TS", {name: overview[name]["ts"] for name in models}, True, 3),
+            (
+                f"Heavy TS (≥{heavy:g}mm)" if heavy is not None else "Heavy TS",
+                {name: overview[name]["heavy"] for name in models},
+                True,
+                3,
+            ),
+            ("|BIAS−1|", {name: overview[name]["bias"] for name in models}, False, 3),
+            ("IQR across leads", {name: overview[name]["iqr"] for name in models}, False, 3),
+            ("Avg rank", {name: ranks.get(name, float("nan")) for name in models}, False, 2),
+        ]
+        order = sorted(
+            models, key=lambda name: _sort_value(overview[name]["ts"]), reverse=True
         )
-        if artifacts is not None and radar_path.exists():
-            artifacts["capability_radar"] = radar_path
+        figure = plot_overall_heatmap(order, columns)
+        figure.savefig(heatmap_path)
+        import matplotlib.pyplot as plt
 
-    # 分带图与雷达图同一套做法：要画才画，且只有真的落盘了才登记进 artifacts
-    # （登记了但没写进正文，`test_every_artifact_is_placed_in_the_report` 会红）。
+        plt.close(figure)
+        artifacts["overall_heatmap"] = heatmap_path
+
+        dot_path = output_path.parent / "lead_dot.svg"
+        PrecipitationPlotter().plot_lead_dots(models, save_path=dot_path)
+        plt.close("all")
+        artifacts["lead_dot"] = dot_path
+
+    # 分带图：要画才画，只有真的落盘了才登记进 artifacts。
     region_figure: Optional[Path] = None
-    if region_frames:
-        region_figure = output_path.parent / f"{prefix}region_TS_vs_lead.png"
+    if region_frames and artifacts is not None:
+        region_figure = output_path.parent / "region_ts_vs_lead.svg"
         from xmetai_evaluation.visualization.precipitation_plots import PrecipitationPlotter
 
         PrecipitationPlotter().plot_multi_model_vs_lead(
             dict(region_frames),
             metric="TS",
             mode="absolute",
-            legend_title="纬度带",
-            suptitle="各纬度带 TS 随时效变化（每个降水等级一个子图）",
+            legend_title="Latitude band",
+            suptitle="TS by latitude band vs lead time",
             save_path=region_figure,
         )
         if artifacts is not None and region_figure.exists():
             artifacts[REGION_FIGURE] = region_figure
+        import matplotlib.pyplot as plt
 
-    numbering = _Numbering()
-    captions = _figure_captions(summary, window=window, lead=lead, model_name=model_name)
+        plt.close("all")
 
-    lines: List[str] = []
-    # 集合产物的标题按骨架写成「集合预报N模型降水评估报告」；确定性那份保持
-    # 「{模型名}降水评估报告」不变——它有自己的骨架与逐字测试。
     title = (
-        f"集合预报{_model_count_word(len(models))}模型降水评估报告"
-        if ensemble else f"{model_name}降水评估报告"
-    )
-    lines.append(f"# {title}")
-    lines.append("")
-
-    # 评估对象/口径与结论合成同一节：先交代「评的是谁、多少天、什么指标」，
-    # 再一整段给结论，末尾两句固定口径声明。
-    if comparisons:
-        contrast = (
-            "对比对象为"
-            + "、".join(f"{name}（来源：{_source_of(sources, name)}）" for name in comparisons)
-            + ("——各者应使用同一时段" if len(comparisons) > 1 else "——两者应使用同一时段")
-            + "、同一站点集、同一窗口与阈值口径，"
-            "若来源文件的口径不同，结论不可直接横向比较。"
+        (
+            f"集合预报{cn_number(len(models))}模型降水评估报告"
+            if len(models) > 1
+            else "集合预报降水评估报告"
         )
-    else:
-        contrast = "未设对比对象。"
-
-    lines.append("## 一、结论摘要")
-    lines.append("")
-    lines.append(
-        f"本报告评估{model_name}（来源：{_source_of(sources, model_name)}），"
-        + (f"集合每例{int(members)}个成员，" if (ensemble and members) else "")
-        + contrast
-        + _coverage_sentence(coverage)
-        + "评估口径为站点分类检验（"
-        + (f"{window:g}h 累积窗口，" if window else "")
-        + f"时效 {leads[0]:g}–{leads[-1]:g}h 共 {len(leads)} 个，{summary['n_rows']} 条记录），"
-        + "指标为 TS、POD、FAR、漏报率与 BIAS。"
-        + (f"本次改动：{change_description}。" if change_description else "")
-        + f"报告生成时间：{datetime.now():%Y-%m-%d %H:%M}。"
+        if ensemble
+        else (
+            f"{cn_number(len(models))}模型降水评估报告"
+            if len(models) > 1
+            else f"{model_name}降水评估报告"
+        )
     )
-    lines.append("")
-    # 结论并成一段而不是逐条列点：读起来是判断，不是清单
-    lines.append("".join(findings))
-    lines.append("")
-    lines.append(f"**业务定性**：{business_conclusion(grades)}")
-    lines.append("")
+    lines: List[str] = [
+        f"# {title}",
+        "",
+        f"报告日期：{datetime.now():%Y%m%d}    评估层级：站点分类检验",
+        "",
+    ]
+    lines += _section_summary(
+        model_name, models, summaries, overview, ranks,
+        sources=sources,
+        coverage=coverage,
+        change_description=change_description,
+        ensemble=ensemble,
+        members=members,
+        has_probability=bool(probability),
+    )
+    lines += _section_samples(models, summaries, coverage)
+    lines += _section_metrics(ensemble=ensemble)
+    lines += _section_overall(
+        models, overview, ranks, heavy, artifacts, numbering,
+        captions["overall_heatmap"], captions["metrics_at_lead"],
+    )
+    lines += _section_ts(
+        models, summaries, model_name, artifacts, numbering, captions["ts_vs_lead"]
+    )
+    lines += _section_pod(
+        models, summaries, artifacts, numbering, captions["pod_vs_lead"]
+    )
+    lines += _section_far(
+        models, summaries, artifacts, numbering, captions["far_vs_lead"]
+    )
+    lines += _section_bias(
+        models, summaries, artifacts, numbering, captions["bias_vs_lead"]
+    )
+    lines += _section_stability(
+        models, model_name, artifacts, numbering, captions["TS_boxplot"]
+    )
+    lines += _section_performance(
+        models, lead, artifacts, numbering, captions["performance_diagram"]
+    )
     if ensemble:
-        # 集合产物必须点明：这五个指标算在**平均场**上，成员离散信息一点没进去。
-        # 不写这一句，读者会把「集合」当成「集合技巧比确定性好」，而这里根本没比。
-        lines.append(
-            f"集合口径：TS / POD / FAR / 漏报率 / BIAS 均在{_members_phrase(members)}的"
-            f"**平均场**上计算（确定性口径），不是逐成员评分后再平均；"
-            + (
-                "成员离散信息只在第六节的概率评分里体现。"
-                if probability
-                else "本批没有概率评分表，成员离散信息在这份报告里没有体现。"
-            )
-        )
-        lines.append("")
-    lines.append(
-        "指标定义：TS = hits/(hits+misses+false_alarms)，POD = hits/(hits+misses)，"
-        "FAR = false_alarms/(hits+false_alarms)，漏报率 = 1−POD，"
-        "BIAS = (hits+false_alarms)/(hits+misses)（频率偏差）"
-    )
-    lines.append("")
-
-    lines += _section_grade(summary, artifacts, numbering, captions)
-    lines += _section_lead(summary, artifacts, numbering, captions)
-    lines += _section_error_shape(summary, artifacts, numbering, captions)
-    lines += _section_boxplot(models, artifacts, numbering, captions, model_name)
-
-    # 章节号跟着**实际出现了哪几节**走：概率评分与雷达图都是可选的，每出现一节，
-    # 后面所有节号顺延一位。写死数字会在缺节时留下断号。
-    next_number = 6
-    if probability:
         lines += _section_probability(
-            probability, artifacts, numbering,
-            number=_CN_NUM[next_number],
+            probability or None,
+            artifacts,
+            numbering,
+            captions,
             members=members,
             ts_window=window,
-            ts_thresholds=_threshold_list(data),
+            ts_thresholds=ts_thresholds,
         )
-        next_number += 1
-
-    if comparisons:
-        if baselines:
-            heading = f"## {_CN_NUM[next_number]}、与对比模型的比较（{lead:g}h，TS）"
-            caption = f"{lead:g}h 时效上各模型的 TS 与本模型名次"
-            note: Optional[str] = (
-                "> 名次按该时效的 TS 排序（仅统计有有效值的模型）；"
-                "不同数据的起报时段/时效范围要一致才可直接比较。"
-            )
-        else:
-            heading = (
-                f"## {_CN_NUM[next_number]}、与基准 {baseline_name or '基准'} 的对比（{lead:g}h）"
-            )
-            caption = f"{lead:g}h 时效上本模型与基准的 TS 及差值"
-            note = None
-        lines += _section_comparison(
-            data, comparisons, artifacts, numbering, captions,
-            lead=lead, heading=heading, caption=caption, note=note,
-        )
-        next_number += 1
-
-    # 雷达图只在多模型（也就是必有对比对象）时出现——一个多边形没有比较对象
-    if radar:
-        lines += _section_capability(
-            models, numbering,
-            heading=f"## {_CN_NUM[next_number]}、模型能力雷达图",
-            radar_path=radar_path,
-        )
-        next_number += 1
-
-    lines.append(f"## {_CN_NUM[next_number]}、改进建议")
-    lines.append("")
-    for index, item in enumerate(recommendations(grades), start=1):
-        lines.append(f"{index}. {item}")
-    lines.append("")
-    next_number += 1
-    lines.append(f"## {_CN_NUM[next_number]}、口径与注意事项")
-    lines.append("")
-    lines.append("- **值缺失的含义**：TS 为 “—” 表示该等级没有有效配对或无事件，与“评分为 0”不同；")
-    lines.append("- **BIAS 不是平均误差**：它是频率偏差，>1 表示预报事件偏多，<1 表示偏少；")
-    if ensemble:
-        # 没跑概率评分时不能写「要看第六节」——那一节根本没出现，会指到空处。
-        lines.append(
-            "- **前五节评的是集合平均场**：TS / POD / FAR / 漏报率 / BIAS 都不含成员离散信息，"
-            + ("集合的相对优势要看第六节；" if probability else "本批未跑概率评分；")
-        )
-        if probability:
-            lines.append(
-                "- **概率评分与 TS 不可混比**：两者的累积窗口与阈值都不同，"
-                "AROC 还是逐成员概率口径；"
-            )
-    if coverage and len(coverage) > 1:
-        lines.append(
-            "- **各模型的样本量并不相同**：第一节列的是各份实测配对数，"
-            "差值来自起报日数而非口径；样本最少的那份名次波动最大，横向比高低前先看那一行；"
-        )
-    lines.append("- **跨时效不要直接平均后比较模型**：正式对比应使用共同有效样本与固定验证口径；")
-    lines.append(
-        "- 结果来自统一长表（`scores.csv` / `categorical_wide.csv`"
-        # 概率表的文件名新老不一：v2 产物是 diagnostics/probability_wide.csv，
-        # 老归档把两张裸 CSV 并排放，叫 aroc_bss*.csv。两个名字都写出来，
-        # 免得读者拿着新名字在老归档目录里找不到第六节的数据来源。
-        + (
-            "，概率评分另见同目录的 `probability_wide.csv`（老归档叫 `aroc_bss*.csv`）"
-            if probability
-            else ""
-        )
-        + "），逐行可追溯到具体时效与阈值。"
+    lines += _section_lead_rank(models, artifacts, numbering, captions["lead_dot"])
+    lines += _section_conclusions(
+        models, summaries, model_name,
+        ensemble=ensemble,
+        has_probability=bool(probability),
+        coverage=coverage,
     )
-    lines.append("")
-
-    # 附 L 放在「口径与注意事项」之后：它是可选块，编号走自己的 `图 L*` 命名空间，
-    # 有它没它都不动正文任何一个号。
+    lines += ["# 附录：补充诊断", ""]
+    lines += [
+        "本附录只放**不参与主排序**的分纬度带结果，图号走独立命名空间 `图 L*`，"
+        "整块可缺——缺时写「本批未出」及原因，**不留空号、也不指不存在的文件**。",
+        "",
+    ]
     lines += _section_regions(region_frames, region_labels, artifacts, region_figure)
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text("\n".join(lines), encoding="utf-8")
     return output_path
-
-
-def main(argv: Optional[Sequence[str]] = None) -> int:
-    parser = argparse.ArgumentParser(
-        description="把 TS 结果表画成图并写成 Markdown 报告",
-        epilog="示例: python -m xmetai_evaluation.visualization.ts_report "
-        "--csv ts_fgvp_2025.csv --result reports/fgvp --model FGVP",
-    )
-    parser.add_argument("--csv", type=Path, required=True, help="TS 结果表（csv）")
-    parser.add_argument("--result", type=Path, required=True, help="输出目录")
-    parser.add_argument("--model", default=None, help="模型名（默认取文件名）")
-    parser.add_argument("--baseline-csv", type=Path, default=None, help="可选：基准模型结果表")
-    parser.add_argument("--baseline-name", default=None, help="基准模型名")
-    parser.add_argument("--lead-h", type=float, default=None, help="基准时效（默认取最小时效）")
-    parser.add_argument("--dpi", type=int, default=150)
-    args = parser.parse_args(argv)
-
-    from xmetai_evaluation.visualization.precipitation_plots import PrecipitationPlotter
-
-    plt_dpi = args.dpi
-    import matplotlib.pyplot as plt
-
-    plt.rcParams["savefig.dpi"] = plt_dpi
-    model = args.model or args.csv.stem
-    plotter = PrecipitationPlotter()
-    artifacts = plotter.create_report(
-        pd.read_csv(args.csv),
-        output_dir=args.result,
-        model_name=model,
-        lead_h=args.lead_h,
-        baseline_df=pd.read_csv(args.baseline_csv) if args.baseline_csv else None,
-        baseline_name=args.baseline_name,
-    )
-    for name, path in artifacts.items():
-        print(f"  {name}: {path}")
-    return 0
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())

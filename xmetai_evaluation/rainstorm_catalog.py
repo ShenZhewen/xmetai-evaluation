@@ -10,7 +10,7 @@
 
 - 评测配置（``configs/rainstorm_ts_single_fuxi.py`` 等）：只要
   ``(编号, 开始日, 结束日)``，用 :func:`process_tuples`；
-- 汇总脚本（``skills/.../scripts/rainstorm_summary.py``）：要起止标签与等级，
+- 汇总脚本（``skills/.../scripts/render_rainstorm_summary.py``）：要起止标签与等级，
   用 :data:`CATALOG`；
 - 报告渲染器（``visualization/rainstorm_report.py``）：要全套，还要按
   :func:`expected_days` 推口径 A 应有的起报日。

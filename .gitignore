@@ -37,6 +37,7 @@ tmp_data/
 .claude/
 tests_tmp/
 scripts/
+# skill 的入口脚本是交付物，不能跟着上面的本地脚本一起被忽略
 !skills/xmetai-evaluation/scripts/
 !skills/xmetai-evaluation/scripts/*.py
 

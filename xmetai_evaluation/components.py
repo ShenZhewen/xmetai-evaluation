@@ -60,6 +60,11 @@ def _gridded_source(
 
     数据源之间的差别只有布局声明（见 ``io/layouts.py``），
     所以这里不需要为每个模型写一个 Reader 类。
+
+    ``scales``（可选）：``{标准变量名: 系数}``，在布局换算之后按报告单位再乘
+    一次。给"复用同一布局、但落盘单位不同"的模型兜底——例如 AIFS / FengQing
+    的 q 落盘是 kg/kg，复用 FuXi 物理口径（源 g/kg）时写
+    ``"scales": {"q700": 1000.0}``。
     """
     from xmetai_evaluation.io.gridded import GriddedCatalog, GriddedReader
 
@@ -67,7 +72,9 @@ def _gridded_source(
     source_id = params.get("source_id", default_source_id)
     root = _require_root(params, selected.name)
     return SourceHandle(
-        reader=GriddedReader(source_id=source_id, layout=selected),
+        reader=GriddedReader(
+            source_id=source_id, layout=selected, scales=params.get("scales")
+        ),
         catalog=GriddedCatalog(root, selected),
         config=params,
     )

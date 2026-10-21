@@ -972,12 +972,18 @@ observation_reader={
 > `z500` 的两种口径差一个 g，跨源对拍前先确认两边用的是哪个布局：`*_phys` 系列是 xu
 > 报告口径（m²/s²），`fuxi` / `fengqing` 是 ÷g 换算成 m。
 
+> **复用 FuXi 布局读其它模型时注意 q**：AIFS v10 与 FengQing 的输出目录也是
+> `<root>/YYYYMMDD/NNN.nc`，可以直接用 `fuxi_phys` 读；但它们的 q 落盘是 **kg/kg**，
+> FuXi 是 g/kg。配置里要写 `"scales": {"q700": 1000.0}`（布局换算后再乘一次），
+> 否则 q 少乘 1000，q700 RMSE 会退化成实况场自身的量级——漏写时 AIFS 与 FengQing
+> 会得到逐位相同的 q700 RMSE，可作为排查指纹。
+
 ### reader 参数速查
 
 | reader | 必需 | 可选 |
 |---|---|---|
-| `fuxi` / `fuxi_ens` / `fuxi_phys` / `fuxi_ens_phys` | `root_dir` | `step_hours`（默认 6）、`variable` 或 `variables`、`source_id` |
-| `fengqing` / `fengqing_phys` | `root_dir` | `variable` 或 `variables`、`source_id` |
+| `fuxi` / `fuxi_ens` / `fuxi_phys` / `fuxi_ens_phys` | `root_dir` | `step_hours`（默认 6）、`variable` 或 `variables`、`scales`、`source_id` |
+| `fengqing` / `fengqing_phys` | `root_dir` | `variable` 或 `variables`、`scales`、`source_id` |
 | `cra` | `root_dir` | `variable` 或 `variables`、`source_id` |
 | `era5_zarr` | `stores`（`{"pl": …, "sfc": …}`） | `variable` 或 `variables`、`source_id` |
 | `station` / `diamond_station` | `root_dir` | `station_whitelist` 或 `station_list`、`source_id` |

@@ -3,8 +3,7 @@
 本文件描述**降水分类检验（TS 系列）结果怎么判读**。§1–§5 与
 `xmetai_evaluation/visualization/ts_report.py` 中的 `diagnose()` /
 `business_conclusion()` / `recommendations()` 一一对应，智能体写报告时以代码为准，
-本文件用于解释口径和边界。**§6（概率评分）是唯一的例外**，它没有代码支撑，
-理由写在那节的开头。
+本文件用于解释口径和边界。§6 的概率评分由 `ts_report.analysis_probability` 渲染。
 
 ---
 
@@ -87,10 +86,9 @@
 
 ## 6. 概率评分（AROC / BSS）
 
-> **本节与前面五节不同：它没有代码支撑。** 前面几节的规则都能在 `ts_report.py`
-> 里找到对应函数，本节没有——`core/api.py` 的 `run_ts_ens` 把 `window_aroc`
-> 置成空元组（该能力不产 AROC/BSS 表），真正算这个的 `weather_ts_ens_prob`
-> 在 `README.md` 里标着 `[BLOCKED]`。规则先落在这里，等渲染器做出来再对齐。
+> AROC / BS / BSS 由 `metrics/probabilistic.py` 计算，集合 TS 报告的概率节由
+> `ts_report.analysis_probability` 渲染。本节只讲**判读**，定义见
+> `evaluation-metrics.md` §2。
 
 **先分清两个问题**：AROC 问"能不能把事件排出来"，BSS 问"概率数值准不准"。
 两个都低是真没技巧；一高一低是常见组合，**不能互相顶替**。

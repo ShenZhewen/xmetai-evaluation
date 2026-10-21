@@ -1,30 +1,17 @@
 # -*- coding: utf-8 -*-
 """多个暴雨过程个例产物根 → 多模型对比图 + Markdown 报告。
 
-**这是"降水个例分析"这条支线的渲染器**，与 TS 系列的 ``ts_report.py`` 不是一回事：
-``ts_report.py`` 吃**一次连续时段评测**的宽表（一张表里若干时效、若干等级），
-本模块吃的是**一整年的 43 个过程 × 2 种口径**，每个过程一段独立产物，所以报告
-按"过程"分节而不是按"时效"分节。
-
-产物形状（``configs/rainstorm_ts_single_*`` 的输出根）::
+与 ``ts_report.py`` 不同：它吃一次连续时段评测的宽表，本模块吃一整年的
+43 个过程 × 2 种口径，每个过程一段独立产物，所以按「过程」分节。产物形状::
 
     <根>/{编号}_24h/{起报日}/diagnostics/categorical_wide.csv   口径 A，一天一份
     <根>/{编号}_total/diagnostics/categorical_wide.csv          口径 B，一个过程一份
 
-两种口径**互不可比**（基准率差得远：同一个过程，口径 A 的 ≥25mm TS 常在 0.1 上下，
-口径 B 能到 0.6）——报告里两套数分节呈现，只在同一口径内做跨模型比较。
+两种口径互不可比，只在同一口径内做跨模型比较。读 ``categorical_wide.csv``
+（带 hits / misses / false_alarms / n_pairs 列联计数），与 ``scores.csv`` 的 TS 同值。
+读不到的段记「缺」并计入末尾「口径与注意事项」，不静默跳过。
 
-读的是 ``categorical_wide.csv`` 而不是 ``scores.csv``：前者带
-hits / misses / false_alarms / n_pairs 这些列联计数，正文里的样本量、
-误差形态都从它来；两者的 TS 是同一个数，不会打架。
-
-**读不到某段产物时**：那段记「缺」并计入末尾的「口径与注意事项」，**不静默跳过**
-——用户以为跑了、结果是空的，比报错更糟。
-
-**不出降水空间分布。** 产物里只有站点列联表的聚合统计，没有逐站或逐格降水量，
-画不出实况场，也画不出预报−实况差值场。要画得回头读原始预报 nc 与站点报文
-（``rainstorm_ts_single_*`` 配置里的 ``FUXI_ROOT`` / ``STATION_ROOT``），
-那是另一个脚本。这一条在报告的「口径与注意事项」里也写明了。
+**不出降水空间分布**：产物只有站点列联表的聚合统计，没有逐站/逐格降水场。
 """
 
 from __future__ import annotations
@@ -38,6 +25,7 @@ import pandas as pd
 
 from xmetai_evaluation import rainstorm_catalog
 from xmetai_evaluation.rainstorm_catalog import expected_days, get, window_days
+from xmetai_evaluation.visualization._common import finite_or_none, fmt_number
 
 #: 宽表在产物目录里的相对位置（三个 TS 流程都写在这里）。
 WIDE_RELATIVE_PATH = Path("diagnostics") / "categorical_wide.csv"
@@ -305,27 +293,15 @@ def n_pairs_of(scores: ProcessScores, threshold: float, *, total: bool = False):
 # ============================================================== 文本工具
 
 
-def _fmt(value: Optional[float], digits: int = 3) -> str:
-    """数值 → 定长文本；None / 非有限值写成 ``—``（有产物但无有效值）。"""
-    if value is None:
-        return "—"
-    number = float(value)
-    if not np.isfinite(number):
-        return "—"
-    return f"{number:.{digits}f}"
-
-
 def _fmt_delta(value: Optional[float]) -> str:
-    if value is None or not np.isfinite(float(value)):
-        return "—"
-    return f"{float(value):+.3f}"
+    number = finite_or_none(value)
+    return "—" if number is None else f"{number:+.3f}"
 
 
 def _fmt_pct(value: Optional[float], digits: int = 1) -> str:
     """比例 → 百分数文本（``0.085`` → ``8.5%``）；None 写成 ``—``。"""
-    if value is None or not np.isfinite(float(value)):
-        return "—"
-    return f"{float(value) * 100:.{digits}f}%"
+    number = finite_or_none(value)
+    return "—" if number is None else f"{number * 100:.{digits}f}%"
 
 
 def _fmt_count(value) -> str:
@@ -422,7 +398,7 @@ def _screening_rows(
                 value = (
                     total_value(scores, threshold) if total else daily_pooled(scores, threshold)
                 )
-                cells.append(_fmt(value))
+                cells.append(fmt_number(value))
                 values.append(value)
             cells.append(_delta_cell(values))
         rows.append(cells)
@@ -639,7 +615,7 @@ def _leader_phrase(
     winner: Optional[str], gap: float, *, scope: str
 ) -> str:
     if winner is None:
-        return f"{scope}两模型差值 {_fmt(gap)}，小于并列阈值 {TIE_THRESHOLD}，本口径下不分胜负"
+        return f"{scope}两模型差值 {fmt_number(gap)}，小于并列阈值 {TIE_THRESHOLD}，本口径下不分胜负"
     return f"{scope}{winner} 领先 {gap:.3f}"
 
 
@@ -748,7 +724,7 @@ def _summary_paragraph(
             else f"两边都有有效值的 {paired} 个过程（共 {len(codes)} 个）"
         )
         winner, _, gap = _leader(values)
-        detail = "、".join(f"{name} {_fmt(values[name])}" for name in names)
+        detail = "、".join(f"{name} {fmt_number(values[name])}" for name in names)
         sentences.append(
             f"{scope}{_grade_label(RANK_THRESHOLD)}mm 均值水平（{pool_note}）：{detail}，"
             + _leader_phrase(winner, gap, scope="")
@@ -764,7 +740,7 @@ def _summary_paragraph(
                       shared_only=True)
     sentences.append(
         f"极强降水更难：≥50mm 档的过程累积 TS 为 "
-        + "、".join(f"{name} {_fmt(hard[name])}" for name in names)
+        + "、".join(f"{name} {fmt_number(hard[name])}" for name in names)
         + f"，相对 {_grade_label(RANK_THRESHOLD)}mm 档整体回落"
     )
 
@@ -845,7 +821,7 @@ def _daily_reading(
             continue
         ordered = sorted(usable.items(), key=lambda item: item[1], reverse=True)
         lines.append(
-            f"{name} 汇总 {_fmt(daily_pooled(scores, RANK_THRESHOLD))}，"
+            f"{name} 汇总 {fmt_number(daily_pooled(scores, RANK_THRESHOLD))}，"
             f"逐日起伏 {ordered[-1][1]:.3f}（{ordered[-1][0]}）–"
             f"{ordered[0][1]:.3f}（{ordered[0][0]}），有效 {len(usable)}/{len(days)} 天"
         )
@@ -888,10 +864,10 @@ def _total_reading(
         cap = _highest_usable(scores)
         fragments.append(
             f"{name} {_grade_label(RANK_THRESHOLD)}mm TS "
-            f"{_fmt(total_value(scores, RANK_THRESHOLD))}"
-            f"（POD {_fmt(total_value(scores, RANK_THRESHOLD, 'POD'))}、"
-            f"FAR {_fmt(total_value(scores, RANK_THRESHOLD, 'FAR'))}、"
-            f"BIAS {_fmt(total_value(scores, RANK_THRESHOLD, 'BIAS'))}），"
+            f"{fmt_number(total_value(scores, RANK_THRESHOLD))}"
+            f"（POD {fmt_number(total_value(scores, RANK_THRESHOLD, 'POD'))}、"
+            f"FAR {fmt_number(total_value(scores, RANK_THRESHOLD, 'FAR'))}、"
+            f"BIAS {fmt_number(total_value(scores, RANK_THRESHOLD, 'BIAS'))}），"
             f"有命中的最高等级 {_grade_label(cap) if cap is not None else '无'}"
         )
         pod = total_value(scores, RANK_THRESHOLD, "POD")
@@ -899,9 +875,9 @@ def _total_reading(
         if pod is None or far is None:
             shapes.append(f"{name} 的 POD / FAR 列不全，误差形态判不了")
         elif far > 1.0 - pod:
-            shapes.append(f"{name} 空报多于漏报（FAR {_fmt(far)} > 漏报率 {_fmt(1 - pod)}）")
+            shapes.append(f"{name} 空报多于漏报（FAR {fmt_number(far)} > 漏报率 {fmt_number(1 - pod)}）")
         else:
-            shapes.append(f"{name} 漏报多于空报（漏报率 {_fmt(1 - pod)} > FAR {_fmt(far)}）")
+            shapes.append(f"{name} 漏报多于空报（漏报率 {fmt_number(1 - pod)} > FAR {fmt_number(far)}）")
 
     values = {
         name: total_value(per_model[name][code], RANK_THRESHOLD)
@@ -928,8 +904,8 @@ def _process_reading(
             rows.append(f"{name} 缺段")
             continue
         rows.append(
-            f"{name} 口径 A 汇总 {_fmt(daily_pooled(scores, RANK_THRESHOLD))}"
-            f" / 口径 B 累积 {_fmt(total_value(scores, RANK_THRESHOLD))}"
+            f"{name} 口径 A 汇总 {fmt_number(daily_pooled(scores, RANK_THRESHOLD))}"
+            f" / 口径 B 累积 {fmt_number(total_value(scores, RANK_THRESHOLD))}"
         )
     day_values = {
         name: daily_pooled(per_model[name][code], RANK_THRESHOLD)
@@ -1111,7 +1087,7 @@ def _process_section(
                     values.append(None)
                     continue
                 value = cell(scores.days.get(day), threshold)
-                cells.append(_fmt(value))
+                cells.append(fmt_number(value))
                 values.append(value)
             cells.append(_delta_cell(values))
         body.append(cells)
@@ -1154,7 +1130,7 @@ def _process_section(
                     values.append(None)
                     continue
                 value = total_value(scores, threshold)
-                cells.append(_fmt(value))
+                cells.append(fmt_number(value))
                 values.append(value)
             cells.append(_delta_cell(values))
             body.append(cells)
@@ -1205,7 +1181,7 @@ def _cross_section(
                                column=column, threshold=threshold)
         values = {name: _mean_of(pools[name]) for name in names}
         counts.append(len(pools[names[0]]))
-        cells = [label] + [_fmt(values[name]) for name in names]
+        cells = [label] + [fmt_number(values[name]) for name in names]
         cells.append(_delta_cell([values[name] for name in names]))
         body.append(cells)
 
@@ -1263,11 +1239,11 @@ def _cross_section(
            "；**两种口径给出的胜负方向不一致**，说明领先与否取决于口径而非模型本身，"
            "引用结论必须带口径")
         + f"。总体水平：口径 B 的 {_grade_label(RANK_THRESHOLD)}mm 档在 "
-        + "、".join(f"{name} {_fmt(total_level[name])}" for name in names)
+        + "、".join(f"{name} {fmt_number(total_level[name])}" for name in names)
         + f" 之间，口径 A 的同一档只有 "
-        + "、".join(f"{name} {_fmt(day_level[name])}" for name in names)
+        + "、".join(f"{name} {fmt_number(day_level[name])}" for name in names)
         + f"；≥50mm 档更低（"
-        + "、".join(f"{name} {_fmt(hard_level[name])}" for name in names)
+        + "、".join(f"{name} {fmt_number(hard_level[name])}" for name in names)
         + "），且该档的有效配对数在各过程上远小于低等级档，**这一档的差异不宜当结论**。",
         "",
     ]
@@ -1347,7 +1323,7 @@ def _advice_section(
     usable_hard = [value for value in hard_level.values() if value is not None]
     if usable_hard and max(usable_hard) < 0.3:
         items.append(
-            f"≥50mm 档的过程累积 TS 最高只有 {_fmt(max(usable_hard))}，极端量级整体偏弱；"
+            f"≥50mm 档的过程累积 TS 最高只有 {fmt_number(max(usable_hard))}，极端量级整体偏弱；"
             f"该档的有效配对数在各过程上远小于低等级档，**先把样本补齐再谈改进**，"
             f"不要在这个量级上调参。"
         )
@@ -1469,7 +1445,7 @@ def build_rainstorm_report(
     except ImportError as error:  # pragma: no cover - 取决于运行环境
         raise ImportError(
             "出图需要 matplotlib（pip install matplotlib）；只要正文和 CSV 请改用 "
-            "skills/xmetai-evaluation/scripts/rainstorm_summary.py"
+            "skills/xmetai-evaluation/scripts/render_rainstorm_summary.py"
         ) from error
 
     archives = list(archives)
