@@ -192,6 +192,32 @@ PIPELINE_TEMPLATES: Dict[str, PipelineTemplate] = {
         writers=["csv_long", "spectrum"],
         options={"ensemble_reduction": "mean"},
     ),
+    "weather_ens_field_scores_noref": PipelineTemplate(
+        name="weather_ens_field_scores_noref",
+        protocol="grid_valid_time",
+        description=(
+            "集合场检验（无气候态版）：RMSE / CRPS / Spread-Error / 纬向谱 / 球谐带功率\n"
+            "  用途  与 weather_ens_field_scores 同一批指标，**去掉需要气候态参考的\n"
+            "        ACC 与预报活跃度**——没有气候态文件时用这一条，不给参考、\n"
+            "        也不会像 ACC 那样拿零场兜底出无意义的数\n"
+            "  数据  预报 集合预报 / 观测 格点实况（cra_zarr / era5_zarr）/ 参考 无\n"
+            "  计算  grid_valid_time：格点有效时刻配对；集合均值另算\n"
+            "        CRPS / spread_error 直接吃原始成员，不走均值\n"
+            "  指标  rmse、crps、spread_error、zonal_spectrum、spherical_bands\n"
+            "        产出 scores.csv、diagnostics/spectrum_{var}.csv（全体均值曲线）、\n"
+            "        diagnostics/spectrum_by_init.csv（逐起报曲线）"
+        ),
+        transforms=[TransformSpec("ensemble_mean")],
+        metrics=[
+            MetricSpec("rmse"),
+            MetricSpec("crps"),
+            MetricSpec("spread_error"),
+            MetricSpec("zonal_spectrum"),
+            MetricSpec("spherical_bands"),
+        ],
+        writers=["csv_long", "spectrum"],
+        options={"ensemble_reduction": "mean"},
+    ),
     "fdp_ens_crps": PipelineTemplate(
         name="fdp_ens_crps",
         protocol="grid_valid_time",

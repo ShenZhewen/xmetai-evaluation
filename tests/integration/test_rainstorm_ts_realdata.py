@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """暴雨个例 rainstorm（SMOKE 过程 202521）真实数据档：跑正式 config，对标 run_categorical。
 
-两个 config（``rainstorm_ts_single_fuxi`` / ``rainstorm_ts_single_fgvp_ctrl``）都是
+两个 config（``rainstorm_ts_single_fuxi`` / ``rainstorm_ts_single_fgvp``）都是
 导出 ``cfgs`` 列表——43 个过程 × 两种口径（口径 A 逐日 24h 还按起报日拆段），本模块
 只挑出 SMOKE 过程 202521 的 9 段（口径 A 8 个起报日 + 口径 B 1 个过程累积），覆盖数据
 路径指向最小 fixture 后逐段跑，对拍 ``run_categorical.py``（确定性 TS）的整数列联表。
@@ -52,7 +52,7 @@ FIXTURE_ROOT = f"{FIXTURE_DIR}/rainstorm_test_data"
 #: config 名 -> (模型短名, fixture 里的预报子目录)。
 MODEL_TABLE = {
     "rainstorm_ts_single_fuxi": ("fuxi", "fuxi_single_output"),
-    "rainstorm_ts_single_fgvp_ctrl": ("fgvp_ctrl", "fgvp_output"),
+    "rainstorm_ts_single_fgvp": ("fgvp", "fgvp_output"),
 }
 
 # 标准答案（内联）：run_categorical.py 确定性 TS 的整数列联表，逐格一致、未四舍五入。
@@ -75,7 +75,7 @@ GOLDEN_COUNTS = {
             10.0: {"hits": 6787, "false_alarms": 1703, "misses": 360, "n_pairs": 9767},
         },
     },
-    "fgvp_ctrl": {
+    "fgvp": {
         "24h_20250723": {
             0.1: {"hits": 5228, "false_alarms": 3257, "misses": 58, "n_pairs": 10132},
             10.0: {"hits": 906, "false_alarms": 860, "misses": 979, "n_pairs": 10132},

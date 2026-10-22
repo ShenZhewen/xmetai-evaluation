@@ -41,9 +41,10 @@ python skills/xmetai-evaluation/scripts/generate_typhoon_report.py \
 - 输出目录必须不存在或为空，不能在输入目录内；不覆盖已有报告、不改写 CSV。
 - 依赖已有 `viz` 依赖组中的 matplotlib；缺依赖时显式报错。
 
-输出：`REPORT.md`（九节）、`summary.json`（原始精度统计、逐文件元数据/字段映射/
+输出：`REPORT.md`（六章）、`summary.json`（原始精度统计、逐文件元数据/字段映射/
 SHA256、配对键、排除计数、配置与依赖版本）、`statistics.csv`、`differences.csv`、
-`track.png` 和适用时的 `mae.png` / `me.png`。没有有效共同分量/强度数据时
+`track.svg`、每个分量/强度指标各一张的 `mae_<指标>.svg` 与 `me_<指标>.svg`，
+以及 `track_plots/tc<编号>_<名称>.svg` 逐台风路径图。没有有效共同分量/强度数据时
 不生成占位图片，报告注明不比较的指标；没有有效共同路径数据则报错。
 `mean` 列在路径指标上是平均距离，其他指标上是 MAE，`statistic` 列明确区分；
 `me` 是有符号均值。区间缺失时 JSON 为 `null`、CSV 为空、报告为“未计算”。
@@ -58,7 +59,7 @@ python skills/xmetai-evaluation/scripts/render_report.py \
 ```
 
 这里 `--compare` 是产物目录（TS 分支仍是宽表 CSV），高级统计选项走专用入口。
-当前自动报告输出为 `REPORT.md`，报告章节与两份模板对齐，
+当前自动报告输出为 `REPORT.md`，报告章节与模板对齐，
 真实数字和图表由同一统计对象生成，不把 Markdown 骨架当模板引擎。
 
 正文以用户提供的完成报告为质量参考，采用“模型 × 时效”横表，
@@ -84,15 +85,15 @@ python skills/xmetai-evaluation/scripts/generate_typhoon_report.py \
 ## 配套资源
 
 - 计算前阅读 [统计口径与数据检查](./typhoon-verification.md)。
-- 确定性使用 [weather_typhoon_single.md](../assets/templates/weather_typhoon_single.md)。
-- 集合平均使用 [weather_typhoon_ens.md](../assets/templates/weather_typhoon_ens.md)。
-- 两份模板沿用原报告的九节核心，删除不适用的部分并填入真实结果。
+- 确定性与集合平均共用 [weather_typhoon_single.md](../assets/templates/weather_typhoon_single.md)：
+  六章结构相同，集合版只多 §2 的成员规模表、§3.1 的集合口径句和 §5 的限制句，不另设模板。
+- 删除不适用的部分并填入真实结果；没有分量/强度样本或最大风速字段时按模板的条件块收口。
 
 当前标准产物包括 `manifest.json`、`scores.csv`、`typhoon/tc<编号>_<起报>.csv`
 和对应 `_meta.json`。逐时效报告必须读场次曲线，不能从 `scores.csv`
 的跨时效均值还原；场次表与拼接总表不能重复计入样本。
 中心诊断参数、种子、观测时区和成员完成信息按实际元数据披露；
-缺少成员明细时不计算离散度，不强制输出雷达图或轨迹图集。
+缺少成员明细时不计算离散度，不强制输出雷达图；逐台风路径图只依赖场次 CSV 的位置列，按模板输出。
 下列严格配对与统计规则只针对台风分支，不改变现有 TS/RMSE 报告口径。
 
 ## 1. 确定输入与范围
@@ -176,7 +177,7 @@ python skills/xmetai-evaluation/scripts/generate_typhoon_report.py \
 3. 样本覆盖表、方法说明、结果解释、限制和复现命令。
 4. 同口径机器可读汇总；数据量小也不能只交付图片。
 
-图表使用一致的模型颜色和名称，显示单位、时效、样本口径；置信区间注明方法。为少样本时效作醒目标注。默认不自动添加轨迹图集、概率检验或其他用户未要求的大规模输出。
+图表使用一致的模型颜色和名称，显示单位、时效、样本口径；置信区间注明方法。为少样本时效作醒目标注。确定性报告按模板自动输出逐台风路径图（一个台风一张，`track_plots/`，依赖 basemap）；不自动添加概率检验或其他用户未要求的大规模输出。
 
 按照模板撰写，所有数字取自实际统计结果。结论区分：
 

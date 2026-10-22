@@ -18,9 +18,14 @@ SMOKE = False
 PROCESSES = process_tuples()
 
 #: 数据源与输出根。
-FUXI_ROOT = "/workspace/data/shenzw/fuxi_single_output"
+#: 用 2025 全年重跑后的 `_new` 档（台风 / RMSE / TS 批次也读它）；
+#: 早先的 `fuxi_single_output` 是旧档，换回去只改这一行。
+FUXI_ROOT = "/workspace/data/shenzw/fuxi_single_output_new"
 STATION_ROOT = "/workspace/data/worm/r0/2025"
 STATION_LIST = "/workspace/data/worm/r0/zd_sta_10285.dat"
+#: ⚠ 这个目录里可能已有早先用 `fuxi_single_output` 档跑的结果。块 id 只含
+#: 起报日 + 时效、不含数据根，`resume: True` 会把旧块原样复用——换数据档后
+#: 先把旧目录改名或清空，否则评的还是旧预报。
 OUTPUT_ROOT = "/workspace/szwCode/evaluation_results/rainstorm_ts_single_fuxi"
 
 def _dense_leads(max_hours):

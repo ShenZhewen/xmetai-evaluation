@@ -187,7 +187,7 @@ weather_rmse_single_fgvp    ← RMSE 批次家族
 | 同一套表 + `mode: ensemble` / `n_members > 1` | **集合 TS** | `weather_ts_ens` → `weather_ts_ens.md` |
 | 同上，且目录（或 `--compare` 那一份的同目录）里有概率表 `diagnostics/probability_wide.csv`，或老命名的 `aroc_bss*.csv` | **概率评分也有** | 集合骨架的 §4.7 有数据了（见 `precipitation-evaluation.md` §2.1）。**看的是表在不在（认列不认名），不是看 `aroc_windows` 配没配**——表才是渲染器的输入 |
 | `scores.csv`（长表）+ `manifest.json` + `diagnostics/`，`resolved_config.pipeline` 是 `weather_field_scores` | **RMSE 批次家族**（连续场） | 按支线选入口：`_single`→`render_det_report.py`、`_ens`→`render_ens_report.py`；`_wave` 只剩 legacy 谱专题入口 `render_wave_report.py`（球谐带已并入前两份，见 `rmse-batch-evaluation.md`）。**想出一份单模型的连续场报告**走 `render_report.py`（吃同样形状，只吃一份） |
-| `_meta.json` 里有 `babj` / `tcid` / `forecast_type` | **台风路径** | `forecast_type: "det"` → `weather_typhoon_single.md`；`"ens"` → `weather_typhoon_ens.md`；走 `generate_typhoon_report.py` |
+| `_meta.json` 里有 `babj` / `tcid` / `forecast_type` | **台风路径** | `"det"` 与 `"ens"` 共用 `weather_typhoon_single.md`（集合平均没有专属模板）；走 `generate_typhoon_report.py` |
 | 一堆积分清单一（`mni_csv` 那种） | **结构演示/假数据** | 用户没点名就别当结果用 |
 
 ### 归类之后：报清单，别闷头跑
@@ -283,14 +283,19 @@ python skills/xmetai-evaluation/scripts/render_report.py <主模型产物目录>
 
 ```bash
 python skills/xmetai-evaluation/scripts/render_rainstorm_report.py \
+  --model FGVP=/workspace/szwCode/evaluation_results/rainstorm_ts_single_fgvp \
+  --model AIFS=/workspace/szwCode/evaluation_results/rainstorm_ts_single_aifs \
   --model FuXi=/workspace/szwCode/evaluation_results/rainstorm_ts_single_fuxi \
-  --model FGVP-ctrl=/workspace/szwCode/evaluation_results/rainstorm_ts_single_fgvp_ctrl \
+  --model FengQing=/workspace/szwCode/evaluation_results/rainstorm_ts_single_fengqing \
+  --model Tongyun=/workspace/szwCode/evaluation_results/rainstorm_ts_single_tongyun \
   --process 202503,202521 \
   --result /workspace/szwCode/evaluation_results/rainstorm_report
 ```
 
 - `--model NAME=目录` 给的是**产物根**（底下是 `{编号}_24h/` 与 `{编号}_total/`），
-  不是单个过程的目录；第一个是主模型，Δ 一律是「主模型 − 第二个」；
+  不是单个过程的目录；第一个是主模型，Δ 一律是「主模型 − 第二个」，**Δ 列
+  只有一列**——多于两个模型时其余模型只并排列值，胜负计数与改进建议也
+  只针对主模型与第二个；要做两两矩阵就拆成多份报告；
 - `--process` **必给**（逗号分隔的过程编号）。先跑
   `scripts/render_rainstorm_summary.py` 拿全 43 个过程的两口径宽表，照着挑要详析哪几个。
 
@@ -454,11 +459,11 @@ python skills/xmetai-evaluation/scripts/render_report.py <产物目录> --result
 | `weather_ts_ens` | 集合站点降水分类检验：同上，TS 算在集合平均场上；另加一节概率评分 AROC / BSS | ✅ [`assets/templates/weather_ts_ens.md`](./assets/templates/weather_ts_ens.md) |
 | `weather_field_scores` | 确定性连续场：RMSE / ACC / 活跃度 / 纬向谱 | ⚠️ 能力与渲染器都在，但 `assets/templates/` 里的格式契约已删 |
 | `weather_typhoon_det`（`forecast_type: det`） | 确定性台风路径、AT/CT、强度 MAE/ME | ✅ [`weather_typhoon_single.md`](./assets/templates/weather_typhoon_single.md)，通用统计/绘图/报告 |
-| `weather_typhoon_ens`（`forecast_type: ens`） | 集合平均方案 B 主结果，不混入成员平均误差 | ✅ [`weather_typhoon_ens.md`](./assets/templates/weather_typhoon_ens.md)，通用统计/绘图/报告 |
+| `weather_typhoon_ens`（`forecast_type: ens`） | 集合平均方案 B 主结果，不混入成员平均误差 | ✅ 同 [`weather_typhoon_single.md`](./assets/templates/weather_typhoon_single.md)（共用骨架，多成员规模表与集合口径句） |
 | 其余流程 | CRPS、FSS、概率评分…… | ⛔ 还没做，会明确报错 |
 
 **台风报告分支**：先读 [报告工作流](./references/typhoon-report-workflow.md) 和
-[统计口径与字段检查](./references/typhoon-verification.md)，按元数据选择上述确定性/集合模板。
+[统计口径与字段检查](./references/typhoon-verification.md)；确定性与集合平均都按同一份骨架。
 流程为“确认范围 → 核实 CSV/元数据与可用工具 → 逐指标逐时效严格配对 →
 统计与图表/报告/机器可读汇总 → 验收交付”。默认起报个例等权，
 适用指标同时报告 MAE/ME、`N_case` 与 `N_storm`；置信区间按需用台风分组 bootstrap。
@@ -476,13 +481,14 @@ python skills/xmetai-evaluation/scripts/generate_typhoon_report.py \
 
 支持单模型与多模型；不指定时效则用实际数据。默认 2000 次台风分组 bootstrap，
 `--bootstrap 0` 可禁用；输出 `REPORT.md`、`summary.json`、`statistics.csv`、
-`differences.csv`、`track.png` 及适用时的 `mae.png` / `me.png`。
+`differences.csv`、`track.svg`、每个分量/强度指标各一张的 `mae_<指标>.svg` 与
+`me_<指标>.svg`，以及 `track_plots/` 下逐台风一张的路径图。
 输出目录须不存在或为空。统一入口的台风 `--compare` 使用 `NAME=产物目录`，
 与 TS 的宽表 CSV 不同；历史无 manifest 的归档走专用入口并核实方案 B 元数据。
 用户要求“以某模型为主”“新旧版本对比”时，必须传 `--primary-model` 和适用的
 `--previous-model`，不能只靠模型列表猜关系。用 `--primary-leads` /
 `--exploratory-leads` 明确讨论范围。正文使用紧凑横表、主模型配对比较和偏差分析；
-完整统计留在 CSV/JSON。九节报告不等于统计清单：小结必须区分均值改善与区间证据。
+完整统计留在 CSV/JSON。六章报告不等于统计清单：小结必须区分均值改善与区间证据。
 
 > **RMSE 批次家族（`weather_rmse_single_<模型>` / `weather_rmse_ens_<模型>`）走的是多模型对比入口，
 > 不是因为形状不同**：它们的产物就是标准评估产物目录（`scores.csv` + `manifest.json` +
@@ -646,7 +652,7 @@ REPORT.md
   3.x.2 口径 A 逐日 24h   表（逐日原值）+ 图 → 小结（小结报的是汇总值）
   3.x.3 口径 B 过程累积   表 + 图 → 小结
   3.x.4 过程小结         两个口径的名次是否一致
-四、跨过程综合对比      表（九项指标等权平均，**逐行只取两边都有有效值的过程**）+ 图（散点）→ 小结
+四、跨过程综合对比      表（九项指标等权平均，**逐行只取各模型都有有效值的过程**）+ 图（散点）→ 小结
 五、改进建议           每条挂到一个具体数字或过程编号
 六、口径与注意事项      十条，含"跨模型汇总只比同一批过程""本报告不含降水空间分布"
 ```
@@ -655,9 +661,9 @@ REPORT.md
 > 骨架 [`rainstorm_case.md`](./assets/templates/rainstorm_case.md) 只画了一个块，
 > 写的是 `3.{x}` / `表 {N}` 这类占位，**不要照抄成固定的 `3.1` / `表 3`**。
 >
-> **`assets/templates/` 的测试不覆盖这一份**——`tests/` 在另一个工作副本里，
-> 这个副本没有测试。骨架靠人工与 `rainstorm_report.py` 的静态文字对齐，
-> 改渲染器正文时两边要一起改。
+> **`assets/templates/` 的测试不覆盖这一份**——`tests/` 里只有真实数据集成测试
+> （`tests/integration/test_rainstorm_ts_realdata.py`），**没有骨架文字对照测试**。
+> 骨架靠人工与 `rainstorm_report.py` 的静态文字对齐，改渲染器正文时两边要一起改。
 
 **D. 空间分布图**（可选，`render_spatial_distribution.py`，`--out` 目录下）：
 
@@ -735,7 +741,7 @@ REPORT.md
 | 用户点名一个切片（"热带 春季 rmse 对比"） | 走 `references/rmse-batch-evaluation.md` **§6**：长表筛选 + 按既有口径重算，**不重跑评测**；季节按**起报时刻**切、DJF 按气象冬季归。渲染器不认这类请求，段落由智能体自己补 |
 | 用户要的季节/纬度带上，长表里没有现成一列 | 季节从 `init_time` 推（§6.2）；纬度带本来就有 `region` 列（空 = 全球）。两者都不需要改评测配置 |
 | 用户要"降水个例分析"但没说看哪几个过程 | 先跑 `render_rainstorm_summary.py`（43 个过程 × 两口径 × N 模型的挑过程总表 + 排序参考），**读它的 `summary_long.csv` 挑**；**`--process` 必给**，43 个全出会变成一本册子 |
-| 两个产物根的**过程覆盖不一样** | 跨模型汇总的 Δ 就不是同分母相减（实测差一倍）。渲染器已按「只用双方都有产物的过程」算，表题会给出该批过程数；转述时要说明，别把 Δ 当纯模型差异 |
+| 几个产物根的**过程覆盖不一样** | 跨模型汇总的 Δ 就不是同分母相减（实测差一倍）。渲染器已按「只用各模型都有有效值的过程」算，表题会给出该批过程数；转述时要说明，别把 Δ 当纯模型差异 |
 | 用户想比"这个过程的 TS"，但两个数一个 0.21 一个 0.61 | 那是**两种口径**（逐日 24h 汇总 / 过程累积），基准率不同，**互不可比**——先问清看哪个口径，或两个都出、分节呈现 |
 | 用户说口径 A 的每过程值应当"把所有报的 hit 汇到一起重算"，而产物/脚本给的是逐日平均 | 用户是对的：TS 是比率，平均比率会被小样本日拖偏。渲染器用 `daily_pooled`、`render_rainstorm_summary.py` 用 `pooled_ts`，两处定义必须一致；`scores.csv` 没有四格表计数，得读 `diagnostics/categorical_wide.csv` |
 | 降水个例报告里没有落区图 | **不是漏做**。产物里只有站点列联表的聚合统计（hits / misses / false_alarms / n_pairs / TS…），没有逐站或逐格降水量，画不出实况场也画不出差值场；要看落区得回头读原始预报 nc 与站点报文 |
@@ -752,12 +758,12 @@ REPORT.md
   `assets/templates/weather_ts_ens.md`（集合，多一节概率评分）
 - RMSE 批次家族：`assets/templates/weather_rmse_single.md`（单成员，§4.5 球谐带）、
   `assets/templates/weather_rmse_ens.md`（集合，§4.8 球谐带）
-- 台风路径/强度：`assets/templates/weather_typhoon_single.md`（单成员）、
-  `assets/templates/weather_typhoon_ens.md`（集合平均；方案 A 独立呈现）
-  ——两份均对齐原 `typhoon-error-report` 的九节报告结构，不强制雷达图或离散度。
+- 台风路径/强度：`assets/templates/weather_typhoon_single.md`（六章结构，
+  **确定性与集合平均共用**；集合版主结果为方案 B，多成员规模表与集合口径句，
+  无专属指标、无单独模板）
 - 暴雨过程个例：`assets/templates/rainstorm_case.md`（双口径 × 多模型，按过程分节）
 
-> `assets/templates/` 现在有上面八份。**确定性连续场（`weather_field_scores`）
+> `assets/templates/` 现在有上面六份。**确定性连续场（`weather_field_scores`）
 > 的骨架与模板目录的 `README.md` 都已删除**——能力本身、渲染器、判读规则
 > （`references/field-evaluation.md`）都还在，只是格式契约没有真值来源了。
 
@@ -841,11 +847,12 @@ REPORT.md
      **legacy `_wave` 入口的日期口径也有 `--own-dates` 两档**（同 §3 缺口 2 的说明）：
      谱统计按各模型全部起报日，配对检验永远退回共同日期；
   5. **台风报告已接通当前场次 CSV 与明确声明方案 B 的历史归档**，
-     模板九节标题由 `tests/unit/test_typhoon_report.py` 对齐检查。
-     不包含成员明细离散度、概率技巧、轨迹图集或方案 A 附加报告；
+     确定性报告为六章结构，含逐台风路径图（依赖 basemap；`viz` 依赖组已声明）。
+     不包含成员明细离散度、概率技巧或方案 A 附加报告；
      算法/单位不明的历史归档需先核实，不能直接强行生成；
-  6. **暴雨过程个例的骨架没有测试守着**。`tests/` 不在 v2 这个工作副本里，
-     `rainstorm_case.md` 靠人工与 `rainstorm_report.py` 的静态文字对齐；
+  6. **暴雨过程个例的骨架没有测试守着**。`tests/` 里只有真实数据集成测试，
+     **没有骨架文字对照测试**；`rainstorm_case.md` 靠人工与
+     `rainstorm_report.py` 的静态文字对齐；
      真跑一遍对骨架是**目前唯一的验收手段**（本地已用同一份产物喂两个模型名跑通，
      Δ 列全是 `+0.000`，但渲染路径与编号连续性都验证过了）。
      另外 `render_rainstorm_summary.py` 缺 `stream.reconfigure(encoding="utf-8")` 那段，

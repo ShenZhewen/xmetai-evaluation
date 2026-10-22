@@ -403,6 +403,56 @@ ERA5_ZARR_LAYOUT = GriddedLayout(
     key_kind="time_group",
 )
 
+#: CRA-40 再分析（c71 zarr store，见 ``io/era5_zarr_reader.py`` 的 ``CraZarrReader``）。
+#:
+#: 与 ``ERA5_ZARR_LAYOUT`` 的差别有两条，都不在这个声明里、在读取器里体现：
+#:
+#:   * store 存的是**归一化值**，``CraZarrReader(denormalize=True)`` 用 store 自带的
+#:     ``mean``/``std`` 还原成物理量；
+#:   * ``tp`` 在 store 里是 ``log1p(mm)``（且 mean=0/std=1），读取器对它做 ``expm1``，
+#:     所以这里的 ``tp`` 就是 mm，**不要再写 scale**。
+#:
+#: 71 个通道：z/t/u/v/q × 13 层（50→1000）+ t2m/q2m/u10m/v10m/msl/tp。
+#: 一个 store 装下全部通道，所以没有 ``groups``（读取器退化成挨个找）。
+#: 通道名用标准名即可——store 若写 ``z_500``，``resolve_channel`` 会去掉下划线对上。
+CRA_ZARR_LEVELS = (50, 100, 150, 200, 250, 300, 400, 500, 600, 700, 850, 925, 1000)
+
+#: 层次变量的单位。q 的口径见 ``CRA_ZARR_VARIABLES`` 里的注释。
+_CRA_LEVEL_UNITS = {"z": "m^2/s^2", "t": "K", "u": "m/s", "v": "m/s", "q": "kg/kg"}
+
+CRA_ZARR_VARIABLES: Dict[str, VarSpec] = {
+    f"{name}{level}": VarSpec(unit=unit)
+    for name, unit in _CRA_LEVEL_UNITS.items()
+    for level in CRA_ZARR_LEVELS
+}
+CRA_ZARR_VARIABLES.update(
+    {
+        "t2m": VarSpec(unit="K"),
+        # q 不换算：CRA 原生就是 kg/kg。若哪天换到 g/kg 口径的 store，
+        # 要么改这里的 unit，要么加 scale=1000（两者都要同步 source_unit）。
+        "q2m": VarSpec(unit="kg/kg"),
+        "u10m": VarSpec(unit="m/s"),
+        "v10m": VarSpec(unit="m/s"),
+        "msl": VarSpec(unit="Pa"),
+        # expm1 由读取器做（store 是 log1p 空间），到这里已经是 mm。
+        "tp": VarSpec(
+            unit="mm",
+            source_unit="log1p(mm)",
+            temporal_kind=TemporalKind.INTERVAL_ACCUMULATION,
+        ),
+    }
+)
+
+CRA_ZARR_LAYOUT = GriddedLayout(
+    name="cra_zarr",
+    patterns=(),
+    variables=CRA_ZARR_VARIABLES,
+    kind=DataKind.GRIDDED_OBSERVATION,
+    engine="zarr",
+    time_kind="observation",
+    key_kind="time_group",
+)
+
 LAYOUTS: Dict[str, GriddedLayout] = {
     FUXI_LAYOUT.name: FUXI_LAYOUT,
     FUXI_PHYS_LAYOUT.name: FUXI_PHYS_LAYOUT,
@@ -412,4 +462,5 @@ LAYOUTS: Dict[str, GriddedLayout] = {
     FENGQING_PHYS_LAYOUT.name: FENGQING_PHYS_LAYOUT,
     CRA_LAYOUT.name: CRA_LAYOUT,
     ERA5_ZARR_LAYOUT.name: ERA5_ZARR_LAYOUT,
+    CRA_ZARR_LAYOUT.name: CRA_ZARR_LAYOUT,
 }

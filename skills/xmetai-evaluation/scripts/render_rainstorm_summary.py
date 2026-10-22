@@ -2,7 +2,8 @@
 # -*- coding: utf-8 -*-
 """43 个暴雨过程 × 2 口径 × N 模型 → 挑过程对比总表。
 
-    python render_rainstorm_summary.py --model FuXi=<输出根> --model FGVP-ctrl=<输出根> \
+    python render_rainstorm_summary.py --model FGVP=<输出根> --model AIFS=<输出根> \
+        --model FuXi=<输出根> --model FengQing=<输出根> --model Tongyun=<输出根> \
         --result evaluation_results/rainstorm_summary
 
 ``--model`` 缺省用 DEFAULT_MODELS，``--result`` 缺省用 DEFAULT_RESULT。
@@ -38,8 +39,11 @@ from xmetai_evaluation.visualization.rainstorm_report import (
 
 #: 模型名 → rainstorm_ts_single_* 输出根（换机器改这里）
 DEFAULT_MODELS = [
+    ("FGVP", "/workspace/szwCode/evaluation_results/rainstorm_ts_single_fgvp"),
+    ("AIFS", "/workspace/szwCode/evaluation_results/rainstorm_ts_single_aifs"),
     ("FuXi", "/workspace/szwCode/evaluation_results/rainstorm_ts_single_fuxi"),
-    ("FGVP-ctrl", "/workspace/szwCode/evaluation_results/rainstorm_ts_single_fgvp_ctrl"),
+    ("FengQing", "/workspace/szwCode/evaluation_results/rainstorm_ts_single_fengqing"),
+    ("Tongyun", "/workspace/szwCode/evaluation_results/rainstorm_ts_single_tongyun"),
 ]
 
 DEFAULT_RESULT = "/workspace/szwCode/evaluation_results/rainstorm_summary"
@@ -303,16 +307,17 @@ def main(argv=None) -> int:
     md_path = result_dir / "screening.md"
     md_path.write_text(markdown, encoding="utf-8")
 
-    missing = []
-    for code in all_codes:
-        got = set(load_days(models[0][1], code))
-        missing += [f"{code}_24h_{day}" for day in expected_days(code) if day not in got]
-        if load_total(models[0][1], code) is None:
-            missing.append(f"{code}_total")
     print(f"长表 {len(long_table)} 行 -> {long_path}")
     print(f"宽表 -> {md_path}")
-    if missing:
-        print(f"注意：{models[0][0]} 缺 {len(missing)} 段产物：{', '.join(missing)}")
+    for name, root in models:
+        missing = []
+        for code in all_codes:
+            got = set(load_days(root, code))
+            missing += [f"{code}_24h_{day}" for day in expected_days(code) if day not in got]
+            if load_total(root, code) is None:
+                missing.append(f"{code}_total")
+        if missing:
+            print(f"注意：{name} 缺 {len(missing)} 段产物：{', '.join(missing)}")
     return 0
 
 

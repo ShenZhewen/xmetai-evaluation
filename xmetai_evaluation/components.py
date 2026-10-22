@@ -186,6 +186,28 @@ def _era5_zarr_source(**params) -> SourceHandle:
     )
 
 
+def _cra_zarr_source(**params) -> SourceHandle:
+    """CRA-40 再分析实况（c71 zarr store）。
+
+    只有一个 store（71 通道全在里面），配置写 ``path``；也接受 ``stores``
+    （``{"cra": ...}``）以与 era5_zarr 同形。反归一化与 tp 的 expm1 在读取器里。
+    """
+    from xmetai_evaluation.io.era5_zarr_reader import CraZarrReader, Era5ZarrCatalog
+
+    source_id = params.get("source_id", "cra_zarr")
+    stores = dict(params.get("stores") or {})
+    if not stores:
+        path = params.get("path")
+        if not path:
+            raise ConfigError("reader 'cra_zarr' 需要 path（CRA c71 zarr store 的路径）")
+        stores = {"cra": str(path)}
+    return SourceHandle(
+        reader=CraZarrReader(source_id=source_id, stores=stores),
+        catalog=Era5ZarrCatalog(stores),
+        config=params,
+    )
+
+
 def _climatology_source(**params) -> SourceHandle:
     from xmetai_evaluation.io.climatology_reader import (
         ClimatologyCatalog,
@@ -845,6 +867,12 @@ def _register_all() -> None:
         "1.0.0",
         _era5_zarr_source,
         "ERA5 再分析实况（zarr store，气压层/地面分 store）",
+    )
+    register_reader(
+        "cra_zarr",
+        "1.0.0",
+        _cra_zarr_source,
+        "CRA-40 再分析实况（c71 zarr store，归一化存储，tp 为 log1p(mm)）",
     )
     register_reader(
         "climatology",

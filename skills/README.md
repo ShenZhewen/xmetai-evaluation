@@ -20,7 +20,7 @@
 | TS 系列（`weather_ts_det` / `weather_ts_ens` / `fdp_precip_ts` …） | 站点降水分类检验：TS / POD / FAR / 频率偏差 | ✅ 骨架分确定性 / 集合两份 |
 | RMSE 批次家族（`weather_rmse_single_<模型>` / `weather_rmse_ens_<模型>`，外加谱检验补充报告） | 格点 RMSE / ACC / FA / 纬向谱，**多模型横向对比** | ✅ 三份骨架 + 三个渲染器都做了（`render_det_report.py` / `_ens_` / `_wave_`） |
 | 暴雨过程个例（`rainstorm_ts_single_<模型>`） | 2025 年 43 个暴雨过程 × **双口径**（逐日 24h / 过程累积）的站点 TS | ✅ 骨架 + 渲染器都做了（`render_rainstorm_report.py`）。**流水线同为 `weather_ts_det`，但产物形状不同，走独立入口** |
-| 台风（`weather_typhoon_det` / `weather_typhoon_ens`） | 路径、AT/CT、强度 MAE/ME、严格配对、分组 bootstrap 与固定样本 | ✅ 统计、图表、九节报告、CSV/JSON；专用入口或标准产物统一派发 |
+| 台风（`weather_typhoon_det` / `weather_typhoon_ens`） | 路径、AT/CT、强度 MAE/ME、严格配对、分组 bootstrap 与固定样本 | ✅ 统计、图表、六章报告（确定性与集合平均共用一份骨架）、CSV/JSON；专用入口或标准产物统一派发 |
 | 其余流程（CRPS、FSS、概率评分…） | — | ⛔ 报告模板还没做，调用时会明确报错 |
 
 **能力身份自动识别**：给一个评测产物目录，skill 从 `manifest.json` 的
@@ -95,7 +95,7 @@ skills/
     │   ├── render_ens_report.py    # 批次归档（集合）→ 同上，另加 CRPS/Spread
     │   ├── render_wave_report.py   # legacy：谱检验补充（球谐带已并入上两份报告）
     │   ├── render_rainstorm_summary.py      # 43 个过程 × 2 口径 × N 模型 → 挑过程总表（CSV + 宽表）
-    │   ├── generate_typhoon_report.py  # 台风场次 CSV → 配对统计 + 图表 + 九节报告
+    │   ├── generate_typhoon_report.py  # 台风场次 CSV → 配对统计 + 图表 + 六章报告（det/ens 共用）
     │   ├── render_rainstorm_report.py  # 暴雨过程个例产物根 → 多模型对比报告（按过程分节）
     │   ├── _spatial_common.py               # 两个空间分布取数脚本共用的常量 / 坐标归一 / ERA5
     │   ├── extract_spatial_distribution.py      # 确定性档案 + ERA5 → 月平均宽表 CSV（服务器）
@@ -107,8 +107,7 @@ skills/
     │       ├── weather_ts_ens.md       # 集合降水检验：同上，§3 多 AROC/BS/BSS 三行、另加 §4.7 概率评分
     │       ├── weather_rmse_single.md  # RMSE 批次家族（单成员）：纬向 FFT、球谐带（§4.5）、空间分布（§4.6）
     │       ├── weather_rmse_ens.md     # RMSE 批次家族（集合）：CRPS / Spread、空间分布（§4.6）、球谐带（§4.8）
-    │       ├── weather_typhoon_single.md  # 台风路径/强度（确定性）
-    │       ├── weather_typhoon_ens.md     # 台风路径/强度（集合平均，九节报告）
+    │       ├── weather_typhoon_single.md  # 台风路径/强度（确定性 / 集合平均共用）
     │       └── rainstorm_case.md          # 暴雨过程个例：双口径 × 多模型，按过程分节
     ├── references/              # 参考文档（口径与判读规则）
     │   ├── evaluation-metrics.md        # 指标词典：是什么（不判好坏）
@@ -878,7 +877,19 @@ skills/
     `references/model-diff-analysis.md` 的差值图段落同步；删掉「有
     `test_ts_report.py` 守着」的旧说法（`tests/` 里从来没有这个文件）
 
+- **2026-10-22**: 台风集合模板并入确定性骨架
+  - **删除 `weather_typhoon_ens.md`**：未来的集合评测报告与确定性报告完全同构，
+    没有专属指标。`weather_typhoon_single.md` 抬头改为「确定性 / 集合平均共用」，
+    文件不改名以免引用大面积翻动
+  - 集合版与确定性的差别收拢为三处：§2 的「成员规模（场次覆盖）」与
+    「文件交集内成员规模与起报数」附加表、§3.1 的集合口径句（方案 B）、
+    §5 的固定限制句；集合没有最大风速字段时按条件块写「不比较最大风速」，
+    不出该指标的 MAE/ME 图、不补空号
+  - `SKILL.md` 三处路由/能力表/模板清单、`references/typhoon-report-workflow.md`
+    配套资源同步；两份旧骨架里的「图 2 三面板」「图 4 起缺席」两处过期图号说明
+    改成按实际出图数顺延
+
 ---
 
 **维护者**: 沈哲文 (szw)
-**最后更新**: 2026-10-21
+**最后更新**: 2026-10-22

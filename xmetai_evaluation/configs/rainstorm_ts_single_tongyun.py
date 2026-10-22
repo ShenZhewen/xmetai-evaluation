@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""2025 年暴雨过程个例检验（FGVP-ctrl × Diamond 站点）：43 个过程 × 两种口径。
+"""2025 年暴雨过程个例检验（通云 × Diamond 站点）：43 个过程 × 两种口径。
 
 口径 A 为逐日 08–08 北京时 24h 窗，口径 B 为过程累积窗；不分带，只出全球行。
 """
@@ -18,10 +18,11 @@ SMOKE = False
 PROCESSES = process_tuples()
 
 #: 数据源与输出根。
-FGVP_CTRL_ROOT = "/workspace/data/shenzw/fgvp_ctrl_output"
+TONGYUN_ROOT = "/workspace/data/shenzw/tongyun_single"
 STATION_ROOT = "/workspace/data/worm/r0/2025"
 STATION_LIST = "/workspace/data/worm/r0/zd_sta_10285.dat"
-OUTPUT_ROOT = "/workspace/szwCode/evaluation_results/rainstorm_ts_single_fgvp_ctrl"
+OUTPUT_ROOT = "/workspace/szwCode/evaluation_results/rainstorm_ts_single_tongyun"
+
 
 def _dense_leads(max_hours):
     """按 6h 密排到 max_hours（24h 窗是 4 个连续 6h 步加出来的，必须密排）。"""
@@ -46,12 +47,12 @@ for _code, _start, _end in PROCESSES:
         _init = _d.strftime("%Y%m%d")
         cfgs.append(
             EvalConfig(
-                name=f"rainstorm_fgvp_ctrl_{_code}_24h_{_init}",
+                name=f"rainstorm_tongyun_{_code}_24h_{_init}",
                 description=f"{_code} 过程 {_init} 起报 day-1 24h TS（{_init}08时→次日08时）",
                 pipeline="weather_ts_det",
                 forecast_reader={
-                    "type": "fuxi",  # FGVP-ctrl 落盘也用 fuxi 目录布局
-                    "root_dir": FGVP_CTRL_ROOT,
+                    "type": "fuxi",  # 通云落盘也用 fuxi 目录布局
+                    "root_dir": TONGYUN_ROOT,
                     "variable": "tp",
                     "step_hours": 6.0,
                     "lead_times": [6, 12, 18, 24],
@@ -72,7 +73,7 @@ for _code, _start, _end in PROCESSES:
                 output_dir=f"{OUTPUT_ROOT}/{_code}_24h/{_init}",
                 log_level="INFO",
                 execution={
-                    "mode": "threads",  # 轻指标 → threads（同 weather_ts_single_fgvp）
+                    "mode": "threads",  # 轻指标 → threads（同 weather_ts_single_*）
                     "n_workers": 24,
                     "chunk_days": 1,
                     "lead_chunk_days": 1,  # 1 天时效 = 1 个 24h 采样点
@@ -87,12 +88,12 @@ for _code, _start, _end in PROCESSES:
     # lead_times 密排到窗长；lead_chunk_days 一块装下整窗。
     cfgs.append(
         EvalConfig(
-            name=f"rainstorm_fgvp_ctrl_{_code}_total",
+            name=f"rainstorm_tongyun_{_code}_total",
             description=f"{_code} 过程累积 TS（{_prev} 08时 起 {_span_days} 天）",
             pipeline="weather_ts_det",
             forecast_reader={
                 "type": "fuxi",
-                "root_dir": FGVP_CTRL_ROOT,
+                "root_dir": TONGYUN_ROOT,
                 "variable": "tp",
                 "step_hours": 6.0,
                 "lead_times": _dense_leads(_window_hours),

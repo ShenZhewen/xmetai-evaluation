@@ -37,7 +37,7 @@ python -m pytest tests/integration/test_fdp_fengqing_realdata.py -m realdata
 
 ## 台风结果生成报告
 
-evaluation 写出的逐场次 CSV 与元数据可直接生成严格配对统计、图表与九节报告：
+evaluation 写出的逐场次 CSV 与元数据可直接生成严格配对统计、图表与六章报告：
 
 ```bash
 python skills/xmetai-evaluation/scripts/generate_typhoon_report.py \
@@ -51,10 +51,11 @@ python skills/xmetai-evaluation/scripts/generate_typhoon_report.py \
 默认 2000 次台风区组 bootstrap，`--bootstrap 0` 禁用。输入可为标准产物根或
 场次 CSV 目录，要求每个场次有类型、时间和集合口径明确的 `_meta.json`。
 输出 `REPORT.md`、`summary.json`、`statistics.csv`、`differences.csv`、
-`track.png` 和适用时的 `mae.png` / `me.png`。不改写输入，不覆盖非空输出目录。
+`track.svg`、每个分量/强度指标各一张的 `mae_<指标>.svg` 与 `me_<指标>.svg`，
+以及 `track_plots/` 下逐台风一张的路径图。不改写输入，不覆盖非空输出目录。
 集合主结果是方案 B，不是成员平均误差或概率性能。
 具体输入契约与验收见 [台风报告工作流](./skills/xmetai-evaluation/references/typhoon-report-workflow.md)。
-报告保留九节大纲，正文采用模型×时效横表与数据驱动小结，完整统计留在 CSV/JSON。
+报告为六章结构，正文采用模型×时效横表与数据驱动小结，完整统计留在 CSV/JSON。
 可用 `--primary-model` / `--previous-model` 明确主模型与旧版本，
 `--primary-leads` / `--exploratory-leads` 预先指定主要/探索时效；
 其他时效作个例参考。配对差值正文按“比较模型 − 主模型”展示，
@@ -201,9 +202,9 @@ options={
 
    | 驻留策略 | 语义 | 缺省用于 |
    |---|---|---|
-   | `slice` | 每块现读现弃 | 预报（恒为此策略）、格点实况（`cra`/`era5_zarr`） |
+   | `slice` | 每块现读现弃 | 预报（恒为此策略）、格点实况（`cra`/`era5_zarr`/`cra_zarr`） |
    | `resident` | 整个 run 读一次驻留 | 站点观测、气候态参考场（CRA CLI_6HOUR / 日序） |
-   | `window:W` | 按 W 天块滚动缓存，保留当前块 ±1（回跳要用） | 格点实况（`cra`/`era5_zarr`）**推荐**显式改成它，推导缺省仍是 `slice` |
+   | `window:W` | 按 W 天块滚动缓存，保留当前块 ±1（回跳要用） | 格点实况（`cra`/`era5_zarr`/`cra_zarr`）**推荐**显式改成它，推导缺省仍是 `slice` |
 
    格点实况的推导缺省是 `slice`，但**配 `window` 基本总是更好**：块序会让观测读
    反复回跳（原因见本节末「`loads` 的自动定窗」那段），`slice` 下每个观测日被重读
@@ -586,7 +587,7 @@ echo "已用: $(cat /sys/fs/cgroup/memory.current)"
 
 | 类型 | 注册名 |
 |---|---|
-| Reader | `fuxi`、`fuxi_ens`、`fengqing`（及 `fuxi_phys`/`fuxi_ens_phys`/`fengqing_phys` 单位变体）、`cra`、`era5_zarr`、`station`（`diamond_station` 别名）、`babj`（BABJ 台风路径报文）、`climatology`、`daily_climatology`、`ref_probability` |
+| Reader | `fuxi`、`fuxi_ens`、`fengqing`（及 `fuxi_phys`/`fuxi_ens_phys`/`fengqing_phys` 单位变体）、`cra`、`era5_zarr`、`cra_zarr`、`station`（`diamond_station` 别名）、`babj`（BABJ 台风路径报文）、`climatology`、`daily_climatology`、`ref_probability` |
 | Transform | `grid_to_station`、`time_window_accumulator`、`ensemble_mean` |
 | Metric | `rmse`、`bias`、`acc`、`acc_uncentered`、`ts_score`、`ensemble_probability`、`crps`、`spread_error`、`fss`、`activity`、`spectrum`、`zonal_spectrum`、`spherical_bands`、`track_error`、`track_error_ens` |
 | Protocol | `station_valid_time`（插值到站点，按有效时刻配对）、`grid_valid_time`（插值到实况网格）、`typhoon_track`（链式诊断台风中心，对 BABJ 配对）、`typhoon_track_ens`（同上前者逐成员，批次带成员轴） |
@@ -618,6 +619,7 @@ echo "已用: $(cat /sys/fs/cgroup/memory.current)"
 | **确定性连续量检验**<br>`weather_field_scores` | 格点场预报（`fuxi`，z500 等）+ 格点实况 + 气候态（ACC/活跃度必需） | `scores.csv`、`diagnostics/spectrum_{var}.csv`、`diagnostics/spectrum_by_init.csv` | `rmse`、`acc`、`activity_ratio`、`activity_forecast`、`activity_observation`、`activity_bias`、`spectrum_power_ratio`（纬向谱）、`spherical_band_power_forecast/observation/ratio`（球谐带，group 列分频带）<br>逐波数谱曲线另出宽表 | 重·参考·整场 · processes |
 | **集合连续评分**<br>`weather_ens_crps` | 集合格点场预报（`fuxi_ens`）+ 格点实况 | `scores.csv` | `crps`、`spread`、`rmse`（集合平均场）、`spread_error_ratio` | 重·成员 · processes |
 | **集合场检验**<br>`weather_ens_field_scores` | 集合格点场预报（`fuxi_ens`）+ 格点实况（ERA5）+ 气候态（ACC/活跃度必需） | `scores.csv`、`diagnostics/spectrum_{var}.csv`、`diagnostics/spectrum_by_init.csv` | `rmse`、`crps`、`spread`、`rmse`（集合平均场）、`spread_error_ratio`、`acc`、`activity_ratio`、`activity_forecast`、`activity_observation`、`activity_bias`、`spectrum_power_ratio`、`spherical_band_power_*`<br>谱曲线同 `weather_field_scores` | 重·参考·成员·整场 · processes |
+| **集合场检验（无气候态）**<br>`weather_ens_field_scores_noref` | 同 `weather_ens_field_scores`，但不给参考场 | 同 `weather_ens_field_scores` | 同上去掉 `acc`、`activity_*`——只留 `rmse`、`crps`、`spread`、`spread_error_ratio`、`spectrum_power_ratio`、`spherical_band_power_*` | 重·成员·整场 · processes |
 | **台风路径与强度检验（确定性）**<br>`weather_typhoon_det` | 确定性格点预报（`fuxi_phys`，msl 必给；u10m/v10m 给不了就没有强度项）+ BABJ 路径报文（`babj`，diamond7） | `scores.csv`、`typhoon/tc<编号>_<起报>.csv`（逐时效 15 列）、`_meta.json`、`typhoon/typhoon.csv`（全场合拼） | `track_err_km`、`at_km`、`ct_km`、`wind_err_ms`、`pmin_err_hpa`<br>逐 场次（台风 × 起报）：每项一个时效均值；逐时效曲线在路径表里，不进长表 | 轻 · threads（配置改 processes：瓶颈是读盘不是算） |
 | **台风路径与强度检验（集合）**<br>`weather_typhoon_ens` | 集合格点预报（根目录按起报分日期目录，日期目录下放 `member_*/`；msl 必给）+ BABJ 路径报文 | 同上（路径表多 `n_members`/`n_valid_members`） | 确定性那 5 项 + `track_err_km_a`、`at_km_a`、`ct_km_a`<br>无后缀 = 方案 B（各成员位置先平均，再与实况求误差）；`_a` = 方案 A（各成员先各算误差，再对成员平均）。两者只在路径三项上有别；强度两项代数恒等，只出一行 | 轻·成员 · threads（配置改 processes） |
 | **集合连续评分**<br>`fdp_ens_crps` | 集合格点场预报（`fengqing`）+ CRA40 再分析实况 | `scores.csv` | `crps`、`spread`、`rmse`（集合平均场）、`spread_error_ratio` | 重·成员 · processes |
@@ -756,11 +758,12 @@ echo "已用: $(cat /sys/fs/cgroup/memory.current)"
 | `weather_ts_ens_fuxi` | FuXi 集合降水：24h TS + 6h 概率两段一趟跑完 |
 | `weather_rmse_single_fuxi` / `_fgvp` | 确定性连续量（RMSE/谱/ACC/活跃度） |
 | `weather_rmse_ens_fuxi` / `_fgvp` | 集合场（RMSE/CRPS/Spread/ACC/活跃度/谱/球谐带） |
+| `weather_rmse_ens_tongyun_cra` | Tongyun CRA 集合 × CRA-40 c71 zarr：RMSE/CRPS/Spread/谱（不算 ACC/活跃度） |
 | `weather_typhoon_single_fuxi` | 台风路径与强度（确定性 × BABJ） |
 | `weather_typhoon_ens_fuxi` | 台风路径与强度（集合，方案 A/B 一次算清） |
 | `fdp_rmse_single_fengqing` / `fdp_rmse_ens_fengqing` | FDP 要素检验（确定性 / 集合） |
 | `fdp_precip_single_fengqing` / `fdp_precip_ens_fengqing` | FDP 降水站点检验（确定性 TS/频率偏差 / 集合概率 BS/AROC/BSS） |
-| `rainstorm_ts_single_fuxi` / `_fgvp_ctrl` | 暴雨过程分档检验：走 `weather_ts_det`，逐过程展开起报，过程编目（43 个过程，编号/起止/等级）的唯一真值在 `rainstorm_catalog.py` |
+| `rainstorm_ts_single_fgvp` / `_aifs` / `_fuxi` / `_fengqing` / `_tongyun` | 暴雨过程分档检验：走 `weather_ts_det`，逐过程展开起报，过程编目（43 个过程，编号/起止/等级）的唯一真值在 `rainstorm_catalog.py` |
 
 批量多模型见上「批量评测」——写一份 `cfgs` 列表即可，无内置示例。
 
@@ -780,6 +783,7 @@ echo "已用: $(cat /sys/fs/cgroup/memory.current)"
 | `weather_field_scores` | 格点预报（`fuxi` 等） | 格点实况（`cra` / `era5_zarr`） | 气候态（ACC / 活跃度必需；纬向谱不需要） |
 | `weather_ens_crps` | `fuxi_ens` | `cra` / `era5_zarr` | — |
 | `weather_ens_field_scores` | 集合预报（`fuxi_ens` / `fengqing`） | `era5_zarr` | 日气候态（ACC / 活跃度必需） |
+| `weather_ens_field_scores_noref` | 集合预报（`fuxi_ens_phys` 等） | `cra_zarr` / `era5_zarr` | — |
 | `fdp_ens_crps` | `fengqing`（集合） | `cra` | — |
 | `fdp_field_scores` | `fengqing` | `cra` | `climatology`（ACC 需要） |
 | `weather_typhoon_det` | 格点预报（`msl` 必给；`u10m`/`v10m` 可选） | `babj` 报文 | — |
@@ -868,6 +872,29 @@ observation_reader={
 - 通道名旁挂在 store 同级目录的 `channel_names.json` 里；**没有层次轴**，层次编码在
   通道名里（`z_500`、`u_200`），配置侧仍写标准名。
 - 气压层走 `pl`、地面走 `sfc`（`groups` 已声明）；GRIB 缺测哨兵 `1e30` 当缺测。
+
+**CRA-40 zarr**（`cra_zarr`）——单个 store 装 71 通道，与 CRA 版 Tongyun 推理同一个源：
+
+```python
+observation_reader={
+    "type": "cra_zarr",
+    "path": ".../cra.19790101_20260714.c71.p25.h6.v1.zarr",
+    "variables": ["z500", "msl", "t2m", "tp"],
+}
+```
+
+- 通道 = z/t/u/v/q × 13 层（50→1000）+ `t2m`/`q2m`/`u10m`/`v10m`/`msl`/`tp`，
+  层次名与推理侧一致（`z500`，store 里可能写 `z_500`，读取器去下划线对上）。
+- **store 存的是归一化值**：读取器用 store 自带的 `mean`/`std` 还原成物理量
+  （`x*std+mean`），配置侧不用管；缺这两个数组会直接报错，不猜。
+- **`tp` 在 store 里是 `log1p(mm)`**（其 mean=0/std=1），读取器做 `expm1` 后按
+  `INTERVAL_ACCUMULATION` 的 mm 报出——不要再写 `scale`。
+- q 是 **kg/kg**（不 ×1000，与 `era5_zarr` 的 g/kg 口径不同）；当前默认变量表不含 q。
+- **`data` 是 float16**，读取器统一转成 f32 再算，不影响指标口径。
+- **`time` 是 zarr v3 原生 `datetime64[ns]`**（属性里没有 CF 的 `units`）；读取器
+  直接换算成距 1970 的秒数，同时也照旧支持 ERA5 store 的 `<单位> since <时刻>` 写法。
+- 时间轴精确匹配：store 覆盖不到的有效时刻直接报错（不会静默错配）。所以配置里的
+  时效上限要跟 store 末尾对齐（例：store 止于 2026-07-14，`20260701` 起报最多 +318h）。
 
 **BABJ 台风路径报文**（`babj`）——记录台风**最佳路径**的业务分析报文：
 
@@ -986,6 +1013,7 @@ observation_reader={
 | `fengqing` / `fengqing_phys` | `root_dir` | `variable` 或 `variables`、`scales`、`source_id` |
 | `cra` | `root_dir` | `variable` 或 `variables`、`source_id` |
 | `era5_zarr` | `stores`（`{"pl": …, "sfc": …}`） | `variable` 或 `variables`、`source_id` |
+| `cra_zarr` | `path`（也可写 `stores`） | `variables`、`source_id` |
 | `station` / `diamond_station` | `root_dir` | `station_whitelist` 或 `station_list`、`source_id` |
 | `climatology` | `root_dir` | `engine`（默认 `cfgrib`）、`source_id` |
 | `daily_climatology` | `root_dir` | `smooth_days`（默认 15）、`scales`、`units`、`source_id` |

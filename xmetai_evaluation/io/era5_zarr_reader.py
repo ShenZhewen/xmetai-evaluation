@@ -35,7 +35,11 @@ from xmetai_evaluation.core.contracts import (
 from xmetai_evaluation.core.errors import DecodeError, DiscoveryError
 from xmetai_evaluation.core.variables import TemporalKind
 from xmetai_evaluation.io.base import DataCatalog, Reader
-from xmetai_evaluation.io.layouts import ERA5_ZARR_LAYOUT, GriddedLayout
+from xmetai_evaluation.io.layouts import (
+    CRA_ZARR_LAYOUT,
+    ERA5_ZARR_LAYOUT,
+    GriddedLayout,
+)
 
 log = logging.getLogger(__name__)
 
@@ -132,6 +136,9 @@ class _Store:
         self._group: Any = None
         self._names: Optional[List[str]] = None
         self._alias: Dict[str, str] = {}
+        self._stats: Optional[Tuple[np.ndarray, np.ndarray]] = None
+        self._stats_loaded = False
+        self._time: Optional[Tuple[np.ndarray, float, datetime]] = None
 
     # -- 打开 ---------------------------------------------------------------
 
@@ -213,14 +220,58 @@ class _Store:
             return target
         return self._alias.get(target.replace("_", ""))
 
+    # -- 归一化统计量 -------------------------------------------------------
+
+    def stats(self) -> Optional[Tuple[np.ndarray, np.ndarray]]:
+        """store 里随附的 ``mean`` / ``std``（逐通道），没有就 ``None``。
+
+        CRA store 存的是归一化值，反归一化要用这两个数组；ERA5 store 没有成员，
+        所以这里返回 ``None`` 而不是报错——要不要用由读取器的 ``denormalize`` 决定。
+        """
+        if not self._stats_loaded:
+            self._stats_loaded = True
+            arrays = []
+            for name in ("mean", "std"):
+                try:
+                    arrays.append(
+                        np.asarray(self.member(name)[:], dtype="f8").reshape(-1)
+                    )
+                except DecodeError:
+                    arrays = []
+                    break
+            self._stats = (arrays[0], arrays[1]) if arrays else None
+        return self._stats
+
     # -- 时间轴 -------------------------------------------------------------
 
     def time_values(self) -> Tuple[np.ndarray, float, datetime]:
-        """返回 (时间轴原始值, 单位换算系数, 起算时刻)。"""
-        axis = self.member("time")
-        raw = np.asarray(axis[:], dtype="f8")
-        factor, origin = _parse_time_units(getattr(axis, "attrs", {}).get("units"), self.path)
-        return raw, factor, origin
+        """返回 (时间轴原始值, 单位换算系数, 起算时刻)。
+
+        两种编码都认：
+
+        * CF 风格数值 + ``units='<单位> since <时刻>'``（ERA5 store）；
+        * zarr v3 原生的 ``numpy.datetime64``（CRA store，属性里**没有** units），
+          此时直接换算成距 1970-01-01 的秒数。
+
+        结果缓存：CRA 的时间轴有近 7 万个时次，每个 chunk 都重读一遍不值得。
+        """
+        if self._time is None:
+            axis = self.member("time")
+            values = np.asarray(axis[:])
+            attrs = dict(getattr(axis, "attrs", {}) or {})
+            if attrs.get("units"):
+                factor, origin = _parse_time_units(attrs["units"], self.path)
+                raw = values.astype("f8")
+            elif np.issubdtype(values.dtype, np.datetime64):
+                raw = values.astype("datetime64[ns]").astype("int64") / 1e9
+                factor, origin = 1.0, _EPOCH
+            else:
+                raise DecodeError(
+                    f"{self.path} 的 time 轴既没有 units，也不是 datetime64"
+                    f"（dtype={values.dtype}，属性={attrs}）"
+                )
+            self._time = (raw, factor, origin)
+        return self._time
 
     # -- 数据 ---------------------------------------------------------------
 
@@ -266,7 +317,9 @@ class _Store:
         slicer[axes["channel"]] = slice(channel_index, channel_index + 1)
         order = [axes["time"], axes["channel"], axes["lat"], axes["lon"]]
         block = np.asarray(raw[tuple(slicer)]).transpose(order)
-        return block[:, 0, :, :]
+        # 统一转 f4 再返回：CRA store 存的是 float16，直接拿它跟 MISSING_SENTINEL
+        # （1e30）比会触发 float16 溢出告警，而且后面的 NaN 掩码本来就按 f4 算。
+        return block[:, 0, :, :].astype("f4", copy=False)
 
 
 class Era5ZarrCatalog(DataCatalog):
@@ -300,16 +353,32 @@ class Era5ZarrReader(Reader):
     一个 run 可以用两个 store（气压层 + 地面），变量按 ``layout.groups`` 路由。
     """
 
+    #: 写进 provenance 的读取器标识；子类改成自己的名字
+    reader_id = "era5_zarr"
+    #: 报错/告警里的数据源称呼
+    label = "ERA5 zarr"
+
     def __init__(
         self,
         source_id: str,
         stores: Dict[str, str],
         layout: GriddedLayout = ERA5_ZARR_LAYOUT,
         version: str = "1.0.0",
+        denormalize: bool = False,
+        expm1_variables: Sequence[str] = (),
     ):
+        """
+        Args:
+            denormalize: store 是否存归一化值。为真时用 store 自带的 ``mean``/``std``
+                还原成物理量（``x*std+mean``）；缺这两个数组直接报错，不猜。
+            expm1_variables: 需要在读取时做 ``expm1`` 的标准变量名（CRA 的 ``tp``
+                在 store 里是 ``log1p(mm)``）。在反归一化之后、``scale`` 之前做。
+        """
         super().__init__(source_id=source_id, version=version)
         self.stores = {str(key): str(value) for key, value in (stores or {}).items()}
         self.layout = layout
+        self.denormalize = bool(denormalize)
+        self.expm1_variables = frozenset(str(name) for name in expm1_variables)
         self._opened: Dict[str, _Store] = {}
 
     # -- 内部 ---------------------------------------------------------------
@@ -318,7 +387,8 @@ class Era5ZarrReader(Reader):
         if key not in self._opened:
             if key not in self.stores:
                 raise DecodeError(
-                    f"era5_zarr 没有声明分组 {key!r}；已声明: {sorted(self.stores)}"
+                    f"{self.reader_id} 没有声明分组 {key!r}；"
+                    f"已声明: {sorted(self.stores)}"
                 )
             self._opened[key] = _Store(key, self.stores[key])
         return self._opened[key]
@@ -375,7 +445,7 @@ class Era5ZarrReader(Reader):
     def read(self, request: DataRequest, index: DataIndex) -> DataBundle:
         if not request.init_times:
             raise DecodeError(
-                "era5_zarr 需要显式给出要读的有效时刻（request.init_times），"
+                f"{self.reader_id} 需要显式给出要读的有效时刻（request.init_times），"
                 "否则会整块载入整个 store"
             )
         times = sorted(request.init_times)
@@ -392,10 +462,10 @@ class Era5ZarrReader(Reader):
             message = ", ".join(unresolved)
             if message not in _WARNED_MISSING:
                 _WARNED_MISSING.add(message)
-                log.warning("ERA5 zarr 里没有这些变量，已跳过: %s", message)
+                log.warning("%s 里没有这些变量，已跳过: %s", self.label, message)
         if not resolved:
             raise DecodeError(
-                f"ERA5 zarr 里没有任何请求的变量可用: {list(request.variables)}"
+                f"{self.label} 里没有任何请求的变量可用: {list(request.variables)}"
             )
 
         fields: Dict[str, xr.DataArray] = {}
@@ -423,12 +493,34 @@ class Era5ZarrReader(Reader):
             time_size = len(store.member("time")[:])
             picked = np.asarray(indices, dtype=int) - lo
 
+            # 归一化 store：整块只取一次 mean/std，逐通道挑下标
+            stats = store.stats() if self.denormalize else None
+            if self.denormalize and stats is None:
+                raise DecodeError(
+                    f"{store.path} 里没有 mean/std，无法反归一化"
+                    f"（{self.reader_id} 的 denormalize=True）"
+                )
+            names_in_store = store.channel_names() if stats is not None else []
+
             for name, _store_obj, channel in items:
                 block = store.block(
                     channel, lo, hi, len(lat), len(lon), time_size
                 )
                 values = np.where(np.abs(block) > MISSING_SENTINEL, np.nan, block)
                 values = values[picked, :, :].astype("f4")
+
+                if stats is not None:
+                    mean, std = stats
+                    position = names_in_store.index(channel)
+                    if position >= len(mean) or position >= len(std):
+                        raise DecodeError(
+                            f"{store.path} 的 mean/std 只有 {len(mean)}/{len(std)} 个值，"
+                            f"装不下 {len(names_in_store)} 个通道"
+                        )
+                    values = values * np.float32(std[position]) + np.float32(mean[position])
+
+                if name in self.expm1_variables or channel in self.expm1_variables:
+                    values = np.expm1(values)
 
                 spec = self.layout.spec_for(name)
                 unit = spec.unit if spec is not None else "unknown"
@@ -460,10 +552,43 @@ class Era5ZarrReader(Reader):
             ),
             provenance=Provenance(
                 input_files=files,
-                reader_id="era5_zarr",
+                reader_id=self.reader_id,
                 reader_version=self.version,
                 source_variables=source_variables,
             ),
+        )
+
+
+class CraZarrReader(Era5ZarrReader):
+    """CRA-40 的 c71 zarr store。
+
+    与 ERA5 store 的差别全落在基类的两个开关上，没有新流程：
+
+    * ``denormalize=True``——store 存的是归一化值，用 store 自带的 ``mean``/``std``
+      还原成物理量（``x*std+mean``）。这与推理侧 ``TensorDenormalize`` 同一个口径。
+    * ``expm1_variables=("tp",)``——store 里 tp 是 ``log1p(mm)``（mean=0/std=1，
+      反归一化在它身上是恒等），读出来要做 ``expm1`` 才是 mm。
+
+    布局是 ``CRA_ZARR_LAYOUT``（71 通道，单 store，无 groups）。
+    """
+
+    reader_id = "cra_zarr"
+    label = "CRA zarr"
+
+    def __init__(
+        self,
+        source_id: str = "cra_zarr",
+        stores: Optional[Dict[str, str]] = None,
+        layout: GriddedLayout = CRA_ZARR_LAYOUT,
+        version: str = "1.0.0",
+    ):
+        super().__init__(
+            source_id=source_id,
+            stores=stores or {},
+            layout=layout,
+            version=version,
+            denormalize=True,
+            expm1_variables=("tp",),
         )
 
 

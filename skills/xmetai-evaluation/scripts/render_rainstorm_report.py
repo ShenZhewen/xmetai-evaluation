@@ -2,7 +2,8 @@
 # -*- coding: utf-8 -*-
 """多个暴雨过程个例产物根 → 多模型对比图 + Markdown 报告。
 
-    python render_rainstorm_report.py --model FuXi=<输出根> --model FGVP-ctrl=<输出根> \
+    python render_rainstorm_report.py --model FGVP=<输出根> --model AIFS=<输出根> \
+        --model FuXi=<输出根> --model FengQing=<输出根> --model Tongyun=<输出根> \
         --process 202503,202521,202531 --result report/rainstorm
 
 ``--model NAME=目录`` 可重复、至少两个，第一个是主模型（Δ = 主模型 − 第二个）。
@@ -32,8 +33,11 @@ def main(argv=None) -> int:
     parser = argparse.ArgumentParser(
         description="按多个暴雨过程个例产物根出图并写多模型对比报告",
         epilog="示例: python skills/xmetai-evaluation/scripts/render_rainstorm_report.py "
+        "--model FGVP=evaluation_results/rainstorm_ts_single_fgvp "
+        "--model AIFS=evaluation_results/rainstorm_ts_single_aifs "
         "--model FuXi=evaluation_results/rainstorm_ts_single_fuxi "
-        "--model FGVP-ctrl=evaluation_results/rainstorm_ts_single_fgvp_ctrl "
+        "--model FengQing=evaluation_results/rainstorm_ts_single_fengqing "
+        "--model Tongyun=evaluation_results/rainstorm_ts_single_tongyun "
         "--process 202503,202521 --result reports/rainstorm",
     )
     parser.add_argument(

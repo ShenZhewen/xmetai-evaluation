@@ -42,6 +42,7 @@ grib = [
 viz = [
     "matplotlib>=3.5",
     "cartopy>=0.20",
+    "basemap>=2.0",
 ]
 dev = [
     "pytest>=7.0",
