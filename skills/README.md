@@ -19,7 +19,7 @@
 | `weather_field_scores` | 确定性连续场：RMSE / ACC / 预报活跃度 / 纬向谱 | ⚠️ 能力与渲染器在，格式契约骨架已删（单模型报告走 `render_report.py`） |
 | TS 系列（`weather_ts_det` / `weather_ts_ens` / `fdp_precip_ts` …） | 站点降水分类检验：TS / POD / FAR / 频率偏差 | ✅ 骨架分确定性 / 集合两份 |
 | RMSE 批次家族（`weather_rmse_single_<模型>` / `weather_rmse_ens_<模型>`，外加谱检验补充报告） | 格点 RMSE / ACC / FA / 纬向谱，**多模型横向对比** | ✅ 三份骨架 + 三个渲染器都做了（`render_det_report.py` / `_ens_` / `_wave_`） |
-| 暴雨过程个例（`rainstorm_ts_single_<模型>`） | 2025 年 43 个暴雨过程 × **双口径**（逐日 24h / 过程累积）的站点 TS | ✅ 骨架 + 渲染器都做了（`render_rainstorm_report.py`）。**流水线同为 `weather_ts_det`，但产物形状不同，走独立入口** |
+| 暴雨过程个例（`rainstorm_ts_single_<模型>`） | 2025 年 43 个暴雨过程 × **双口径**（逐日 24h / S 单起报逐日 24h）的站点 TS | ✅ 骨架 + 渲染器都做了（`render_rainstorm_report.py`）。**流水线同为 `weather_ts_det`，但产物形状不同，走独立入口** |
 | 台风（`weather_typhoon_det` / `weather_typhoon_ens`） | 路径、AT/CT、强度 MAE/ME、严格配对、分组 bootstrap 与固定样本 | ✅ 统计、图表、六章报告（确定性与集合平均共用一份骨架）、CSV/JSON；专用入口或标准产物统一派发 |
 | 其余流程（CRPS、FSS、概率评分…） | — | ⛔ 报告模板还没做，调用时会明确报错 |
 
@@ -721,21 +721,23 @@ skills/
     `scripts/render_rainstorm_report.py`。它吃的是
     `configs/rainstorm_ts_single_*` 的产物根——一个过程两套段
     （`{编号}_24h/{起报日}/` 与 `{编号}_total/`），一次评测 43 个过程 ×
-    2 种口径 = 255 段独立产物，报告**按过程分节**（不是按时效分节）
+    2 种口径 = 212 段独立产物（口径 A 每个 UTC 日一段、口径 B 每过程一段），
+    报告**按过程分节**（不是按时效分节）
   - **流水线相同、渲染器不同**：每段产物的 `pipeline` 也是 `weather_ts_det`、
     宽表列名也和 TS 系列一样，但 `ts_report.py` 假定"一次连续时段评测、
     一张宽表"，结构上吃不下这批产物。所以它走独立渲染器，
     **不能喂给 `render_report.py`**（喂得进去、出的却是错的章节口径）。
     这是"模板按家族分、不按流程分"原则之外的第一处例外，已在 SKILL.md 写明
-  - **两种口径互不可比**，报告里两套数分节呈现、只在同一口径内跨模型比：
-    口径 A（逐日 24h）一天一个 08–08 窗、基准率随每日实况浮动；
-    口径 B（过程累积）一根预报累加整段、基准率显著更高。实测 202503 的
-    ≥25mm TS：日均 0.210 vs 过程累积 0.313
-  - **过程编目收敛到一份真值**：新增 `xmetai_evaluation/rainstorm_catalog.py`
+  - **两种口径的预报样本不同**，报告里两套数分节呈现、只在同一口径内跨模型比：
+    口径 A（逐日 24h）每天换一根 00UTC 起报、每窗都是 0–24h 的短期技巧；
+    口径 B（单起报逐日 24h）只在过程起点 S 起报一根、第 k 天是 lead k×24h 的
+    中期预报。两者评的是同一批 24h 窗，差别只在「每天更新起报」与「一根报到底」
+  - **过程编目收敛到一份真值**：新增 `xmetai_evaluation/configs/rainstorm_ts_single_base.py`
     （43 条：编号 → 起止 / 等级）。此前配置 `rainstorm_ts_single_fuxi.py`、
     `rainstorm_ts_single_fgvp_ctrl.py` 与 `render_rainstorm_summary.py` **各抄了一份
     46 行的过程表**，改一头另两头不会跟着动；现在三处都 `import` 编目模块，
-    重构后逐一核对过 43 个过程 / 255 个 cfg / 输出路径逐项相同
+    重构后逐一核对过 43 个过程 / 当时的 255 个 cfg / 输出路径逐项相同
+    （2026-10-28 口径 B 改为单起报逐日后，cfg 总数为 212）
   - **`--process` 必给**：43 个过程全出会变成一本册子，所以要求显式点名；
     先跑 `render_rainstorm_summary.py`、读它的 `summary_long.csv` 照着挑
   - **跨模型汇总逐行配对，保证 Δ 两边同分母**：一边缺段时「各算各的均值」是两个

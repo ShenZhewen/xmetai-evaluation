@@ -6,25 +6,35 @@
 
     <根>/{编号}_24h/{起报日}/diagnostics/categorical_wide.csv   口径 A，一天一份
     <根>/{编号}_total/diagnostics/categorical_wide.csv          口径 B，一个过程一份
+                                                                （一行一个 lead，即一天一个 24h 窗）
 
-两种口径互不可比，只在同一口径内做跨模型比较。读 ``categorical_wide.csv``
+口径 A = 每 UTC 日换一根 00UTC 起报评 0–24h；口径 B = 只在 S 日 00UTC 起报一根，
+逐日各评一次 24h（lead 24/48/…/N×24），**不累加总量**。两者预报样本不同，
+只在同一口径内做跨模型比较。读 ``categorical_wide.csv``
 （带 hits / misses / false_alarms / n_pairs 列联计数），与 ``scores.csv`` 的 TS 同值。
 读不到的段记「缺」并计入末尾「口径与注意事项」，不静默跳过。
 
-**不出降水空间分布**：产物只有站点列联表的聚合统计，没有逐站/逐格降水场。
+评测产物里只有站点列联表的聚合统计，**画不出落区**；要让报告带降水空间分布动图，
+得先用 ``skills/xmetai-evaluation/scripts/extract_rainstorm_spatial.py`` 在服务器上
+从未经评测的 6h nc / ERA5 store 另算 24h 累计场，下载后用 ``--spatial 编号=目录``
+交给 :func:`build_rainstorm_report`——动图只在点名的那几个过程里插入，不参与任何 TS。
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Dict, List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
 
-from xmetai_evaluation import rainstorm_catalog
-from xmetai_evaluation.rainstorm_catalog import expected_days, get, window_days
+from xmetai_evaluation.configs import rainstorm_ts_single_base
+from xmetai_evaluation.configs.rainstorm_ts_single_base import (
+    expected_days,
+    get,
+    window_days,
+)
 from xmetai_evaluation.visualization._common import finite_or_none, fmt_number
 
 #: 宽表在产物目录里的相对位置（三个 TS 流程都写在这里）。
@@ -42,8 +52,9 @@ TIE_THRESHOLD = 0.005
 #: 列联宽表必须有的列。
 REQUIRED_COLUMNS = ("grade", "threshold_mm", "TS")
 
-#: 图在报告目录下的子目录。
-FIGURES_DIR = "figures"
+#: 图**不套子目录**，直接和 ``REPORT.md`` 并排放，除降水空间分布动图（GIF）外
+#: 统一出 SVG（矢量、可缩放）。文件名就是 ``<编号>_daily_ts.svg`` 这种，
+#: 正文里用相对路径引用。
 
 
 # ============================================================== 数据结构
@@ -55,7 +66,7 @@ class RainstormArchive:
 
     ``name`` **由调用方给**，不从目录名、也不从 ``manifest.run_id`` 猜——
     本仓库的规矩是身份不靠目录名，而这里连 manifest 都不读（一个产物根下有
-    255 份 manifest，认哪一份都不对）。
+    两百多份 manifest，认哪一份都不对）。
     """
 
     name: str
@@ -75,7 +86,7 @@ class ProcessScores:
     code: str
     #: 口径 A：起报日 → 宽表；缺的起报日不在字典里。
     days: Dict[str, pd.DataFrame] = field(default_factory=dict)
-    #: 口径 B：过程累积宽表；产物缺失时 None。
+    #: 口径 B：S 单起报的逐日宽表（一行一个 ``lead_h`` = 一个 24h 窗）；缺失时 None。
     total: Optional[pd.DataFrame] = None
 
     @property
@@ -218,6 +229,12 @@ def daily_values(scores: ProcessScores, threshold: float, column: str = "TS"):
 _COUNT_COLUMNS = ("hits", "misses", "false_alarms", "n_pairs")
 
 
+def _to_float(value) -> Optional[float]:
+    """单格转 float；空串 / NaN / 非数一律 None（不当 0）。"""
+    number = pd.to_numeric(pd.Series([value]), errors="coerce").iloc[0]
+    return None if pd.isna(number) else float(number)
+
+
 def daily_counts(
     scores: ProcessScores, threshold: float
 ) -> Optional[Dict[str, float]]:
@@ -270,15 +287,73 @@ def daily_pooled(
     return None if counts is None else _from_counts(counts, column)
 
 
+def total_leads(scores: ProcessScores) -> List[float]:
+    """口径 B 表里的时效（升序），一根起报下每个 ``lead_h`` 就是一个 24h 窗。"""
+    frame = scores.total
+    if frame is None or "lead_h" not in frame.columns:
+        return []
+    leads = pd.to_numeric(frame["lead_h"], errors="coerce").dropna().unique()
+    return sorted(float(lead) for lead in leads)
+
+
+def total_day_cell(
+    scores: ProcessScores, lead: float, threshold: float, column: str = "TS"
+) -> Optional[float]:
+    """口径 B 某一个 24h 窗（按 ``lead_h`` 定位）的某档值。"""
+    frame = scores.total
+    if frame is None or "lead_h" not in frame.columns or column not in frame.columns:
+        return None
+    part = frame[
+        np.isclose(pd.to_numeric(frame["lead_h"], errors="coerce"), float(lead))
+        & np.isclose(frame["threshold_mm"], float(threshold))
+    ]
+    if part.empty:
+        return None
+    value = pd.to_numeric(part[column], errors="coerce").iloc[0]
+    return None if pd.isna(value) else float(value)
+
+
+def total_counts(scores: ProcessScores, threshold: float) -> Optional[Dict[str, float]]:
+    """口径 B 汇总：把该过程**全部 24h 窗**的四格表计数逐格加总。
+
+    与 :func:`daily_counts` 同法——口径 B 的评分对象从「一根起报的整段累积」
+    改成了「一根起报逐日各评 24h」后，过程级数值同样要把各日的
+    hits / misses / false_alarms 加起来再按定义重算一次 TS，
+    不能对各日的 TS 取算术平均。
+    """
+    frame = scores.total
+    if frame is None:
+        return None
+    part = frame[np.isclose(frame["threshold_mm"], float(threshold))]
+    if part.empty:
+        return None
+    total = {key: 0.0 for key in _COUNT_COLUMNS}
+    seen = False
+    for _, row in part.iterrows():
+        hits = _to_float(row.get("hits"))
+        misses = _to_float(row.get("misses"))
+        false_alarms = _to_float(row.get("false_alarms"))
+        if hits is None or misses is None or false_alarms is None:
+            continue
+        seen = True
+        total["hits"] += hits
+        total["misses"] += misses
+        total["false_alarms"] += false_alarms
+        total["n_pairs"] += _to_float(row.get("n_pairs")) or 0.0
+    return total if seen else None
+
+
 def total_value(scores: ProcessScores, threshold: float, column: str = "TS") -> Optional[float]:
-    """口径 B：过程累积值。"""
-    return cell(scores.total, threshold, column)
+    """口径 B 汇总值：全部逐日窗的计数加总后按 ``column`` 重算一次。"""
+    counts = total_counts(scores, threshold)
+    return None if counts is None else _from_counts(counts, column)
 
 
 def n_pairs_of(scores: ProcessScores, threshold: float, *, total: bool = False):
-    """有效配对数：口径 B 取累积表，口径 A 取各起报日的最小 / 最大值。"""
+    """有效配对数：口径 B 取逐日窗之和，口径 A 取各起报日的最小 / 最大值。"""
     if total:
-        return cell(scores.total, threshold, "n_pairs")
+        counts = total_counts(scores, threshold)
+        return None if counts is None else counts["n_pairs"]
     values = [
         value
         for value in (cell(frame, threshold, "n_pairs") for frame in scores.days.values())
@@ -368,10 +443,14 @@ def _markdown_table(lines: List[str], header: Sequence[str], rows: Sequence[Sequ
 
 
 def _screening_header(names: Sequence[str]) -> List[str]:
+    """第二节两张挑选表：每个阈值段只列各模型的 TS，**不设 Δ 列**。
+
+    Δ 只留在第三节的逐日 / 等级表与第四节的跨过程汇总表；43 个过程 × 3 个
+    阈值段各挂一列 Δ 会把表撑得过宽，读数还得回头对两列原值。
+    """
     header = ["编号", "起止", "等级"]
     for threshold in SCREENING_THRESHOLDS:
         header += [f"{_grade_label(threshold)} {name}" for name in names]
-        header.append(f"Δ({names[0]}−{names[1]})")
     return header
 
 
@@ -382,25 +461,21 @@ def _screening_rows(
     *,
     total: bool,
 ) -> List[List[str]]:
-    """挑选依据宽表的表体：一行一个过程（口径 A 取起报日汇总，口径 B 取累积）。"""
+    """挑选依据宽表的表体：一行一个过程（两口径各自汇总各自的窗）。"""
     rows: List[List[str]] = []
     for code in codes:
         process = get(code)
         cells = [code, process.span, process.grade]
         for threshold in SCREENING_THRESHOLDS:
-            values: List[Optional[float]] = []
             for name in names:
                 scores = per_model[name].get(code)
                 if scores is None or not scores.present:
                     cells.append("缺")
-                    values.append(None)
                     continue
                 value = (
                     total_value(scores, threshold) if total else daily_pooled(scores, threshold)
                 )
                 cells.append(fmt_number(value))
-                values.append(value)
-            cells.append(_delta_cell(values))
         rows.append(cells)
     return rows
 
@@ -440,16 +515,14 @@ def _base_rate(
     """实况基准率 = (hits + misses) / n_pairs，即实况达阈值的站点占比。
 
     两个口径都**先在各自口径内把计数加总再算比例**——口径 A 汇总全部起报日、
-    口径 B 就是那一根累积窗——而不是跨天取比率的平均，理由同 :func:`daily_counts`。
+    口径 B 汇总同一根起报的全部逐日窗——而不是跨天取比率的平均，
+    理由同 :func:`daily_counts`。
     """
     if total:
-        frame = scores.total
-        hits = cell(frame, threshold, "hits")
-        misses = cell(frame, threshold, "misses")
-        pairs = cell(frame, threshold, "n_pairs")
-        if hits is None or misses is None or not pairs:
+        counts = total_counts(scores, threshold)
+        if counts is None or not counts["n_pairs"]:
             return None
-        return (hits + misses) / pairs
+        return (counts["hits"] + counts["misses"]) / counts["n_pairs"]
     counts = daily_counts(scores, threshold)
     if counts is None or not counts["n_pairs"]:
         return None
@@ -671,10 +744,10 @@ def _caliber_block(
         "**两种口径怎么算**",
         "",
         "**口径 A（逐日 24h）——把过程拆成逐日 24 小时的窗，每天单独评一次。**"
-        "过程期 `[S-1, E]` 逐日 00UTC 各起报一根，一根预报只评 lead 24h 那一个窗；"
-        "窗是 **08–08 北京时**（起报日 08 时 → 次日 08 时），相邻起报日的窗首尾相接、"
-        "**互不重叠**，过程有 N 个自然日就有 N+1 个起报日（`S-1` 到 `E` 各一个）、"
-        "N+1 个独立的 24h 窗。每个窗内逐站二值化"
+        "过程期 `[S, E]` 逐日 00UTC 各起报一根，一根预报只评 lead 24h 那一个窗；"
+        "窗是 **00–00 UTC**（= 08–08 北京时，起报日 08 时 → 次日 08 时），相邻起报日的"
+        "窗首尾相接、**互不重叠**，过程有 N 个 UTC 日就有 N 个起报日（`S` 到 `E` 各一个）、"
+        "N 个独立的 24h 窗，**每个窗都是 0–24h 的短期预报**。每个窗内逐站二值化"
         "（实况达阈值记「有事件」、否则「无事件」，预报同理），数出 "
         "hits / misses / false_alarms，出一张四格表、一个 TS。"
         "报告里一个过程的**口径 A 数值**是把该过程**所有起报日的四格表逐格加总**"
@@ -684,25 +757,27 @@ def _caliber_block(
         "汇总重算等价于把该过程的全部「站点·日」样本当成一个整体。"
         "底层 tp 是 6h 步，24h 窗由 `[6, 12, 18, 24]` 四个 6h 步累加而成。",
         "",
-        "**口径 B（过程累积）——整段加成一个总量，只评一次。**"
-        f"只在 `S-1` 日 00UTC 起报**一根**，窗长 = 过程全长 `(E-S+2)×24h`，"
-        "窗为 `[S-1 08:00, E+1 08:00]`；预报侧把窗内**所有 6h 步的 tp 累加**成总量，"
-        "实况侧在同一窗内同样累加；然后拿**总量**比阈值，逐站判一次，"
-        "出一张四格表、一个 TS。",
+        "**口径 B（单起报逐日 24h）——整段过程只用一根预报，逐日各评一次。**"
+        "只在 `S` 日 00UTC 起报**一根**，然后在这根预报上取 lead 24 / 48 / … / N×24h，"
+        "每个 lead 各是一个 24h 窗（`[S 00UTC, S+1 00UTC]`、`[S+1, S+2]`…）；"
+        "每窗内同样逐站二值化、数四格表、出一个 TS。"
+        "**不把多日雨量累加成一个总量再判一次**——那样「8 天每天 8mm 的连绵小雨」"
+        f"与「1 天 60mm 的一场暴雨」会被记成同一次 {_grade_label(50.0)}mm 事件，"
+        "与逐日业务口径不符。报告里一个过程的**口径 B 数值**同样把该过程全部逐日窗的"
+        "四格表逐格加总后按定义**重新算一次** TS（与口径 A 同法）。",
         "",
-        "**「一天大雨一天小雨」在两种口径下不是一回事。**"
-        f"口径 A 每天单独判——大雨那天算 {_grade_label(50.0)}mm 事件、"
-        "小雨那天只是「有降水」；口径 B 加起来判——50 + 5 = 55mm，"
-        f"按 {_grade_label(50.0)}mm 记**一次**事件。因此「8 天每天 8mm 的连绵小雨」"
-        "与「1 天 60mm 的一场暴雨」在口径 B 眼里**完全相同**。"
-        "口径 B 只回答「总量报得准不准」，回答不了「每天都报得准不准」。",
+        "**两种口径的差别只在「窗由哪根起报来报」。**"
+        "口径 A 每个窗都是一根全新的 0–24h 预报，逐日水平不受前一天的误差影响；"
+        "口径 B 从 `S` 日那一根一路报下去，第 k 天的窗是 lead `k×24h` 的中期预报，"
+        "因此**同一批 24h 窗、同一批站点，A 与 B 的差别就是「每天更新起报」"
+        "与「一根起报报到底」的差别**。B 的窗时效越往后、技巧一般越低，"
+        "这一层随 lead 的衰减在逐日表里可以直接看到。",
         "",
-        f"两种口径下**实况侧**的基准率（实况 {grade}mm 的站点占比）因此差得很远："
-        f"口径 A 逐过程汇总 **{_fmt_pct(rate_day)}**，"
-        f"口径 B 逐过程 **{_fmt_pct(rate_total)}**。"
-        "注意两者的统计单元不同（前者是「站点·日」的汇总比例，"
-        "后者是「站点」的比例再对过程取平均），但是量级差这么多已经足够说明问题："
-        "**基准率不在一个量级，TS 就不能跨口径比**——这是报告里两套数分节呈现的原因。",
+        f"两种口径下**实况侧**的基准率（实况 {grade}mm 的站点占比）统计单元相同"
+        f"（都是「站点·日」的汇总比例），数值也应当接近："
+        f"口径 A **{_fmt_pct(rate_day)}**，口径 B **{_fmt_pct(rate_total)}**。"
+        "所以 A/B 的 TS 之差反映的是**起报方式**，不是基准率差异。"
+        "但两套数仍分节呈现、不混算：A 与 B 用的是不同的预报样本。",
         "",
     ]
 
@@ -715,7 +790,7 @@ def _summary_paragraph(
     """结论摘要那一整段的规则化诊断。"""
     sentences: List[str] = []
 
-    for scope, total in (("口径 B（过程累积）的 ", True), ("口径 A（逐日 24h 汇总）的 ", False)):
+    for scope, total in (("口径 B（单起报逐日汇总）的 ", True), ("口径 A（逐日 24h 汇总）的 ", False)):
         pools = _paired_values(codes, per_model, names, total=total)
         values = {name: _mean_of(pools[name]) for name in names}
         paired = len(pools[names[0]])
@@ -740,7 +815,7 @@ def _summary_paragraph(
     hard = _aggregate(codes, per_model, names, total=True, threshold=50.0,
                       shared_only=True)
     sentences.append(
-        f"极强降水更难：≥50mm 档的过程累积 TS 为 "
+        f"极强降水更难：≥50mm 档的单起报逐日汇总 TS 为 "
         + "、".join(f"{name} {fmt_number(hard[name])}" for name in names)
         + f"，相对 {_grade_label(RANK_THRESHOLD)}mm 档整体回落"
     )
@@ -762,13 +837,13 @@ def _business_conclusion(
     values = _aggregate(codes, per_model, names, total=True)
     best = max((value for value in values.values() if value is not None), default=None)
     if best is None:
-        return "本批产物没有可用的过程累积评分，无法给出业务定性。"
+        return "本批产物没有可用的口径 B 评分，无法给出业务定性。"
     if best >= 0.5:
-        level = "对过程总量级降水（≥25mm）具备可用技巧，可作为过程是否发生的定性参考"
+        level = "同一根起报报下去、逐日 24h 的强降水（≥25mm）具备可用技巧，可作为过程期逐日落区的定性参考"
     elif best >= 0.3:
-        level = "对过程总量级降水（≥25mm）具备有限技巧，只宜作趋势性参考，不宜直接用于落区判定"
+        level = "同一根起报报下去、逐日 24h 的强降水（≥25mm）具备有限技巧，只宜作趋势性参考，不宜直接用于落区判定"
     else:
-        level = "对过程总量级降水（≥25mm）技巧偏低，本批数据只能用于量级与相对强弱比较"
+        level = "同一根起报报下去、逐日 24h 的强降水（≥25mm）技巧偏低，本批数据只能用于量级与相对强弱比较"
     return (
         f"就本批 {len(codes)} 个过程而言，{level}；单过程、单起报的结果受样本量与"
         f"过程本身可预报性影响很大，不作个例定论。"
@@ -780,10 +855,10 @@ def _process_overview(
     per_model: Dict[str, Dict[str, ProcessScores]],
     names: Sequence[str],
 ) -> str:
-    """过程概况一句话：起报日数、窗长、各模型样本量。"""
+    """过程概况一句话：起报日数、逐日窗数、各模型样本量。"""
     process = get(code)
     days = process_days(code, per_model, names)
-    window = window_days(code) * 24
+    n_days = window_days(code)
     pairs: List[str] = []
     for name in names:
         scores = per_model[name].get(code)
@@ -795,12 +870,14 @@ def _process_overview(
             f"口径 B {_fmt_count(n_pairs_of(scores, RANK_THRESHOLD, total=True))} 对"
         )
     if days:
-        coverage = f"口径 A 覆盖 {len(days)} 个起报日（{days[0]}–{days[-1]}，day-1 的 08–08 窗）"
+        coverage = (
+            f"口径 A 覆盖 {len(days)} 个起报日（{days[0]}–{days[-1]}，每日 00–00 UTC 窗）"
+        )
     else:
         coverage = "口径 A 一个起报日的产物都没有"
     return (
         f"{code}（{process.span}，{process.grade}）：{coverage}；"
-        f"口径 B 为 {process.start} 前一天起报、窗长 {window}h。"
+        f"口径 B 为 {process.start} 00UTC 单起报、逐日 {n_days} 个 24h 窗。"
         f"{_grade_label(RANK_THRESHOLD)}mm 档有效配对数：" + "；".join(pairs) + "。"
     )
 
@@ -843,6 +920,7 @@ def _highest_usable(scores: Optional[ProcessScores]) -> Optional[float]:
     """
     if scores is None or scores.total is None or "hits" not in scores.total.columns:
         return None
+    # 口径 B 是一根起报的 N 个逐日窗，任一窗有命中就算这个等级可达
     hit = scores.total[pd.to_numeric(scores.total["hits"], errors="coerce").fillna(0) > 0]
     if hit.empty:
         return None
@@ -854,7 +932,7 @@ def _total_reading(
     per_model: Dict[str, Dict[str, ProcessScores]],
     names: Sequence[str],
 ) -> str:
-    """口径 B 一节的小结：累积水平、误差形态、可用量级上限、领先者。"""
+    """口径 B 一节的小结：逐日汇总水平、随 lead 的起伏、误差形态、领先者。"""
     fragments: List[str] = []
     shapes: List[str] = []
     for name in names:
@@ -863,13 +941,28 @@ def _total_reading(
             fragments.append(f"{name} 无口径 B 产物")
             continue
         cap = _highest_usable(scores)
+        # 逐日窗的 TS 起伏：lead 越靠后通常越低，报告里直接给区间和两端
+        per_day = {
+            lead: total_day_cell(scores, lead, RANK_THRESHOLD)
+            for lead in total_leads(scores)
+        }
+        usable = {lead: value for lead, value in per_day.items() if value is not None}
+        if usable:
+            first, last = min(usable), max(usable)
+            span_text = (
+                f"逐日 TS 在 {usable[first]:.3f}（{first:g}h）–{usable[last]:.3f}（{last:g}h）之间、"
+                f"共 {len(usable)} 个窗"
+                if first != last else f"全部 {len(usable)} 个逐日窗都是 {usable[first]:.3f}"
+            )
+        else:
+            span_text = "各逐日窗都没有有效 TS"
         fragments.append(
-            f"{name} {_grade_label(RANK_THRESHOLD)}mm TS "
+            f"{name} {_grade_label(RANK_THRESHOLD)}mm 逐日汇总 TS "
             f"{fmt_number(total_value(scores, RANK_THRESHOLD))}"
             f"（POD {fmt_number(total_value(scores, RANK_THRESHOLD, 'POD'))}、"
             f"FAR {fmt_number(total_value(scores, RANK_THRESHOLD, 'FAR'))}、"
             f"BIAS {fmt_number(total_value(scores, RANK_THRESHOLD, 'BIAS'))}），"
-            f"有命中的最高等级 {_grade_label(cap) if cap is not None else '无'}"
+            f"{span_text}，有命中的最高等级 {_grade_label(cap) if cap is not None else '无'}"
         )
         pod = total_value(scores, RANK_THRESHOLD, "POD")
         far = total_value(scores, RANK_THRESHOLD, "FAR")
@@ -888,7 +981,7 @@ def _total_reading(
     winner, _, gap = _leader(values)
     return (
         "；".join(fragments) + "；" + "；".join(shapes) + "；"
-        + _leader_phrase(winner, gap, scope="过程累积口径下") + "。"
+        + _leader_phrase(winner, gap, scope="单起报逐日汇总下") + "。"
     )
 
 
@@ -906,7 +999,7 @@ def _process_reading(
             continue
         rows.append(
             f"{name} 口径 A 汇总 {fmt_number(daily_pooled(scores, RANK_THRESHOLD))}"
-            f" / 口径 B 累积 {fmt_number(total_value(scores, RANK_THRESHOLD))}"
+            f" / 口径 B 汇总 {fmt_number(total_value(scores, RANK_THRESHOLD))}"
         )
     day_values = {
         name: daily_pooled(per_model[name][code], RANK_THRESHOLD)
@@ -924,8 +1017,8 @@ def _process_reading(
         verdict = "两个口径至少有一个分不出胜负，本过程的名次是否翻转判不了"
     elif day_winner != total_winner:
         verdict = (
-            f"**两个口径名次相反**：逐日 24h 看 {day_winner} 好，过程累积看 "
-            f"{total_winner} 好——该过程「总量报得准」与「每天都报得准」不是一回事，"
+            f"**两个口径名次相反**：逐日换新起报看 {day_winner} 好，S 单起报报到底看 "
+            f"{total_winner} 好——该过程「每天更新起报」与「一根起报报全程」不是一回事，"
             f"引用本过程时必须带上口径"
         )
     else:
@@ -951,7 +1044,7 @@ def _header_lines(
         f"**主模型：{names[0]}**；对比模型：" + "、".join(names[1:]),
         "",
         f"**过程编目**：《2025年暴雨过程纪要表（修订）-1.docx》，编号 202501–202543，"
-        f"共 {len(rainstorm_catalog.CATALOG)} 个过程，"
+        f"共 {len(rainstorm_ts_single_base.CATALOG)} 个过程，"
         f"本报告详析其中 {len(processes)} 个（{'、'.join(processes)}）。",
         "",
         "**归档文件**",
@@ -960,10 +1053,10 @@ def _header_lines(
     lines += [f"- {item.name}：`{item.root}`" for item in archives]
     lines.append("")
     lines += [
-        "> 两种口径**互不可比**，只在本口径内跨模型、跨过程比：口径 A（逐日 24h）"
-        "把过程期拆成逐日起报的 day-1 窗，一天一个结果，基准率随每日实况浮动；"
-        "口径 B（过程累积）用过程起点前一天的一根预报把整段降水累加后评总量，"
-        "基准率显著更高，同一个过程的 TS 因此明显高于口径 A。",
+        "> 两种口径评的是同一批 24h 窗，但**预报样本不同**，只在本口径内跨模型、跨过程比："
+        "口径 A（逐日 24h）每天换一根全新起报，每窗都是 0–24h 的短期技巧；"
+        "口径 B（单起报逐日）只在过程起点 `S` 00UTC 起报一根，第 k 天的窗是 lead "
+        "`k×24h` 的中期预报，越往后越难。两个口径的数值**不混算、不相减**。",
         "",
     ]
     return lines
@@ -979,10 +1072,11 @@ def _conclusion_section(
     lines = ["## 一、结论摘要", ""]
     lines += [
         "本报告评估 " + "、".join(names) + f" 共 {len(names)} 个模型在 2025 年 "
-        f"{len(codes)} 个暴雨过程上的站点降水分类检验表现。评分对象是**站点 24h 与"
-        f"过程累积降水量**的分类命中情况（zd_sta_10285 站表的全部站；评测不分纬度带，"
-        f"只出全球行），指标是 TS 及其配套的 POD / FAR / 频率偏差；**不重算任何指标**，"
-        f"每个数字都直接来自产物里的 `diagnostics/categorical_wide.csv`。"
+        f"{len(codes)} 个暴雨过程上的站点降水分类检验表现。评分对象是**逐日 24h"
+        f"降水量**的分类命中情况（两种口径评的是同一批窗，只是起报方式不同；"
+        f"zd_sta_10285 站表的全部站，评测不分纬度带，只出全球行），指标是 TS 及其配套的 "
+        f"POD / FAR / 频率偏差；逐日数值**不重算**，"
+        f"直接来自产物里的 `diagnostics/categorical_wide.csv`。"
         f"本报告详析 {'、'.join(processes)} 共 {len(processes)} 个过程，"
         f"其余过程的挑选依据见第二节。",
         "",
@@ -1011,9 +1105,10 @@ def _screening_section(
         f"(Σhits + Σmisses + Σfalse_alarms) **重新算一次**，"
         f"**不是**把各起报日的 TS 加起来除以天数：TS 是比率，那样平均会让只报出"
         f"十几个站、TS 恰好为 0 的起报日与事件上千的起报日**等权**，"
-        f"把均值拖偏（见第六节第 2 条）；口径 B 的列是过程累积 TS。"
+        f"把均值拖偏（见第六节第 2 条）；口径 B 的列是**同一根 `S` 起报的逐日窗**"
+        f"按同样办法加总后重算的 TS。"
         f"「缺」= 该段产物缺失；「—」= 有产物但该档无有效 TS（无事件或无有效配对）。"
-        f"Δ 一律是「{names[0]} − {names[1]}」，**正值表示主模型领先**。",
+        f"这两张表只列各模型的 TS、**不带 Δ 列**——差多少直接看相邻两列。",
         "",
     ]
     grades = "、".join(_grade_label(item) for item in SCREENING_THRESHOLDS)
@@ -1024,7 +1119,7 @@ def _screening_section(
                     _screening_rows(codes, per_model, names, total=False))
 
     _table_caption(lines, numbering,
-                   f"各过程口径 B（过程累积）TS —— {len(codes)} 个过程 × {grades}mm")
+                   f"各过程口径 B（单起报逐日汇总）TS —— {len(codes)} 个过程 × {grades}mm")
     _markdown_table(lines, _screening_header(names),
                     _screening_rows(codes, per_model, names, total=True))
 
@@ -1033,8 +1128,9 @@ def _screening_section(
             f"按 {names[0]} 降序排列，柱高越高越好；与下图**不可比**，仅看本图内的"
             f"模型间高低）")
     _figure(lines, numbering, overview_path,
-            f"各过程的过程累积 TS（{_grade_label(RANK_THRESHOLD)}mm；"
-            f"按 {names[0]} 降序排列，柱高越高越好）")
+            f"各过程的单起报逐日汇总 TS（{_grade_label(RANK_THRESHOLD)}mm；"
+            f"按 {names[0]} 降序排列，柱高越高越好；与上图用的是不同的预报样本，"
+            f"只在本图内比高低）")
 
     total_counts = _win_counts(codes, per_model, names, total=True)
     day_counts = _win_counts(codes, per_model, names, total=False)
@@ -1043,8 +1139,8 @@ def _screening_section(
         + _counts_phrase(total_counts, names)
         + "；口径 A 的起报日汇总口径是 "
         + _counts_phrase(day_counts, names)
-        + "。两种口径的胜负过程并不完全重合，挑选详析对象时以口径 B 为主，"
-        "再点名几个两口径名次相反的过程。",
+        + "。两种口径的胜负过程并不完全重合——重合度本身就是「每日更新起报能带来多少"
+        "额外收益」的读数，挑选详析对象时以口径 B 为主，再点名几个名次相反的过程。",
         "",
     ]
     return lines
@@ -1058,11 +1154,44 @@ def _process_section(
     daily_path: Path,
     threshold_path: Path,
     index: int,
+    spatial_path: Optional[Path] = None,
+    spatial_model: str = "Tongyun",
+    spatial_total_path: Optional[Path] = None,
+    spatial_total_hours: int = 0,
+    spatial_total_init: str = "",
+    spatial_total_model: str = "Tongyun",
 ) -> List[str]:
     process = get(code)
     lines = [f"### 3.{index} {code}（{process.span}，{process.grade}）", ""]
     lines += [f"#### 3.{index}.1 过程概况", "",
               _process_overview(code, per_model, names), ""]
+    if spatial_path is not None:
+        _figure(
+            lines,
+            numbering,
+            spatial_path,
+            f"{code}（{process.span}）24h 累计降水空间分布动图（左 {spatial_model} "
+            f"预报、右 ERA5 实况；一帧一个 08–08 北京时 24h 窗、按起报日顺序播放，"
+            f"逐帧对照同一时窗的落区；分级色标 0–10–25–50–100–250 mm（中央气象台雨量配色，250 mm 以上暗红，<0.1 mm 留白）；"
+            f"主图右下角南海诸岛小图按标准地图口径含九段线）",
+        )
+    if spatial_total_path is not None:
+        init_text = f"{spatial_total_init[:4]}-{spatial_total_init[4:6]}-{spatial_total_init[6:]}" \
+            if spatial_total_init else "S"
+        _figure(
+            lines,
+            numbering,
+            spatial_total_path,
+            f"{code}（{process.span}）**过程累积雨量示意**（只用 {init_text} 00UTC "
+            f"一根起报、把整段 {spatial_total_hours}h 逐 6h 的降水累加成一张总量场；"
+            f"**这张图只用来看整段落区，不作评分**——口径 B 已经改成逐日各评 24h，"
+            f"不再评累积总量；"
+            f"左 {spatial_total_model} 预报、右 ERA5 实况；分级色标 0–40–100–200–400–1000 mm"
+            f"（同一套配色、边界放大 4 倍，1000 mm 以上暗红，<0.1 mm 留白），与上面 "
+            f"24h 动图的 0–250 mm **不是同一把尺子**，"
+            f"只看落区与总量量级、不要逐色比深浅；"
+            f"主图右下角南海诸岛小图按标准地图口径含九段线）",
+        )
 
     # ── 3.x.2 口径 A ─────────────────────────────────────────────
     days = process_days(code, per_model, names)
@@ -1098,8 +1227,10 @@ def _process_section(
                        + "、".join(_grade_label(item) for item in SCREENING_THRESHOLDS) + "mm")
         _markdown_table(lines, header, body)
         _figure(lines, numbering, daily_path,
-                f"{code}（{process.span}）逐日 24h TS（08–08 北京时，day-1；"
-                f"纵轴 0–1，没有有效 TS 的起报日不画点）")
+                f"{code}（{process.span}）逐日 24h TS（起报日当天 00–24h，08–08 北京时；"
+                f"(a)(b)(c) 依次为 ≥10、≥25、≥50mm；三个子图纵轴各自独立，"
+                f"取该等级内的最小/最大值上下各留一点，刻度数字见各格；"
+                f"没有有效 TS 的起报日不画点）")
     else:
         lines += [f"{code} 没有任何起报日的口径 A 产物。", ""]
     lines += [f"**小结**：{_daily_reading(code, per_model, names, days)}", ""]
@@ -1111,14 +1242,51 @@ def _process_section(
         for threshold in (thresholds_of(per_model[name][code])
                           if per_model[name].get(code) is not None else [])
     })
-    lines += [f"#### 3.{index}.3 口径 B：过程累积 TS", ""]
+    lines += [f"#### 3.{index}.3 口径 B：单起报逐日 24h TS", ""]
     lines += [
-        f"整段过程只用**一根预报**（{process.start} 前一天 00UTC 起报）累加到底，"
-        f"窗长 {window_days(code) * 24}h；因此这一节与上一节**不可比**，"
-        f"基准率比逐日窗高得多。",
+        f"整段过程只用**{process.start} 00UTC 这一根起报**，逐日各评一次 24h："
+        f"第 1 天是 lead 24h、第 2 天 lead 48h……共 {window_days(code)} 个窗。"
+        f"窗与上一节**逐日对应**（同一天、同一批站、同一 24h 实况窗），"
+        f"差别只在预报来自「当天新起报」还是「S 日那根报到底」——"
+        f"因此两节的同日数值可以直接对着看，越靠后的日子差距通常越大。",
         "",
     ]
-    if thresholds:
+    leads = sorted({
+        lead for name in names
+        for lead in (total_leads(per_model[name][code])
+                     if per_model[name].get(code) is not None else [])
+    })
+    if leads:
+        # 逐日表：一行一个 24h 窗，跑法同口径 A 的逐日表
+        header = ["时效（UTC 日）"]
+        for threshold in SCREENING_THRESHOLDS:
+            header += [f"{_grade_label(threshold)} {name}" for name in names]
+            header.append(f"Δ({names[0]}−{names[1]})")
+        start = process.start
+        body = []
+        for lead in leads:
+            day = (
+                pd.Timestamp(start) + pd.Timedelta(hours=float(lead) - 24.0)
+            ).strftime("%Y%m%d")
+            cells = [f"{lead:g}h（{day}）"]
+            for threshold in SCREENING_THRESHOLDS:
+                values: List[Optional[float]] = []
+                for name in names:
+                    scores = per_model[name].get(code)
+                    if scores is None or scores.total is None:
+                        cells.append("缺")
+                        values.append(None)
+                        continue
+                    value = total_day_cell(scores, lead, threshold)
+                    cells.append(fmt_number(value))
+                    values.append(value)
+                cells.append(_delta_cell(values))
+            body.append(cells)
+        _table_caption(lines, numbering,
+                       f"{code} 单起报逐日 24h TS —— 时效 × "
+                       + "、".join(_grade_label(item) for item in SCREENING_THRESHOLDS) + "mm")
+        _markdown_table(lines, header, body)
+
         header = ["等级"] + [f"{name} TS" for name in names] + [f"Δ({names[0]}−{names[1]})"]
         body = []
         for threshold in thresholds:
@@ -1135,11 +1303,14 @@ def _process_section(
                 values.append(value)
             cells.append(_delta_cell(values))
             body.append(cells)
-        _table_caption(lines, numbering, f"{code} 过程累积 TS —— 降水等级 × 模型")
+        _table_caption(lines, numbering,
+                       f"{code} 单起报逐日汇总 TS —— 降水等级 × 模型"
+                       f"（上面 {len(leads)} 个窗的四格表加总后重算）")
         _markdown_table(lines, header, body)
         _figure(lines, numbering, threshold_path,
-                f"{code}（{process.span}）过程累积 TS 随降水等级的变化"
-                f"（等级越高样本越少，高等级档的起伏不作结论）")
+                f"{code}（{process.span}）单起报逐日汇总 TS 随降水等级的变化"
+                f"（{len(leads)} 个 24h 窗汇总；等级越高样本越少，"
+                f"高等级档的起伏不作结论）")
     else:
         lines += [f"{code} 没有口径 B 产物。", ""]
     lines += [f"**小结**：{_total_reading(code, per_model, names)}", ""]
@@ -1170,7 +1341,7 @@ def _cross_section(
     lines += [
         scope_note
         + f"口径 A 是各过程**汇总值**的再平均（过程等权，不是按起报日数加权）；"
-        f"口径 B 是各过程累积 TS 的均值。两个口径**各自汇总、不混算**。",
+        f"口径 B 是各过程**单起报逐日窗汇总值**的均值。两个口径**各自汇总、不混算**。",
         "",
     ]
     header = ["指标"] + list(names) + [f"Δ({names[0]}−{names[1]})"]
@@ -1189,9 +1360,9 @@ def _cross_section(
     _row("口径 A 汇总 TS（≥10mm）", "TS", 10.0, False)
     _row("口径 A 汇总 TS（≥25mm）", "TS", RANK_THRESHOLD, False)
     _row("口径 A 汇总 TS（≥50mm）", "TS", 50.0, False)
-    _row("口径 B 累积 TS（≥10mm）", "TS", 10.0, True)
-    _row("口径 B 累积 TS（≥25mm）", "TS", RANK_THRESHOLD, True)
-    _row("口径 B 累积 TS（≥50mm）", "TS", 50.0, True)
+    _row("口径 B 逐日汇总 TS（≥10mm）", "TS", 10.0, True)
+    _row("口径 B 逐日汇总 TS（≥25mm）", "TS", RANK_THRESHOLD, True)
+    _row("口径 B 逐日汇总 TS（≥50mm）", "TS", 50.0, True)
     _row("口径 B 命中率 POD（≥25mm）", "POD", RANK_THRESHOLD, True)
     _row("口径 B 空报率 FAR（≥25mm）", "FAR", RANK_THRESHOLD, True)
     _row("口径 B 频率偏差 BIAS（≥25mm）", "BIAS", RANK_THRESHOLD, True)
@@ -1219,8 +1390,9 @@ def _cross_section(
     }
     _figure(lines, numbering, scatter_path,
             f"两种口径的逐过程对照（{_grade_label(RANK_THRESHOLD)}mm；同上 "
-            f"{len(pool)} 个过程，每点一个过程，虚线为 y = x，"
-            f"点上方的过程累积口径更有利）")
+            f"{len(pool)} 个过程，每点一个过程，横轴每日换新起报（口径 A）、"
+            f"纵轴 S 单起报逐日（口径 B），虚线为 y = x，"
+            f"点上方的过程单起报更有利）")
 
     day_counts = _win_counts(codes, per_model, names, total=False)
     total_counts = _win_counts(codes, per_model, names, total=True)
@@ -1269,34 +1441,34 @@ def _advice_section(
 
     if main_total > rival_total and main_day <= rival_day:
         items.append(
-            f"主模型在过程累积口径上 {main_total} 胜 {rival_total} 负，但在逐日口径上"
-            f"只有 {main_day} 胜 {rival_day} 负——**优势集中在「总量报得准」，"
-            f"不集中在「每天都报得准」**。若业务关心逐日强降水落区，改进重点应放在"
-            f"逐日窗的时序误差上，而不是继续优化总量。"
+            f"主模型在单起报逐日口径上 {main_total} 胜 {rival_total} 负，但在每日换新"
+            f"起报的口径 A 上只有 {main_day} 胜 {rival_day} 负——**优势集中在「同一根"
+            f"起报报到底」的中期时效，不集中在 0–24h 的短期窗**。若业务关心临近预报，"
+            f"改进重点应放在短期窗的误差上。"
         )
     elif main_total > rival_total and main_day > rival_day:
         items.append(
-            f"主模型在两个口径上都领先（过程累积 {main_total} 胜 {rival_total} 负，"
-            f"逐日 {main_day} 胜 {rival_day} 负），优势不是靠单个口径撑起来的。"
+            f"主模型在两个口径上都领先（单起报逐日 {main_total} 胜 {rival_total} 负，"
+            f"每日换新起报 {main_day} 胜 {rival_day} 负），优势不是靠单个口径撑起来的。"
             f"但两个口径的名次**逐过程并不重合**，引用具体过程时必须带口径。"
         )
     elif main_total < rival_total and main_day >= rival_day:
         items.append(
-            f"主模型的过程累积口径以 {main_total} 胜 {rival_total} 负落后，"
-            f"逐日口径却是 {main_day} 胜 {rival_day} 负不落后——"
-            f"**落后集中在「总量报得准」，不是「每天都报得准」**，"
-            f"改进重点应放在过程总量的量级偏差上。"
+            f"主模型的单起报逐日口径以 {main_total} 胜 {rival_total} 负落后，"
+            f"每日换新起报的 A 口径却是 {main_day} 胜 {rival_day} 负不落后——"
+            f"**落后集中在过程期中后段（lead 越长的窗）**，"
+            f"改进重点应放在中长时效的预报误差上。"
         )
     elif main_total < rival_total:
         items.append(
-            f"主模型在两个口径上都落后（过程累积 {main_total} 胜 {rival_total} 负，"
-            f"逐日 {main_day} 胜 {rival_day} 负）；先排查是**过程总量**还是"
-            f"**逐日分布**的问题，再定改动方向。"
+            f"主模型在两个口径上都落后（单起报逐日 {main_total} 胜 {rival_total} 负，"
+            f"每日换新起报 {main_day} 胜 {rival_day} 负）；先排查是**短期窗**还是"
+            f"**中长时效窗**的问题，再定改动方向。"
         )
     else:
         items.append(
-            f"两个模型的过程累积口径胜负持平（{main_total}:{rival_total}），"
-            f"逐日口径是 {main_day}:{rival_day}；在这批目标上做取舍的收益有限，"
+            f"两个模型的单起报逐日口径胜负持平（{main_total}:{rival_total}），"
+            f"口径 A 是 {main_day}:{rival_day}；在这批目标上做取舍的收益有限，"
             f"建议换更有区分度的检验对象（更极端的量级档、或另外几年）再看。"
         )
 
@@ -1324,7 +1496,7 @@ def _advice_section(
     usable_hard = [value for value in hard_level.values() if value is not None]
     if usable_hard and max(usable_hard) < 0.3:
         items.append(
-            f"≥50mm 档的过程累积 TS 最高只有 {fmt_number(max(usable_hard))}，极端量级整体偏弱；"
+            f"≥50mm 档的单起报逐日汇总 TS 最高只有 {fmt_number(max(usable_hard))}，极端量级整体偏弱；"
             f"该档的有效配对数在各过程上远小于低等级档，**先把样本补齐再谈改进**，"
             f"不要在这个量级上调参。"
         )
@@ -1352,18 +1524,37 @@ def _advice_section(
     return lines
 
 
-def _caveats_section(archives: Sequence[RainstormArchive]) -> List[str]:
+def _caveats_section(
+    archives: Sequence[RainstormArchive], spatial_codes: Sequence[str] = ()
+) -> List[str]:
+    if spatial_codes:
+        item8 = (
+            "8. **降水空间分布动图只覆盖点名的那几个过程**（"
+            + "、".join(spatial_codes)
+            + "），而且**不是评测产物的一部分**：它直接读预报的 6h nc 与 ERA5 store "
+            "另算 24h 累计（口径 A）或整段累积（示意图，不参与评分），只用来认落区，"
+            "不参与任何 TS / POD / FAR 的计算；没点名的"
+            "过程没有这张图，也不影响任何数值。"
+        )
+    else:
+        item8 = (
+            "8. **本报告不含降水空间分布**。评测产物里只有站点列联表的聚合统计"
+            "（hits / misses / false_alarms / n_pairs / TS…），没有逐站或逐格的降水量，"
+            "画不出实况场、也画不出预报−实况差值场。要看落区得回头读原始预报 nc 与"
+            "站点报文（配置里的预报根目录 / 站点根目录），那是另一个脚本。"
+        )
     lines = ["## 六、口径与注意事项", ""]
     lines += [
-        "1. **两种口径互不可比**。口径 A 的窗只有 24h，实况达到阈值的站点占比低、"
-        "基准率也低；口径 B 把整段累加成一个总量，基准率高得多。同一个过程的 TS "
-        "在两者之间可以差好几倍；跨口径比大小没有意义，只在本口径内比。",
-        "2. **口径 A 的过程值是把起报日的四格表汇总后重算**，不是逐日 TS 的算术"
+        "1. **两种口径的预报样本不同，不能相减**。口径 A 每天换一根新起报，"
+        "每个窗都是 0–24h 的短期技巧；口径 B 只用 S 日一根起报逐日往下报，"
+        "第 k 天是 lead k×24h。两者评的是同一批 24h 窗与站点，基准率接近，"
+        "但数值差反映的是「每天更新起报」与「一根报到底」的差别，"
+        "只在本口径内比大小。",
+        "2. **两个口径的过程值都是把四格表汇总后重算**，不是逐日 TS 的算术"
         "平均。TS 是比率，简单平均会给「只报出十几个站、TS 恰好为 0」的起报日"
         "与事件上千的起报日**同样的权重**，把均值拖偏；汇总重算等价于把该过程"
         "全部「站点·日」样本当成一个整体，小样本日自然只占很小的权重。"
-        "注意口径 A 汇总的仍是**逐日 24h 窗**的样本，与口径 B 那根累积窗不是"
-        "同一个量，两者照样不可比。",
+        "口径 A 汇总的是各**起报日**的窗，口径 B 汇总的是同一根起报的**各 lead** 的窗。",
         "3. **跨模型汇总只比同一批过程**。某个模型缺段时，各算各的均值就是不同的"
         "分母，相减得到的 Δ 里混着覆盖率差、不是模型差异；第四节的汇总表因此**逐行"
         "只取各模型都有有效值的过程**，各模型的过程数一定相等（表题给出这个数，会小于 43）。"
@@ -1376,16 +1567,14 @@ def _caveats_section(archives: Sequence[RainstormArchive]) -> List[str]:
         "两者都不补 0。",
         "6. **高等级档的样本量急剧收缩**。≥100mm 尤其是 ≥250mm 档在很多过程上根本"
         "没有事件，TS 为空是「无事件」而不是「技巧为 0」；这些档的差异不作结论。",
-        "7. **指标不重估，只汇总**。逐日值、口径 B 的值都直接来自产物里的 "
-        "`diagnostics/categorical_wide.csv`，一个字没动；口径 A 的过程级数值是把"
-        "同一份产物里的 hits / misses / false_alarms 按起报日**加总后按定义再算"
+        "7. **指标不重估，只汇总**。逐日值直接来自产物里的 "
+        "`diagnostics/categorical_wide.csv`，一个字没动；两个口径的过程级数值都是把"
+        "同一份产物里的 hits / misses / false_alarms **加总后按定义再算"
         "一次**（第 2 条），没有用默认值或估算值补全任何缺格。",
-        "8. **本报告不含降水空间分布**。评测产物里只有站点列联表的聚合统计"
-        "（hits / misses / false_alarms / n_pairs / TS…），没有逐站或逐格的降水量，"
-        "画不出实况场、也画不出预报−实况差值场。要看落区得回头读原始预报 nc 与"
-        "站点报文（配置里的预报根目录 / 站点根目录），那是另一个脚本。",
-        "9. **过程边界用 08–08 日界**，与纪要表的 0–0 日历口径头尾各差 8 小时；"
-        "口径 B 的窗因此是 (结束日 − 开始日 + 2) 天，比纪要表的自然日数多一天。",
+        item8,
+        "9. **过程日期按 UTC 整日理解**：过程 S–E 覆盖 `[S 00UTC, (E+1) 00UTC]`，"
+        "共 N = E−S+1 个 00–00 UTC 窗（= 08–08 北京时），与纪要表原文的北京时日期相比"
+        "**整体后移 8 小时**；两个口径用的是同一批 N 个窗，只是起报方式不同。",
         "10. **202519 与 202520 起止完全相同**（纪要表把同一时段的两个侧面分列两条），"
         "各评各的、不合并——本报告里它们各占一行，数字相同属正常。",
         "",
@@ -1408,10 +1597,10 @@ def _validate_processes(processes: Sequence[str]) -> List[str]:
     for code in (str(item).strip() for item in processes):
         if code in seen:
             continue
-        if code not in rainstorm_catalog.BY_CODE:
+        if code not in rainstorm_ts_single_base.BY_CODE:
             raise ValueError(
                 f"过程编号 {code!r} 不在编目里；有效范围 "
-                f"{rainstorm_catalog.codes()[0]}–{rainstorm_catalog.codes()[-1]}"
+                f"{rainstorm_ts_single_base.codes()[0]}–{rainstorm_ts_single_base.codes()[-1]}"
             )
         seen.add(code)
         ordered.append(code)
@@ -1426,6 +1615,8 @@ def build_rainstorm_report(
     title: str = "2025 年暴雨过程个例检验报告",
     archive: Optional[str] = None,
     change: Optional[str] = None,
+    spatial: Optional[Mapping[str, Path]] = None,
+    spatial_total: Optional[Mapping[str, Path]] = None,
 ) -> Dict[str, Path]:
     """写图 + ``REPORT.md``，返回 ``{相对路径: 绝对路径}`` 的产物清单。
 
@@ -1436,6 +1627,13 @@ def build_rainstorm_report(
         title: 报告 H1 标题。
         archive: 归档名；给了就在标题下加一行**归档**。
         change: 本次改动说明；不给就在「改进建议」里说明差异只能报、不能归因。
+        spatial: ``{过程编号: 空间场目录}``（``extract_rainstorm_spatial.py`` 的产物，
+            含 ``manifest.json``）。给了就在该过程 §3.x.1 后插一张落区 SVG；
+            没给的过程不出图。**只在 ``processes`` 里选编号。**
+        spatial_total: ``{过程编号: 过程累积目录}``（目录里只有一个 ``S`` 起报日）。
+            给了就在口径 A 动图后面再加一张**全过程累积示意图**单帧 GIF，
+            窗长按 ``rainstorm_ts_single_base.window_days(code)`` 推；这张图**不参与评分**，
+            只用来认整段落区。同样只认 ``processes`` 里的编号。
 
     Raises:
         ValueError: 模型不足两个 / 名字重复 / 过程编号非法。
@@ -1457,10 +1655,9 @@ def build_rainstorm_report(
         raise ValueError(f"模型名重复：{names}；同名会让表格列对不上号")
 
     selected = _validate_processes(processes)
-    codes = rainstorm_catalog.codes()
+    codes = rainstorm_ts_single_base.codes()
     out_dir = Path(out_dir)
-    figure_dir = out_dir / FIGURES_DIR
-    figure_dir.mkdir(parents=True, exist_ok=True)
+    out_dir.mkdir(parents=True, exist_ok=True)
 
     per_model = load_all(archives, codes)
     plotter = RainstormPlotter()
@@ -1472,7 +1669,7 @@ def build_rainstorm_report(
         return relative
 
     # ── 图 1、图 2：全过程的两种口径分组条形（口径 A 在前）───────────
-    overview_daily_rel = _register(Path(FIGURES_DIR) / "process_overview_daily.png")
+    overview_daily_rel = _register(Path("process_overview_daily.svg"))
     plotter.plot_process_overview(
         codes,
         {
@@ -1486,9 +1683,9 @@ def build_rainstorm_report(
         threshold=RANK_THRESHOLD,
         save_path=out_dir / overview_daily_rel,
         order=names[0],
-        metric_label="逐日 24h 汇总",
+        metric_label="Daily 24-h pooled",
     )
-    overview_rel = _register(Path(FIGURES_DIR) / "process_overview.png")
+    overview_rel = _register(Path("process_overview.svg"))
     plotter.plot_process_overview(
         codes,
         {
@@ -1507,8 +1704,8 @@ def build_rainstorm_report(
     # ── 第 3 节：每个详析过程两张图 ────────────────────────────────
     per_process_rels: Dict[str, Tuple[Path, Path]] = {}
     for code in selected:
-        daily_rel = _register(Path(FIGURES_DIR) / f"{code}_daily_ts.png")
-        threshold_rel = _register(Path(FIGURES_DIR) / f"{code}_threshold_ts.png")
+        daily_rel = _register(Path(f"{code}_daily_ts.svg"))
+        threshold_rel = _register(Path(f"{code}_threshold_ts.svg"))
         per_process_rels[code] = (daily_rel, threshold_rel)
 
         days = process_days(code, per_model, names)
@@ -1545,8 +1742,93 @@ def build_rainstorm_report(
             code=code, span=get(code).span, save_path=out_dir / threshold_rel,
         )
 
+    # ── 可选：点名过程的降水空间分布（读 extract_rainstorm_spatial.py 的目录）──
+    spatial_rels: Dict[str, Path] = {}
+    spatial_models: Dict[str, str] = {}
+    if spatial:
+        unknown = [code for code in spatial if code not in selected]
+        if unknown:
+            raise ValueError(
+                f"--spatial 给了不在 --process 里的过程：{unknown}；"
+                "空间图只能挂在详析过程上"
+            )
+        try:
+            from xmetai_evaluation.visualization.rainstorm_spatial_anim import (
+                plot_rainstorm_anim,
+            )
+        except ImportError as error:  # pragma: no cover - 取决于运行环境
+            raise ImportError(
+                "画降水空间分布动图需要 cartopy 与 Pillow（pip install cartopy pillow）；"
+                "不想装就去掉 --spatial"
+            ) from error
+        import json
+
+        for code in selected:
+            directory = spatial.get(code)
+            if directory is None:
+                continue
+            manifest_path = Path(directory) / "manifest.json"
+            if not manifest_path.exists():
+                raise ValueError(
+                    f"{directory} 里没有 manifest.json；"
+                    "给的应是 extract_rainstorm_spatial.py 的 --out 目录"
+                )
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            spatial_models[code] = str(manifest.get("model") or "Tongyun")
+            rel = _register(Path(f"{code}_spatial.gif"))
+            # 900 dpi：11 in 宽 → 9900 px。GIF 只有 256 色，清晰度全靠分辨率，
+            # 帧里还要放两张图和色条，低于这个档放大就看不清降水带边缘。
+            plot_rainstorm_anim(Path(directory), out_dir / rel, dpi=900)
+            spatial_rels[code] = rel
+
+    # ── 可选：口径 B 的过程累积场（一张单帧 GIF，跟在 A 的动图后面）──
+    spatial_total_rels: Dict[str, Path] = {}
+    spatial_total_init: Dict[str, str] = {}
+    spatial_total_models: Dict[str, str] = {}
+    if spatial_total:
+        unknown = [code for code in spatial_total if code not in selected]
+        if unknown:
+            raise ValueError(
+                f"--spatial-total 给了不在 --process 里的过程：{unknown}；"
+                "空间图只能挂在详析过程上"
+            )
+        try:
+            from xmetai_evaluation.visualization.rainstorm_spatial_anim import (
+                plot_rainstorm_total,
+            )
+        except ImportError as error:  # pragma: no cover - 取决于运行环境
+            raise ImportError(
+                "画降水空间分布动图需要 cartopy 与 Pillow（pip install cartopy pillow）；"
+                "不想装就去掉 --spatial-total"
+            ) from error
+        import json
+
+        for code in selected:
+            directory = spatial_total.get(code)
+            if directory is None:
+                continue
+            manifest_path = Path(directory) / "manifest.json"
+            if not manifest_path.exists():
+                raise ValueError(
+                    f"{directory} 里没有 manifest.json；"
+                    "给的应是 extract_rainstorm_spatial.py 的 --out 目录"
+                )
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            days = list(manifest.get("days") or {})
+            if len(days) != 1:
+                raise ValueError(
+                    f"{directory} 里有 {len(days)} 个起报日；累积示意图只要 S 那一根，"
+                    "多起报日的目录是口径 A 的逐日场"
+                )
+            spatial_total_init[code] = days[0]
+            spatial_total_models[code] = str(manifest.get("model") or "Tongyun")
+            window_h = window_days(code) * 24
+            rel = _register(Path(f"{code}_spatial_total.gif"))
+            plot_rainstorm_total(Path(directory), out_dir / rel, window_h=window_h, dpi=900)
+            spatial_total_rels[code] = rel
+
     # ── 图：两口径逐过程散点 ──────────────────────────────────────
-    scatter_rel = _register(Path(FIGURES_DIR) / "caliber_scatter.png")
+    scatter_rel = _register(Path("caliber_scatter.svg"))
     plotter.plot_caliber_scatter(
         {
             name: [
@@ -1572,10 +1854,18 @@ def build_rainstorm_report(
     for index, code in enumerate(selected, start=1):
         daily_rel, threshold_rel = per_process_rels[code]
         lines += _process_section(code, per_model, names, numbering,
-                                  daily_rel, threshold_rel, index)
+                                  daily_rel, threshold_rel, index,
+                                  spatial_path=spatial_rels.get(code),
+                                  spatial_model=spatial_models.get(code, "Tongyun"),
+                                  spatial_total_path=spatial_total_rels.get(code),
+                                  spatial_total_hours=window_days(code) * 24,
+                                  spatial_total_init=spatial_total_init.get(code, ""),
+                                  spatial_total_model=spatial_total_models.get(
+                                      code, "Tongyun"))
     lines += _cross_section(codes, per_model, names, numbering, scatter_rel)
     lines += _advice_section(codes, per_model, names, change)
-    lines += _caveats_section(archives)
+    lines += _caveats_section(
+        archives, sorted(set(spatial_rels) | set(spatial_total_rels)))
 
     report_path = out_dir / "REPORT.md"
     report_path.write_text("\n".join(lines).rstrip("\n") + "\n", encoding="utf-8")

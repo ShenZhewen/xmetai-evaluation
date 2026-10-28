@@ -26,7 +26,7 @@ cd xmetai-evalation-v2
 python -m xmetai_evaluation.cli --list-pipelines         
 
 # 开始评测（配置可以是内置名，也可以是 .py 路径；数据路径由环境变量提供）
-python -m xmetai_evaluation.cli --config weather_rmse_single_fgvp --log-file /workspace/szwCode/evaluation_results/weather_rmse_single_fgvp_ctrl/smoke_tp.log
+python -m xmetai_evaluation.cli --config weather_rmse_single_fgvp --log-file /workspace/data/shenzw/evaluation_results/weather_rmse_single_fgvp_ctrl/smoke_tp.log
 
 # --log-file 可省略：省略后日志只打到控制台（INFO 级），不落文件；
 # --config 可以更换，如 weather_rmse_single_fgvp
@@ -763,7 +763,7 @@ echo "已用: $(cat /sys/fs/cgroup/memory.current)"
 | `weather_typhoon_ens_fuxi` | 台风路径与强度（集合，方案 A/B 一次算清） |
 | `fdp_rmse_single_fengqing` / `fdp_rmse_ens_fengqing` | FDP 要素检验（确定性 / 集合） |
 | `fdp_precip_single_fengqing` / `fdp_precip_ens_fengqing` | FDP 降水站点检验（确定性 TS/频率偏差 / 集合概率 BS/AROC/BSS） |
-| `rainstorm_ts_single_fgvp` / `_aifs` / `_fuxi` / `_fengqing` / `_tongyun` | 暴雨过程分档检验：走 `weather_ts_det`，逐过程展开起报，过程编目（43 个过程，编号/起止/等级）的唯一真值在 `rainstorm_catalog.py` |
+| `rainstorm_ts_single_fgvp` / `_aifs` / `_fuxi` / `_fengqing` / `_tongyun` | 暴雨过程分档检验：走 `weather_ts_det`，逐过程展开起报，过程编目（43 个过程，编号/起止/等级）的唯一真值在 `configs/rainstorm_ts_single_base.py` |
 
 批量多模型见上「批量评测」——写一份 `cfgs` 列表即可，无内置示例。
 

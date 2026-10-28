@@ -10,7 +10,8 @@
     ``weather_ens_field_scores_noref``（同批指标去掉 ACC/活跃度），
     不给 ``reference_reader``。
 
-单位：z500 报 m²/s²（不除 g）、msl 报 Pa、t2m 报 K、tp 报 mm（6h 累积）。
+单位：z500 报 m²/s²（不除 g）、msl 报 Pa、t2m 报 K、tp 报 **inch**（6h 累积，
+store 里 tp 就是 log1p(英寸)，模型输出同口径；换算成 mm 要 ×25.4，评测侧只改标注不动数值）。
 """
 
 from xmetai_evaluation.configs.base import EvalConfig, metric_options_from_var_metrics
@@ -43,10 +44,10 @@ METRIC_OPTIONS["zonal_spectrum"] = {
 METRIC_OPTIONS["spread_error"] = {**METRIC_OPTIONS["spread_error"], "ddof": 0}
 
 # ── 时效 ──
-# CRA store 的时间轴止于 2026-07-14；20260701 00Z 起报能精确对上的最长时效是
-# +318h（60 步跑到 +360h 会越界，实况读取器会报"时间轴里没有这些有效时刻"）。
+# CRA store 的时间轴止于 2026-07-14 06Z；20260702 00Z 起报能精确对上的最长时效是
+# +294h（60 步跑到 +360h 会越界，实况读取器会报"时间轴里没有这些有效时刻"）。
 # 起报换成更晚的日子就把上限跟着收窄（上限 = store 末尾 − 起报时刻）。
-LEADS = list(range(6, 319, 6))
+LEADS = list(range(6, 295, 6))
 
 cfg = EvalConfig(
     name="weather_rmse_ens_tongyun_cra",
@@ -73,7 +74,7 @@ cfg = EvalConfig(
 
     # ── 时段 ──
     periods=[
-        ("20260701", "20260701")
+        ("20260702", "20260702")
     ],
     limit=None,  # 限起报数：冒烟改 2；None = 不限
 

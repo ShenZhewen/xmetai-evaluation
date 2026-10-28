@@ -153,7 +153,7 @@ def build_plan(
             spec.window_hours,
             math.ceil(spec.window_hours / 24),
         )
-    warmup = _warmup_hours(spec, _layout_step_hours(forecast))
+    warmup = _warmup_hours(spec, _layout_step_hours(forecast), forecast)
     chunks = _chunk_work(
         spec,
         init_times,
@@ -287,7 +287,7 @@ def _layout_step_hours(forecast: Any) -> float:
     return float(getattr(layout, "step_hours", None) or 6.0)
 
 
-def _warmup_hours(spec: PipelineSpec, step_hours: float) -> float:
+def _warmup_hours(spec: PipelineSpec, step_hours: float, forecast: Any = None) -> float:
     """累积变换需要的预热时效（小时）。
 
     ``TimeWindowAccumulator`` 是滑动窗，窗口不完整的开头时刻会被直接跳过
@@ -301,11 +301,18 @@ def _warmup_hours(spec: PipelineSpec, step_hours: float) -> float:
     "Need at least 2 time steps"，于是**每段时效的最后一个窗永远出不了样本**
     （实测 6h 段顶边块全灭）。多带一步给的是步长这个信息，不是精度：那个多出
     来的窗不在 ``sample_leads`` 里，协议会跳过，不会多出样本。
+
+    预报是"从起报累计"的变量（``since_init_variables``，如 AIFS 的 tp）还要
+    **再多带 1 步**：Reader 沿 lead 做的差分 ``I(k)=C(k)-C(k-1)`` 需要前驱，
+    块的首个时效只当前驱用、本身不是样本，但它的前驱必须在读取集里。
     """
     if spec.transform("time_window_accumulator") is None:
         return 0.0
     steps = int(round(spec.window_hours / float(step_hours)))
-    return max(1, steps - 1) * float(step_hours)
+    warmup = max(1, steps - 1) * float(step_hours)
+    if forecast is not None and getattr(forecast.reader, "needs_previous_step", False):
+        warmup += float(step_hours)
+    return warmup
 
 
 def _sample_values(spec: PipelineSpec, leads: List[float]) -> List[float]:

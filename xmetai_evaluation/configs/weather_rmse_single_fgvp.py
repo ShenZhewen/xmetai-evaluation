@@ -82,7 +82,7 @@ cfg = EvalConfig(
 
     output_dir=os.environ.get(
         "EVAL_OUTPUT",
-        "/workspace/szwCode/evaluation_results/weather_rmse_single_fgvp",
+        "/workspace/data/shenzw/evaluation_results/weather_rmse_single_fgvp",
     ),
     metric_options=METRIC_OPTIONS,
     log_level="INFO",  # DEBUG / INFO / WARNING / ERROR

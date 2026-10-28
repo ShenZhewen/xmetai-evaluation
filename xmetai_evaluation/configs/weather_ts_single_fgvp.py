@@ -59,7 +59,7 @@ cfg = EvalConfig(
 
     output_dir=os.environ.get(
         "EVAL_OUTPUT",
-        "/workspace/szwCode/evaluation_results/weather_ts_single_fgvp",
+        "/workspace/data/shenzw/evaluation_results/weather_ts_single_fgvp",
     ),
     log_level="INFO",
 

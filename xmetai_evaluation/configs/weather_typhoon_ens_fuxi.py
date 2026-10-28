@@ -41,7 +41,7 @@ cfg = EvalConfig(
     end_date="20251231",
     limit=None,  # 限起报数，直接改这里；None = 不限
 
-    output_dir="/workspace/szwCode/evaluation_results/weather_typhoon_ens_fuxi",
+    output_dir="/workspace/data/shenzw/evaluation_results/weather_typhoon_ens_fuxi",
     log_level="INFO",
 
     # 输出长表与逐场次台风文件。

@@ -219,6 +219,7 @@ class GriddedReader(Reader):
         layout: GriddedLayout,
         version: str = "2.0.0",
         scales: Optional[Dict[str, float]] = None,
+        since_init_variables: Optional[Sequence[str]] = None,
     ):
         super().__init__(source_id=source_id, version=version)
         self.layout = layout
@@ -233,6 +234,27 @@ class GriddedReader(Reader):
             raise ValueError(
                 f"scales 里有布局 {layout.name} 未声明的变量: {', '.join(unknown)}"
             )
+        #: 落盘是"从起报时刻起的累计量"的变量，读入后沿 ``lead_time`` 差分成
+        #: 逐步增量。ECMWF/AIFS 的 tp 是 ``C(k) = Σ_{j≤k} I(j)``；累积窗要求
+        #: 输入是间隔量，否则第 k 步会把 1..k 步再加一遍（24h 窗放大 2.5 倍起，
+        #: 并随时效线性增长）。FuXi / Tongyun 落盘就是间隔量，不写这一项。
+        self.since_init_variables = tuple(str(name) for name in (since_init_variables or ()))
+        unknown = sorted(set(self.since_init_variables) - set(layout.variables))
+        if unknown:
+            # 同样宁可报错：写错名字会静默保留累计口径，偏差只体现在结果里
+            raise ValueError(
+                f"since_init_variables 里有布局 {layout.name} 未声明的变量: "
+                f"{', '.join(unknown)}"
+            )
+
+    @property
+    def needs_previous_step(self) -> bool:
+        """读取集的首个有效时效是否需要前驱时效（差分要用）。
+
+        计划层据此在累积窗预热之外再多读一步（``execution/plan.py`` 的
+        ``_warmup_hours``）：分块读取时块的首个时效只可能当前驱，不能被采样。
+        """
+        return bool(self.since_init_variables)
 
     def read(self, request: DataRequest, index: DataIndex) -> DataBundle:
         return self._read_records(request, self.records_from_index(index))
@@ -562,12 +584,46 @@ class GriddedReader(Reader):
         )
         return stacked.assign_coords({name: list(members)})
 
+    def _difference_since_init(self, dataset: xr.Dataset) -> xr.Dataset:
+        """把"从起报累计"的变量沿 ``lead_time`` 差分成逐步增量。
+
+        ``since_init_variables`` 里的变量落盘是 ``C(k) = Σ_{j≤k} I(j)``，而
+        累积窗/阈值判定要的是间隔量 ``I(k) = C(k) - C(k-1)``。
+
+        读取集的**首个**时效没有前驱，保留原值：分块执行时计划层会多带一步
+        预热（``needs_previous_step``），这一步只会被更晚的差分当前驱用，不在
+        采样集里；不分块时首个时效就是归档第一个文件（001.nc，+6h），它的
+        累计量恰好等于第一个间隔。前提是归档从 ``step_hours`` 起步——AIFS
+        集合归档确实如此（001.nc = +6h）。
+        """
+        names = [name for name in self.since_init_variables if name in dataset.data_vars]
+        if not names or "lead_time" not in dataset.dims:
+            return dataset
+        leads = dataset["lead_time"].values
+        if len(leads) < 2:
+            return dataset
+
+        out = dataset
+        for name in names:
+            data = dataset[name]
+            first = data.isel(lead_time=slice(0, 1))
+            step = data.diff("lead_time").assign_coords(lead_time=leads[1:])
+            differenced = xr.concat([first, step], dim="lead_time").assign_coords(
+                lead_time=leads
+            )
+            # 差分后单位/属性不变；显式拷贝，避免 concat 的 combine_attrs 口径
+            # 随 xarray 版本漂移（``_build_bundle`` 直接从这里取 units）。
+            differenced.attrs = dict(data.attrs)
+            out = out.assign({name: differenced})
+        return out
+
     def _build_bundle(
         self,
         request: DataRequest,
         combined: xr.Dataset,
         frames: Sequence[Tuple[GriddedRecord, xr.Dataset]],
     ) -> DataBundle:
+        combined = self._difference_since_init(combined)
         units: Dict[str, str] = {}
         temporal: Dict[str, TemporalKind] = {}
         for name in combined.data_vars:

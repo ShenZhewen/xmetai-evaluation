@@ -61,7 +61,7 @@ cfg = EvalConfig(
     end_date="20260820",
     limit=None,
 
-    output_dir="/workspace/szwCode/evaluation_results/fdp_precip_ens_fengqing",
+    output_dir="/workspace/data/shenzw/evaluation_results/fdp_precip_ens_fengqing",
     writers=["csv_long", "probability_wide"],
     log_level="INFO",
     execution=_execution(),

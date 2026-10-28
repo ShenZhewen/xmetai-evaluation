@@ -12,8 +12,10 @@
     summary_long.csv   一行 = (过程, 口径, [起报日], 阈值, 指标)，模型列并排 + TS 差值
     screening.md       口径 A 逐起报日、口径 B 逐过程的两张宽表 + 挑过程排序
 
-过程级 TS 一律汇总重算（hits/misses/false_alarms 加总），不是逐日起报 TS 的平均。
-两种口径基准率不同，只能同口径内比较。
+口径 A = 每个 UTC 日换一根 00UTC 起报评 0–24h；口径 B = 只在过程起点 S 00UTC
+起报一根、逐日各评一次 24h（lead 24/48/…/N×24），不累加总量。
+过程级 TS 一律汇总重算（hits/misses/false_alarms 加总），不是逐日 TS 的平均。
+两种口径预报样本不同，只能同口径内比较。
 """
 
 from __future__ import annotations
@@ -28,25 +30,29 @@ from _bootstrap import bootstrap, parse_model
 
 bootstrap()
 
-from xmetai_evaluation.rainstorm_catalog import codes, expected_days, get
+from xmetai_evaluation.configs.rainstorm_ts_single_base import codes, expected_days, get
 from xmetai_evaluation.visualization.rainstorm_report import (
     RANK_THRESHOLD,
     SCREENING_THRESHOLDS,
+    ProcessScores,
+    _read_wide,
     daily_pooled,
     load_archive,
     load_process,
+    total_counts,
+    total_value,
 )
 
 #: 模型名 → rainstorm_ts_single_* 输出根（换机器改这里）
 DEFAULT_MODELS = [
-    ("FGVP", "/workspace/szwCode/evaluation_results/rainstorm_ts_single_fgvp"),
-    ("AIFS", "/workspace/szwCode/evaluation_results/rainstorm_ts_single_aifs"),
-    ("FuXi", "/workspace/szwCode/evaluation_results/rainstorm_ts_single_fuxi"),
-    ("FengQing", "/workspace/szwCode/evaluation_results/rainstorm_ts_single_fengqing"),
-    ("Tongyun", "/workspace/szwCode/evaluation_results/rainstorm_ts_single_tongyun"),
+    ("FGVP", "/workspace/data/shenzw/evaluation_results/rainstorm_ts_single_fgvp"),
+    ("AIFS", "/workspace/data/shenzw/evaluation_results/rainstorm_ts_single_aifs"),
+    ("FuXi", "/workspace/data/shenzw/evaluation_results/rainstorm_ts_single_fuxi"),
+    ("FengQing", "/workspace/data/shenzw/evaluation_results/rainstorm_ts_single_fengqing"),
+    ("Tongyun", "/workspace/data/shenzw/evaluation_results/rainstorm_ts_single_tongyun"),
 ]
 
-DEFAULT_RESULT = "/workspace/szwCode/evaluation_results/rainstorm_summary"
+DEFAULT_RESULT = "/workspace/data/shenzw/evaluation_results/rainstorm_summary"
 
 METRICS = ["ts", "pod", "far", "miss_rate", "frequency_bias"]
 
@@ -65,8 +71,43 @@ def read_scores(path: Path):
 
 
 def load_total(root: Path, code: str):
-    """口径 B 的产物表；缺产物返回 None。"""
-    return read_scores(root / f"{code}_total" / "scores.csv")
+    """口径 B 的逐日宽表（一行一个 ``lead_h`` = 一个 24h 窗）；缺产物返回 None。
+
+    ``scores.csv`` 也是逐 lead 一行、没有四格表计数，所以口径 B 的过程级
+    数值改从 ``categorical_wide.csv`` 加总重算（同报告渲染器）。
+    """
+    archive = load_archive(str(root), root)
+    return _read_wide(archive.path_of(code))
+
+
+#: 脚本里的指标名 → 宽表列名；``miss_rate`` 单独由 POD 取补。
+_WIDE_METRIC = {"ts": "TS", "pod": "POD", "far": "FAR", "frequency_bias": "BIAS"}
+
+
+def total_metric(frame, code: str, threshold: float, metric: str):
+    """口径 B 某档某指标：全部逐日窗计数加总后重算；返回 ``(值, 配对数)``。"""
+    if frame is None:
+        return None, None
+    scores = ProcessScores(code=code, total=frame)
+    if metric == "miss_rate":
+        pod = total_value(scores, threshold, "POD")
+        value = None if pod is None else 1.0 - pod
+    else:
+        column = _WIDE_METRIC.get(metric)
+        value = None if column is None else total_value(scores, threshold, column)
+    counts = total_counts(scores, threshold)
+    return value, (None if counts is None else int(counts["n_pairs"]))
+
+
+def total_view(root: Path, code: str, thresholds=SCREENING_THRESHOLDS):
+    """口径 B 的 ``{阈值: TS}``；缺产物返回 None（表格里记「缺」）。"""
+    frame = load_total(root, code)
+    if frame is None:
+        return None
+    return {
+        threshold: total_metric(frame, code, threshold, "ts")[0]
+        for threshold in thresholds
+    }
 
 
 def load_days(root: Path, code: str):
@@ -161,18 +202,34 @@ def build_long(models, codes):
 
         totals = [load_total(root, code) for _, root in models]
         if any(f is not None for f in totals):
-            for threshold, metric in frame_keys(totals):
-                row = {
-                    "编号": code,
-                    "起止": process.span,
-                    "等级": process.grade,
-                    "口径": "过程累积",
-                    "起报日": "",
-                    "threshold": threshold,
-                    "metric": metric,
-                }
-                fill_model_cells(row, names, totals, threshold, metric)
-                rows.append(row)
+            thresholds = sorted({
+                float(item)
+                for frame in totals if frame is not None
+                for item in frame["threshold_mm"].dropna().unique()
+            })
+            for threshold in thresholds:
+                for metric in METRICS:
+                    row = {
+                        "编号": code,
+                        "起止": process.span,
+                        "等级": process.grade,
+                        "口径": "单起报逐日汇总",
+                        "起报日": "",
+                        "threshold": threshold,
+                        "metric": metric,
+                    }
+                    values = []
+                    for name, frame in zip(names, totals):
+                        value, pairs = total_metric(frame, code, threshold, metric)
+                        row[f"{name}.value"] = value
+                        row[f"{name}.n_valid"] = pairs
+                        row[f"{name}.status"] = (
+                            "缺" if frame is None else ("—" if value is None else "ok")
+                        )
+                        values.append(value)
+                    if metric == "ts" and all(v is not None for v in values[:2]):
+                        row["delta_ts"] = values[0] - values[1]
+                    rows.append(row)
     return pd.DataFrame(rows)
 
 
@@ -196,9 +253,11 @@ def build_screening_markdown(models, codes):
     lines = [
         "# 2025 年暴雨过程个例检验 · 挑过程总表",
         "",
-        "TS 均为**全球行**（zd_sta_10285 全部站）。两种口径互不可比：",
-        "「逐日24h」= 每个起报日的 day-1 窗（起报日 08 时 → 次日 08 时），**每天一个结果**；",
-        "「过程累积」= 过程起点前一天的一根预报把整段降水累加后评总量。",
+        "TS 均为**全球行**（zd_sta_10285 全部站）。两种口径预报样本不同、不可相减：",
+        "「逐日24h」= 每个 UTC 日换一根 00UTC 起报评 0–24h 窗（起报日 08 时 → 次日 08 时），"
+        "**每天一个结果**；",
+        "「单起报逐日汇总」= 只用过程起点 S 00UTC 一根起报，逐日各评一次 24h"
+        "（lead 24/48/…），过程级数值把这些日的四格表加总后重算。",
         "「缺」= 该段产物缺失（多半是那几天的预报数据缺）。",
         "",
     ]
@@ -225,7 +284,7 @@ def build_screening_markdown(models, codes):
             lines.append("| " + " | ".join(cells) + " |")
     lines.append("")
 
-    lines += ["## 口径：过程累积", ""]
+    lines += ["## 口径：单起报逐日汇总", ""]
     header = ["编号", "起止", "等级"]
     for threshold in SCREENING_THRESHOLDS:
         header += [f"≥{threshold:g} {name}" for name in names] + [f"Δ({names[0]}-{names[1]})"]
@@ -233,7 +292,7 @@ def build_screening_markdown(models, codes):
     lines.append("|" + "---|" * len(header))
     for code in codes:
         process = get(code)
-        views = {name: segment_view(load_total(root, code)) for name, root in models}
+        views = {name: total_view(root, code) for name, root in models}
         cells = [code, process.span, process.grade]
         for threshold in SCREENING_THRESHOLDS:
             _screening_row(cells, names, views, threshold)
@@ -257,14 +316,13 @@ def build_screening_markdown(models, codes):
         lines.append(f"{rank}. **{code}**（{process.span}，{process.grade}）汇总 TS = {value:.3f}")
     lines.append("")
 
-    lines += [f"## 排序参考（过程累积，{names[0]} ≥{RANK_THRESHOLD:g}mm TS，前 10）", ""]
+    lines += [f"## 排序参考（单起报逐日汇总，{names[0]} ≥{RANK_THRESHOLD:g}mm TS，前 10）", ""]
     entries = []
     for code in codes:
-        view = segment_view(load_total(main_root, code))
-        if view is not None:
-            value = view.get(RANK_THRESHOLD)
-            if value is not None and not pd.isna(value):
-                entries.append((float(value), code))
+        view = total_view(main_root, code)
+        value = None if view is None else view.get(RANK_THRESHOLD)
+        if value is not None and not pd.isna(value):
+            entries.append((float(value), code))
     entries.sort(reverse=True)
     for rank, (value, code) in enumerate(entries[:10], start=1):
         process = get(code)

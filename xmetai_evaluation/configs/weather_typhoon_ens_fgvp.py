@@ -45,7 +45,7 @@ cfg = EvalConfig(
 
     limit=None,  # 限起报数，直接改这里；None = 不限
 
-    output_dir="/workspace/szwCode/evaluation_results/weather_typhoon_ens_fgvp",
+    output_dir="/workspace/data/shenzw/evaluation_results/weather_typhoon_ens_fgvp",
     log_level="INFO",
 
     writers=["csv_long", "typhoon_cases"],

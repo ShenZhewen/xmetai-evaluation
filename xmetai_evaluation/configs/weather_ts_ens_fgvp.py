@@ -48,7 +48,7 @@ cfg = EvalConfig(
     limit=None,  # 限起报数，直接改这里；None = 不限
 
     output_dir=os.environ.get(
-        "EVAL_OUTPUT", "/workspace/szwCode/evaluation_results/weather_ts_ens_fgvp"
+        "EVAL_OUTPUT", "/workspace/data/shenzw/evaluation_results/weather_ts_ens_fgvp"
     ),
     log_level="INFO",
 

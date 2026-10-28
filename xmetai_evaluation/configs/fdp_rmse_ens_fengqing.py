@@ -51,7 +51,7 @@ cfg = EvalConfig(
     end_date="20260820",
     limit=None,
 
-    output_dir="/workspace/szwCode/evaluation_results/fdp_rmse_ens_fengqing",
+    output_dir="/workspace/data/shenzw/evaluation_results/fdp_rmse_ens_fengqing",
     writers=["csv_long", "spectrum", "json"],
     metric_options=METRIC_OPTIONS,
     log_level="INFO",

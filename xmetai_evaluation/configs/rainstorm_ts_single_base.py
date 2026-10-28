@@ -1,6 +1,9 @@
 # -*- coding: utf-8 -*-
 """2025 年暴雨过程编目：编号 → 起止 / 等级，**这份表是唯一真值来源**。
 
+本文件放在 ``configs/`` 下，是 ``rainstorm_ts_single_*.py`` 五套配置的共用基模块；
+它自己不定义 ``cfg`` / ``cfgs``，不能直接用 ``--config rainstorm_ts_single_base`` 加载。
+
 过程来自《2025年暴雨过程纪要表（修订）-1.docx》（2025-10-08 版），编号
 202501–202543，共 43 个过程。等级是纪要表自己给的（``特强`` / ``强`` /
 ``较强`` / ``中等``），**不是从评分推出来的**——它只用来做过程分档与排序，
@@ -22,8 +25,10 @@
 
 1. **202519 与 202520 起止完全相同**（7月18-22日）——纪要表把同一时段的两个
    侧面分列两条，**各评各的、不合并**，所以编目里两条都在。
-2. 开始日/结束日是纪要表的 **0–0 日历口径**。评测实际用的是 08–08 北京时日界，
-   口径 B 因此头尾各多 8 小时——那是评测口径的事，编目只记纪要表原值。
+2. 开始日/结束日**按 UTC 整日理解**（用户 2026-10-28 定，不再混北京时日界）：
+   过程 S–E 覆盖 ``[S 00UTC, (E+1) 00UTC]``，正好是 N 个 00–00 UTC 窗，
+   每个窗对应 08–08 北京时。与纪要表原文的北京时日期相比，**实际评的时段
+   整体后移 8 小时**——报告图注里要写明这一点。
 """
 
 from __future__ import annotations
@@ -43,8 +48,8 @@ class Process:
     Attributes:
         code: 纪要表编号，``202501``–``202543``。
         span: 起止的中文写法，如 ``"3月12-15日"``，报告里直接引用。
-        start: 开始日 ``YYYYMMDD``（纪要表 0–0 口径）。
-        end: 结束日 ``YYYYMMDD``（纪要表 0–0 口径）。
+        start: 开始日 ``YYYYMMDD``（按 UTC 整日理解，见模块说明第 2 点）。
+        end: 结束日 ``YYYYMMDD``（按 UTC 整日理解，见模块说明第 2 点）。
         grade: 纪要表给的等级，取值见 :data:`GRADE_ORDER`。
     """
 
@@ -135,26 +140,27 @@ def get(code: str) -> Process:
 
 
 def window_days(code: str) -> int:
-    """口径 B 的累积窗长（天），``(结束日 − 开始日) + 2``。
+    """口径 B 的分段数（天），``E − S + 1``，也是整段覆盖的 24h 窗数。
 
-    ``+2`` 是 08–08 日界的代价：窗为 ``[S-1 日 08:00, E+1 日 08:00]``，
-    比纪要表的 0–0 日历口径头尾各多 8 小时。
+    编目日期按 **UTC 整日**理解：过程 S–E 覆盖 ``[S 00UTC, (E+1) 00UTC]``，
+    共 ``E−S+1`` 个 24h 窗。口径 B 只在 S 日 00UTC 起报一根，在每个窗上各评
+    一次（lead 24 / 48 / … / N×24），**不再把整段雨量累加成一个总量**。
     """
     process = get(code)
     start = datetime.strptime(process.start, "%Y%m%d")
     end = datetime.strptime(process.end, "%Y%m%d")
-    return (end - start).days + 2
+    return (end - start).days + 1
 
 
 def expected_days(code: str) -> List[str]:
-    """口径 A 应有的起报日：``[S-1, E]`` 逐日 ``YYYYMMDD``。
+    """口径 A 应有的起报日：``[S, E]`` 逐日 ``YYYYMMDD``。
 
-    口径 A 是"每个 08–08 窗由当日起报的 day-1 预报评一次"，所以起报日从过程
-    开始日**前一天**起、到结束日为止，一天一个结果、互不合并。
+    口径 A 每个 UTC 日一个 24h 窗（00–00 UTC = 08–08 北京时），由**当日起报**
+    的 0–24h 预报评一次，一天一个结果、互不合并。
     报告拿它当"这段产物该有哪些"的基准，缺的起报日在表里记「缺」而不是静默跳过。
     """
     process = get(code)
-    first = datetime.strptime(process.start, "%Y%m%d") - timedelta(days=1)
+    first = datetime.strptime(process.start, "%Y%m%d")
     last = datetime.strptime(process.end, "%Y%m%d")
     return [
         (first + timedelta(days=offset)).strftime("%Y%m%d")

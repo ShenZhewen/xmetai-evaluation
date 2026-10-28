@@ -52,7 +52,7 @@ _station = EvalConfig(
     end_date="20260820",
     limit=None,
 
-    output_dir="/workspace/szwCode/evaluation_results/fdp_precip_single_fengqing",
+    output_dir="/workspace/data/shenzw/evaluation_results/fdp_precip_single_fengqing",
     writers=["csv_long", "categorical_wide"],
     log_level="INFO",
     execution=_execution(),
@@ -82,7 +82,7 @@ _grid = EvalConfig(
     end_date="20260820",
     limit=None,
 
-    output_dir="/workspace/szwCode/evaluation_results/fdp_precip_fss",
+    output_dir="/workspace/data/shenzw/evaluation_results/fdp_precip_fss",
     writers=["csv_long"],
     log_level="INFO",
     execution=_execution(),

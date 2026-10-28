@@ -1084,10 +1084,21 @@ def analysis_probability(summaries: Dict[str, Dict[str, object]]) -> List[str]:
         if len(pool) >= 2:
             best_aroc = max(pool, key=lambda name: pool[name]["AROC"])
             best_bss = max(pool, key=lambda name: pool[name]["BSS"])
+            # 样本量相同就说相同：同一批观测配对时三家 n_points 一致，此时再说
+            # 「并不相同、样本少的波动大」会被表里的同一列数字当场打脸。
+            points = {
+                name: max((entry.get("n_points") or 0) for entry in summaries[name]["rows"])
+                for name in pool
+            }
+            points_note = (
+                "各模型的概率样本量并不相同（见「样本点数」列），样本少的那个名次波动更大。"
+                if len(set(points.values())) > 1
+                else "各模型的概率样本量相同（见「样本点数」列），名次差异不来自抽样规模。"
+            )
             parts.append(
                 f"AVG 档上 AROC 最高的是 {best_aroc}（{fmt_number(pool[best_aroc]['AROC'])}）、"
                 f"BSS 最高的是 {best_bss}（{fmt_number(pool[best_bss]['BSS'])}）。"
-                f"各模型的概率样本量并不相同（见「样本点数」列），样本少的那个名次波动更大。"
+                + points_note
             )
 
     if np.isfinite(average.get("AROC", np.nan)):
@@ -2361,7 +2372,9 @@ def _captions(
         ),
         "metrics_at_lead": (
             f"基准时效 {lead:g}h（{window_text}）各模型在各降水等级上的 TS、POD、FAR 与 BIAS 对比；"
-            f"每格一组柱、按模型着色，BIAS 格内虚线为理想值 1（纵轴自适应、不截断）。"
+            f"每格一组柱、按模型着色，各格纵轴按本格数据自适应（一律 0 起）、刻度 0.1 一档，"
+            f"BIAS 格内虚线为理想值 1（数据整体远离 1 时该格不再强行把 1 拉进视野）"
+            f"——柱高与原值一致，不做截断。"
         ),
         "ts_vs_lead": (
             f"{span} 各模型分降水等级的 TS 曲线，一个等级一个子图、每个模型一条实线；"
@@ -2370,15 +2383,16 @@ def _captions(
         ),
         "pod_vs_lead": (
             f"{span} 各模型分降水等级的 POD 曲线，一个等级一个子图；"
-            f"纵轴锁定 0–1，绝对数值见 §4.2 的逐等级表。"
+            f"纵轴按各子图数据范围缩放，绝对数值见 §4.2 的逐等级表。"
         ),
         "far_vs_lead": (
             f"{span} 各模型分降水等级的 FAR 曲线，一个等级一个子图；"
-            f"纵轴锁定 0–1、越低越好，绝对数值见 §4.3 的逐等级表。"
+            f"纵轴按各子图数据范围缩放、越低越好，绝对数值见 §4.3 的逐等级表。"
         ),
         "bias_vs_lead": (
             f"{span} 各模型分降水等级的 BIAS 曲线，一个等级一个子图；"
-            f"虚线为理想值 1，纵轴自适应、不截断，绝对数值见 §4.4 的逐等级表。"
+            f"纵轴按各子图数据范围自适应、不截断，虚线为理想值 1"
+            f"（数据整体远离 1 的格子不再强行把 1 拉进视野），绝对数值见 §4.4 的逐等级表。"
         ),
         "TS_boxplot": (
             "各模型 TS 的跨时效分布；箱体越高表示该量级整体技巧越好、越窄表示跨时效越稳定，"
@@ -2392,12 +2406,12 @@ def _captions(
         ),
         "aroc_vs_lead": (
             "概率评分的 AROC 随时效变化，2×2 每格一个阈值；各模型一律实线，"
-            "纵轴从各模型各阈值的最低值稍下起、刻度每 0.1 一格，"
+            "四格纵轴各自按本格数据取范围（刻度 0.1 或 0.05 一档），"
             "越靠上区分能力越强，0.5 为无技巧（不画辅助线，读数看纵轴）。"
         ),
         "bss_vs_lead": (
             "概率评分的 BSS 随时效变化，2×2 每格一个阈值；各模型一律实线，"
-            "纵轴按各档数据范围自适应，越靠上越优于气候基准，"
+            "四格纵轴各自按本格数据取范围（可以为负），越靠上越优于气候基准，"
             "0 为无正技巧（不画辅助线，读数看纵轴）。"
         ),
         "lead_dot": (

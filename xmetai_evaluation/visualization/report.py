@@ -292,6 +292,29 @@ def _coverage_of(wide) -> int:
     return int(pairs.dropna().sum())
 
 
+def _fill_grade_column(frame):
+    """老产物宽表的 ``grade`` 列是空的（只有 ``threshold_mm``），按阈值补成 ``≥X``。
+
+    报告的逐等级统计一律按 ``grade`` 分组，而 ``groupby`` 默认丢掉 NaN 组——
+    不补就会把整份表丢光、报告只剩空壳。新产物本来就写了 ``grade``，原样不动。
+    """
+    if "grade" not in frame.columns or "threshold_mm" not in frame.columns:
+        return frame
+    missing = frame["grade"].isna()
+    if not missing.any():
+        return frame
+    import pandas as pd
+
+    thresholds = pd.to_numeric(frame.loc[missing, "threshold_mm"], errors="coerce")
+    frame = frame.copy()
+    # 空列被 pandas 读成 float64，直接塞字符串会触发 FutureWarning（将来直接报错）。
+    frame["grade"] = frame["grade"].astype(object)
+    frame.loc[missing, "grade"] = [
+        f"≥{value:g}" if pd.notna(value) else None for value in thresholds
+    ]
+    return frame
+
+
 def _render_ts(
     output_dir: Path,
     target: Path,
@@ -334,8 +357,10 @@ def _render_ts(
     from xmetai_evaluation.visualization.ts_report import region_labels_from
 
     # 每份来源的表只读一次：宽表要连用三次（主数据、概率同目录、样本量）。
-    frames = {model_name: pd.read_csv(wide_path)}
-    frames.update({name: pd.read_csv(path) for name, path in comparisons.items()})
+    frames = {model_name: _fill_grade_column(pd.read_csv(wide_path))}
+    frames.update(
+        {name: _fill_grade_column(pd.read_csv(path)) for name, path in comparisons.items()}
+    )
 
     # 概率评分：主模型读自己的 diagnostics/，对比模型读**它自己那一行的同目录**
     # （老归档给的是裸 CSV，旁边没有这张表，自然缺席）。缺表不是错误——那几份只出 TS。
@@ -343,7 +368,7 @@ def _render_ts(
     for name, csv_path in [(model_name, wide_path), *comparisons.items()]:
         sibling = _probability_sibling(csv_path)
         if sibling is not None:
-            probability[name] = pd.read_csv(sibling)
+            probability[name] = _fill_grade_column(pd.read_csv(sibling))
     # 样本量披露：最小阈值档的全时效 n_pairs 合计。取不到的不进覆盖表，
     # 免得报告里出现「某某 0」这种会被读成"零样本"的数字。
     coverage = {name: count for name, count in ((n, _coverage_of(f)) for n, f in frames.items()) if count}

@@ -60,6 +60,9 @@ where = ["."]
 include = ["xmetai_evaluation*"]
 exclude = ["tests*", "ref*"]
 
+[tool.setuptools.package-data]
+"xmetai_evaluation.visualization" = ["assets/*.geojson", "assets/*.md"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 python_files = ["test_*.py"]

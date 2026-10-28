@@ -434,10 +434,13 @@ CRA_ZARR_VARIABLES.update(
         "u10m": VarSpec(unit="m/s"),
         "v10m": VarSpec(unit="m/s"),
         "msl": VarSpec(unit="Pa"),
-        # expm1 由读取器做（store 是 log1p 空间），到这里已经是 mm。
+        # expm1 由读取器做（store 是 log1p 空间）。
+        # 单位是**英寸**不是 mm：2026-10-22 实测 expm1 后全球均值 0.026、ITCZ 0.113、
+        # p99 0.37，×25.4 后正好是 2.6 mm/day、2.9 mm/6h、9.4 mm/6h。只改标注、不改数值
+        # （要报 mm 得两侧同时乘 25.4，见 memory: cra-store-tp-unit-inches）。
         "tp": VarSpec(
-            unit="mm",
-            source_unit="log1p(mm)",
+            unit="inch",
+            source_unit="log1p(inch)",
             temporal_kind=TemporalKind.INTERVAL_ACCUMULATION,
         ),
     }

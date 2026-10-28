@@ -68,9 +68,10 @@ metadata:
 - "**热带 春季 rmse 对比**""北半球夏季的 ACC 谁高"——从已出的长表里
   切一个子集补进报告，**不重跑评测**，走 `references/rmse-batch-evaluation.md` §6
 - "**降水个例分析**做一份""2025 年这几个暴雨过程报得怎么样"
-  "挑几个过程细看，逐日和过程累积都比"——走 `render_rainstorm_report.py`，
+  "挑几个过程细看，每天换起报和 S 单起报都比"——走 `render_rainstorm_report.py`，
   `--process` 点名要详析的过程编号（先跑 `render_rainstorm_summary.py`，
-  用它的 `summary_long.csv` 挑，别解析 `screening.md` 的 markdown）
+  用它的 `summary_long.csv` 挑，别解析 `screening.md` 的 markdown）。
+  **报告出完要主动问一句要不要附降水空间分布图**，见下面「第 4 步之后」
 - "顺便画几张**空间分布图**""z500 的偏差长什么样""7 月和 11 月的平均场"——
   走「空间分布图」一节，先问月份、档案根目录（确定性还是集合）、模型名
 
@@ -283,19 +284,21 @@ python skills/xmetai-evaluation/scripts/render_report.py <主模型产物目录>
 
 ```bash
 python skills/xmetai-evaluation/scripts/render_rainstorm_report.py \
-  --model FGVP=/workspace/szwCode/evaluation_results/rainstorm_ts_single_fgvp \
-  --model AIFS=/workspace/szwCode/evaluation_results/rainstorm_ts_single_aifs \
-  --model FuXi=/workspace/szwCode/evaluation_results/rainstorm_ts_single_fuxi \
-  --model FengQing=/workspace/szwCode/evaluation_results/rainstorm_ts_single_fengqing \
-  --model Tongyun=/workspace/szwCode/evaluation_results/rainstorm_ts_single_tongyun \
+  --model FGVP=/workspace/data/shenzw/evaluation_results/rainstorm_ts_single_fgvp \
+  --model AIFS=/workspace/data/shenzw/evaluation_results/rainstorm_ts_single_aifs \
+  --model FuXi=/workspace/data/shenzw/evaluation_results/rainstorm_ts_single_fuxi \
+  --model FengQing=/workspace/data/shenzw/evaluation_results/rainstorm_ts_single_fengqing \
+  --model Tongyun=/workspace/data/shenzw/evaluation_results/rainstorm_ts_single_tongyun \
   --process 202503,202521 \
-  --result /workspace/szwCode/evaluation_results/rainstorm_report
+  --result /workspace/data/shenzw/evaluation_results/rainstorm_report
 ```
 
 - `--model NAME=目录` 给的是**产物根**（底下是 `{编号}_24h/` 与 `{编号}_total/`），
   不是单个过程的目录；第一个是主模型，Δ 一律是「主模型 − 第二个」，**Δ 列
   只有一列**——多于两个模型时其余模型只并排列值，胜负计数与改进建议也
-  只针对主模型与第二个；要做两两矩阵就拆成多份报告；
+  只针对主模型与第二个；**第二节两张挑选表不设 Δ 列**（只列各模型 TS，
+  差多少看相邻两列），Δ 只出现在第三节逐日 / 等级表与第四节汇总表；
+  要做两两矩阵就拆成多份报告；
 - `--process` **必给**（逗号分隔的过程编号）。先跑
   `scripts/render_rainstorm_summary.py` 拿全 43 个过程的两口径宽表，照着挑要详析哪几个。
 
@@ -309,6 +312,84 @@ python skills/xmetai-evaluation/scripts/render_rainstorm_report.py \
 挑中一段对方根本没有的过程，第三节那个块里 Δ 整列都是「缺」，白占一节。
 另外挑的过程要**两个口径都排得靠前**、且**两个方向都覆盖到**
 （有主模型赢的、也有对比模型赢的），否则报告只证明了一件事。
+
+### 第 4 步之后（暴雨个例专用）· 问要不要降水空间分布图
+
+评测产物里只有站点列联表，**画不出落区**；但预报的 6h nc 和 ERA5 store 都在服务器上，
+能另算 24h 累计场。所以 `REPORT.md` 出完后**主动问一句**，不要默认不出：
+
+| 选项 | 含义 |
+|---|---|
+| **1 张（推荐）** | 只给最好的过程，报告不至于变成图册 |
+| **2 张** | 最好 + 最差，形成对照 |
+| **全部** | `--process` 里每个过程一张 |
+| **不要** | 维持现状 |
+
+「最好 / 最差」按**主模型口径 A 汇总 TS（≥25mm）**在 `--process` 里排序，也就是报告
+§3.x.2 小结里那个汇总值（= 图 1 的柱高）；别拿口径 B 的值混着排。
+
+**数量选定后，两种口径的图一起出**（用户 2026-10-27 定）：每个入选过程给
+一张口径 A 的 24h 逐日落区动图 + 一张 S 单起报的全过程累积**示意**单帧图，
+别只出 A。只出 A 属于漏做，要补上 B。⚠ 2026-10-28 起口径 B **不再评累积总量**，
+那张累积图只用来认整段落区、不参与任何 TS，图注里要写明。
+
+选定后按三步走。**第 ① 步在服务器上执行，动手前先把确切命令贴出来等用户点头**；
+用户明确说「你跑」之后再 `ssh xay-editor` 执行（只读检查与用户点名要的下载不必再问）：
+
+```bash
+# ① 服务器：一个过程一个目录；起报日 = 过程起止的 S … E（UTC 整日口径，编目见 configs/rainstorm_ts_single_base.py）
+cd /workspace/szwCode/xmetai-evalation-v2
+python3 skills/xmetai-evaluation/scripts/extract_rainstorm_spatial.py \
+  --process 202510 --model Tongyun \
+  --init-days 20250527,20250528,20250529 \
+  --forecast-root /workspace/data/shenzw/tongyun_single \
+  --era-store /workspace/data/liujunjie/era5_foundation_store2/era5_sfc_2025.01-2026.07.c15.p25.h6.zarr \
+  --out /workspace/data/shenzw/rainstorm_spatial/202510
+
+# ①b 全过程累积**示意**场（与 ① 一起跑，默认都要；不参与评分）——只取 S 一根起报，
+#     步数 = 窗长/6；窗长（h）= rainstorm_ts_single_base.window_days(编号) × 24 = N 天
+#     202510 是 72h → 12 步；202514 是 168h → 28 步
+python3 skills/xmetai-evaluation/scripts/extract_rainstorm_spatial.py \
+  --process 202510 --model Tongyun --steps 12 \
+  --init-days 20250527 \
+  --forecast-root /workspace/data/shenzw/tongyun_single \
+  --era-store /workspace/data/liujunjie/era5_foundation_store2/era5_sfc_2025.01-2026.07.c15.p25.h6.zarr \
+  --out /workspace/data/shenzw/rainstorm_spatial_total/202510
+
+# ② 本地：拉回场目录（用户已点名要这张图，不必再逐条问）
+scp -r xay-editor:/workspace/data/shenzw/rainstorm_spatial/202510 \
+       report/rainstorm_spatial/202510
+scp -r xay-editor:/workspace/data/shenzw/rainstorm_spatial_total/202510 \
+       report/rainstorm_spatial_total/202510
+
+# ③ 本地：重出报告，把场目录交给 --spatial / --spatial-total（每个过程一条，可重复）
+python skills/xmetai-evaluation/scripts/render_rainstorm_report.py ...同上 --model/--process... \
+  --spatial 202510=report/rainstorm_spatial/202510 \
+  --spatial-total 202510=report/rainstorm_spatial_total/202510 \
+  --result report/rainstorm_case
+```
+
+- 服务器上那份仓库**不会自动更新**：跑之前先同步（`wsl.exe -d Ubuntu -- bash -lc '~/xay-sync.sh'`，
+  无 `--delete`、末尾收敛检查 0 行），再 `ls skills/xmetai-evaluation/scripts/extract_rainstorm_spatial.py`
+  确认脚本到位；
+- `--init-days` **必须**是过程起止日的 `S` 到 `E`（含两端），正好是口径 A 的起报日；
+  少一天图里就少一列，多一天会和评估窗对不上；
+- **目前只接了 Tongyun 的 6h nc 根目录**（`/workspace/data/shenzw/tongyun_single`）。
+  主模型是别的模型时，先确认它有没有同样的 `<起报日>/00N.nc` 布局；没有就如实说
+  「这张图只能画 Tongyun」，**别在图注里冒充主模型**；
+- 图自动插在该过程 §3.x.1 之后，**图号全报告连续重排**（后面的「图 N」会一起变），
+  不要手改插入位置；第六节第 8 条也会自动从「本报告不含降水空间分布」改成
+  「只覆盖这几个过程」；
+- 出的是**动图**：一帧一个 24h 窗（左预报、右 ERA5，逐帧同一时窗对照），
+  900 dpi、每帧停留 1.2 s、循环播放，文件直接和 `REPORT.md` 并排、
+  名叫 `<编号>_spatial.gif`，几 MB 到十几 MB 属正常（GIF 只有 256 色，
+  清晰度全靠分辨率，别再往下调 dpi）；
+- 累积那张（`--spatial-total`，**标准流程必出**，和 A 一起）是**单帧 GIF**：只有 S 一根起报的
+  全过程累积场（**示意，不评分**），色标同样用中央气象台雨量六档配色、边界放大 4 倍（0–40–100–200–400–1000 mm），跟 A 的动图同尺寸、同版式，插在它后面；
+  它的目录**必须只有一个起报日**，多起报日的目录是口径 A 的逐日场，传错会报错；
+  B 要求单独抽一遍场（步数按窗长给，别沿用 A 的 4 步）。
+- **这一步必须赶在第 5 步之前做完**：重出报告会重写 `REPORT.md`，第 5 步里
+  手写的分析段会被整段冲掉。先问、先拉图、先重出，再补分析。
 
 ### 第 5 步 · 补写第 4 章分析段（渲染器不出这一段）
 
@@ -362,7 +443,7 @@ bad = frame[abs((frame["a"] - frame["b"]) - frame["delta"]) > 1e-6]
 | `manifest.json 不存在` | 用户给的目录不是产物目录（**当前结果目录必然撞这条**，见第 4 步的现状） |
 | `出图需要 matplotlib` | 环境没装：`pip install -e .[viz]` |
 | `... 下既没有 {编号}_24h/ 也没有 {编号}_total/` | 给的不是暴雨过程个例的产物根——该给 `rainstorm_ts_single_*` 配置的 `OUTPUT_ROOT`，不是单个过程的产物目录 |
-| `过程编号 '...' 不在编目里` | `--process` 写错了；有效范围 202501–202543，全表见 `rainstorm_catalog.py` |
+| `过程编号 '...' 不在编目里` | `--process` 写错了；有效范围 202501–202543，全表见 `configs/rainstorm_ts_single_base.py` |
 | `至少要两个模型` / `模型名重复` | 对比报告至少要两份产物、且名字不能撞（同名会让表格列对不上号） |
 
 ---
@@ -435,6 +516,10 @@ python skills/xmetai-evaluation/scripts/render_ens_report.py ... \
 > 别把 +24 h 那张近乎全白的差值图读成"模型完美"——它是月平均偏差，
 > 随机误差不在这里体现。单月只有 30 来个样本，单格点红蓝斑点多是噪声，
 > 读图只看 20° 以上的成片结构。
+
+**暴雨个例的降水空间分布走另一条链**（不是这里的月度连续场）：先问用户要几张，
+再 `extract_rainstorm_spatial.py` 出 24h 累计 tp 场，下载后交给报告入口的
+`--spatial 编号=目录`，图插在 §3.x.1 后面。完整步骤见工作流「第 4 步之后」。
 
 ---
 
@@ -513,31 +598,37 @@ python skills/xmetai-evaluation/scripts/generate_typhoon_report.py \
 > **暴雨过程个例（`rainstorm_case.md`）是唯一的例外：流水线相同、渲染器不同。**
 > 它的每段产物 `pipeline` 也是 `weather_ts_det`，表结构也和 TS 系列一样，
 > 但**产物数量级和分节方式都不是一回事**——一次评测 = 43 个过程 × 2 种口径 =
-> 255 段独立产物，而 `ts_report.py` 假定"一次连续时段评测、一张宽表"，
+> 212 段独立产物（口径 A 每个 UTC 日一段，口径 B 每过程一段），而
+> `ts_report.py` 假定"一次连续时段评测、一张宽表"，
 > 结构上就吃不下。所以它走独立的 `rainstorm_report.py` + `rainstorm_plots.py`，
 > 报告**按过程分节**而不是按时效分节，入口是
 > `scripts/render_rainstorm_report.py`（`--model NAME=目录` ≥2 份，
 > `--process` **必给**）。
 >
-> **两种口径互不可比**，报告里两套数分节呈现、只在同一口径内跨模型比：
-> 口径 A（逐日 24h，`{编号}_24h/{起报日}/`）一天一个 08–08 窗、基准率随每日实况浮动；
-> 口径 B（过程累积，`{编号}_total/`）一根预报累加整段、基准率显著更高。
-> 同一个过程的 TS 在两者之间可以差好几倍（实测 202503：≥25mm 口径 A 汇总 0.236、
-> 过程累积 0.313），跨口径比大小没有意义。
+> **两种口径评的是同一批 24h 窗，但预报样本不同**（2026-10-28 改）：
+> 口径 A（逐日 24h，`{编号}_24h/{起报日}/`）每个 UTC 日换一根 00UTC 起报、评 0–24h，
+> 共有 N = E−S+1 个起报日；
+> 口径 B（`{编号}_total/`）**只在过程起点 S 00UTC 起报一根**，逐日各评一次 24h
+> （lead 24/48/…/N×24），**不再把多日雨量累加成一个总量**。两套数分节呈现、不混算，
+> A 与 B 的差就是「每天更新起报」与「一根起报报到底」的差。
+> ⚠ 目录名 `{编号}_total/` 是沿用老产物路径，含义已不是「过程总量」。
 >
-> **口径 A 的过程级数值是「汇总重算」**：把该过程各起报日的
-> hits / misses / false_alarms 加总后按定义再算一次 TS，**不是**各起报日 TS 的
-> 算术平均——TS 是比率，简单平均会让只报出十几个站、TS 恰好为 0 的起报日与
-> 事件上千的起报日等权。渲染器的 `daily_pooled`、`render_rainstorm_summary.py` 的
-> `pooled_ts` 都是这个定义，改动要两头一起动。
+> **两个口径的过程级数值都是「汇总重算」**：把该口径内全部 24h 窗（A 是各起报日、
+> B 是同一根起报的各 lead）的 hits / misses / false_alarms 加总后按定义再算一次 TS，
+> **不是**逐窗 TS 的算术平均——TS 是比率，简单平均会让只报出十几个站、TS 恰好为 0
+> 的窗与事件上千的窗等权。渲染器的 `daily_pooled` / `total_value`、
+> `render_rainstorm_summary.py` 用的都是这个定义，改动要两头一起动。
 > 注意 `scores.csv` 里**没有**四格表计数，只有 `diagnostics/categorical_wide.csv`
 > 有，所以做这个汇总必须读后者。
 >
 > 过程编目（编号 → 起止 / 等级）的**真值在主仓库**
-> `xmetai_evaluation/rainstorm_catalog.py`，评测配置、`render_rainstorm_summary.py`
+> `xmetai_evaluation/configs/rainstorm_ts_single_base.py`，评测配置、`render_rainstorm_summary.py`
 > 与渲染器都 import 它；改纪要表改那一份，别在别处再抄一遍。
 >
-> 它**不出降水空间分布**——产物里只有站点列联表的聚合统计，没有逐站或逐格降水量。
+> **评测产物本身不含落区**——只有站点列联表的聚合统计，没有逐站或逐格降水量。
+> 要降水空间分布图得另走「第 4 步之后」，用预报 nc + ERA5 store 重算 24h 累计场
+> （另加一张整段累积**示意**场），再把目录交给 `--spatial` / `--spatial-total`；
+> 那张图不进任何评分。
 
 ---
 
@@ -550,8 +641,8 @@ report/<模型>_<批次>/
   overall_heatmap.svg       图 1   总体指标热力图（列 = 指标，列内批内归一化）
   metrics_at_lead.svg       图 2   基准时效各等级 TS / POD / FAR / BIAS 分组柱
   ts_vs_lead.svg            图 3   分等级 TS 随时效（小多图，纵轴自适应）
-  pod_vs_lead.svg           图 4   分等级 POD 随时效（纵轴 0–1）
-  far_vs_lead.svg           图 5   分等级 FAR 随时效（纵轴 0–1）
+  pod_vs_lead.svg           图 4   分等级 POD 随时效（每格纵轴自适应）
+  far_vs_lead.svg           图 5   分等级 FAR 随时效（每格纵轴自适应）
   bias_vs_lead.svg          图 6   分等级 BIAS 随时效（虚线 =1）
   ts_boxplot.svg            图 7   各模型 TS 的跨时效分布
   performance_diagram.svg   图 8   性能图（POD vs 1−FAR，多模型同图）
@@ -564,8 +655,9 @@ report/<模型>_<批次>/
 
 > **全部图都是 SVG**（`fig.savefig(path)` 按后缀走），文件名不带窗口/时效前缀——
 > 窗口与基准时效只写在报告正文与图注里。
-> 多模型对比**画绝对值 + 自适应纵轴**（`ts_vs_lead` 的 `zoom_y=True`）：几个模型
-> 水平接近时锁 0–1 会把差异压成一条带，绝对数值由 4.1 / 5 节的表负责。
+> 多模型对比**画绝对值 + 小多图每格各自取纵轴**：几个模型水平接近、或高等级那几格
+> 数据只有 0.0x 时，锁 0–1 会把曲线压成一条带；刻度随之细到 0.1/0.05 一档，
+> 绝对数值由 4.1 / 5 节的表负责。
 > **图内一律英文**（轴、标题、图例、等级标签），图例单行放底部、子图上角标 `(a)`–`(f)`；
 > 模型名也是 ASCII（如 `FengQing`）——中文名会让不在中文字体环境里的读者看到方块。
 > 差值图已经撤掉——领先者与差值在同一条曲线上一眼可读，再画一张只会重复。
@@ -632,13 +724,23 @@ REPORT.md
 **C. 暴雨过程个例**（`render_rainstorm_report.py`，`--result` 目录下）：
 
 ```
-figures/process_overview_daily.png             43 个过程的口径 A 汇总 TS 分组条形，按主模型降序
-figures/process_overview.png                   43 个过程的过程累积 TS 分组条形，按主模型降序
-figures/<编号>_daily_ts.png                    单个过程的逐日 24h TS，按等级分面、每模型一条线
-figures/<编号>_threshold_ts.png                单个过程的累积 TS 按等级分组条形
-figures/caliber_scatter.png                    逐过程散点：横轴口径 A 汇总 / 纵轴口径 B 累积
+process_overview_daily.svg             43 个过程的口径 A 汇总 TS 分组条形，按主模型降序
+process_overview.svg                   43 个过程的单起报逐日汇总 TS 分组条形，按主模型降序
+<编号>_daily_ts.svg                    单个过程的逐日 24h TS，按等级分面、每模型一条线
+<编号>_threshold_ts.svg                单个过程的单起报逐日汇总 TS 按等级分组条形
+caliber_scatter.svg                    逐过程散点：横轴口径 A 汇总 / 纵轴口径 B 汇总
+<编号>_spatial.gif                     可选：24h 累计降水落区动图（左预报 / 右 ERA5，
+                                       一帧一个 24h 窗，色标 0–10–25–50–100–250 mm），
+                                       只有 --spatial 给到的过程才有
+<编号>_spatial_total.gif               全过程累积**示意**落区图（S 单起报、单帧 GIF，
+                                       色标边界放大 4 倍：0–40–100–200–400–1000 mm；
+                                       不参与评分），与上面的 A 动图**成对出**，
+                                       由 --spatial-total 触发
 REPORT.md
 ```
+
+图**不套 ``figures/`` 子目录**，和 ``REPORT.md`` 并排放；除降水空间分布是
+GIF 动图外，其余一律 SVG（矢量可缩放），正文里都是相对路径引用。
 
 `REPORT.md` 按**过程**分节（不是按时效）：
 
@@ -648,13 +750,15 @@ REPORT.md
 二、过程清单与挑选依据  表 1 / 表 2（全 43 个过程 × 两个口径的宽表）
                       + 图 1（口径 A）/ 图 2（口径 B）两张全过程柱状图 → 小结
 三、逐过程分析         每个过程一个块，块含四个小节：
-  3.x.1 过程概况         起报日数、窗长、各口径有效配对数
+  3.x.1 过程概况         起报日数、口径 B 逐日窗数、各口径有效配对数
   3.x.2 口径 A 逐日 24h   表（逐日原值）+ 图 → 小结（小结报的是汇总值）
-  3.x.3 口径 B 过程累积   表 + 图 → 小结
+  3.x.3 口径 B 单起报逐日  表（按 lead 逐日原值）+ 汇总表 + 图 → 小结
   3.x.4 过程小结         两个口径的名次是否一致
 四、跨过程综合对比      表（九项指标等权平均，**逐行只取各模型都有有效值的过程**）+ 图（散点）→ 小结
 五、改进建议           每条挂到一个具体数字或过程编号
-六、口径与注意事项      十条，含"跨模型汇总只比同一批过程""本报告不含降水空间分布"
+六、口径与注意事项      十条，含"跨模型汇总只比同一批过程"；第 8 条随
+                      --spatial 变：不出图时写"本报告不含降水空间分布"，
+                      出图时改写成"只覆盖这几个过程、不参与任何 TS"
 ```
 
 > **第三节的块数量 = `--process` 给的编号个数**，块内的表号、图号**跨块连续不重置**。
@@ -742,9 +846,10 @@ REPORT.md
 | 用户要的季节/纬度带上，长表里没有现成一列 | 季节从 `init_time` 推（§6.2）；纬度带本来就有 `region` 列（空 = 全球）。两者都不需要改评测配置 |
 | 用户要"降水个例分析"但没说看哪几个过程 | 先跑 `render_rainstorm_summary.py`（43 个过程 × 两口径 × N 模型的挑过程总表 + 排序参考），**读它的 `summary_long.csv` 挑**；**`--process` 必给**，43 个全出会变成一本册子 |
 | 几个产物根的**过程覆盖不一样** | 跨模型汇总的 Δ 就不是同分母相减（实测差一倍）。渲染器已按「只用各模型都有有效值的过程」算，表题会给出该批过程数；转述时要说明，别把 Δ 当纯模型差异 |
-| 用户想比"这个过程的 TS"，但两个数一个 0.21 一个 0.61 | 那是**两种口径**（逐日 24h 汇总 / 过程累积），基准率不同，**互不可比**——先问清看哪个口径，或两个都出、分节呈现 |
-| 用户说口径 A 的每过程值应当"把所有报的 hit 汇到一起重算"，而产物/脚本给的是逐日平均 | 用户是对的：TS 是比率，平均比率会被小样本日拖偏。渲染器用 `daily_pooled`、`render_rainstorm_summary.py` 用 `pooled_ts`，两处定义必须一致；`scores.csv` 没有四格表计数，得读 `diagnostics/categorical_wide.csv` |
-| 降水个例报告里没有落区图 | **不是漏做**。产物里只有站点列联表的聚合统计（hits / misses / false_alarms / n_pairs / TS…），没有逐站或逐格降水量，画不出实况场也画不出差值场；要看落区得回头读原始预报 nc 与站点报文 |
+| 用户想比"这个过程的 TS"，但两个数一个 0.21 一个 0.61 | 那是**两种口径**（每日换新起报的 24h 汇总 / S 单起报逐日汇总），预报样本不同、**不可相减**——先问清看哪个口径，或两个都出、分节呈现 |
+| 用户说口径 A 的每过程值应当"把所有报的 hit 汇到一起重算"，而产物/脚本给的是逐日平均 | 用户是对的：TS 是比率，平均比率会被小样本日拖偏。渲染器用 `daily_pooled` / `total_value`、`render_rainstorm_summary.py` 用同一套函数，两处定义必须一致；`scores.csv` 没有四格表计数，得读 `diagnostics/categorical_wide.csv` |
+| 用户问"口径 B 为什么不是把几天雨加起来算一次" | 2026-10-28 起**口径 B 已改成单起报逐日各评 24h**，不再累加总量：累加会把「8 天每天 8mm」和「1 天 60mm」记成同一次事件。`{编号}_total/` 目录名沿用老路径，别按名字理解 |
+| 降水个例报告里没有落区图 | 评测产物里**没有格点场**（只有站点列联表），默认画不出；要落区就按「第 4 步之后」走 `extract_rainstorm_spatial.py` → 下载 → `--spatial` 重出报告。**出报告时本来就该先问用户要不要**，别等用户回头问 |
 | 用户说"202519 和 202520 数字一模一样，是不是重复了" | 纪要表把同一时段的两个侧面分列两条，**各评各的、不合并**，数字相同属正常（编目模块的 docstring 里记着这条） |
 | 用户要连续场的空间分布图 | 走「空间分布图」：先问起报月、档案根目录（确定性 / 集合）、模型名；服务器跑 `extract_spatial_distribution.py` 或 `..._ens.py`，CSV 下载到本地后跑 `render_spatial_distribution.py`（只出 SVG），或直接 `--spatial-csv` 交给报告入口 |
 
@@ -797,7 +902,7 @@ REPORT.md
   `scripts/generate_typhoon_report.py` 只做入口。
   改能力改主仓库——那里能被 pytest 覆盖。
   规则与代码的对应关系写在 references 里，**冲突时以代码为准**。
-- **过程编目只有一份真值**：`xmetai_evaluation/rainstorm_catalog.py`
+- **过程编目只有一份真值**：`xmetai_evaluation/configs/rainstorm_ts_single_base.py`
   （编号 → 起止 / 等级，43 条）。评测配置 `configs/rainstorm_ts_single_*`、
   `scripts/render_rainstorm_summary.py`、渲染器全都 import 它。
   历史上这个过程表在配置文件与汇总脚本里各抄了一份，改一头另一头不跟着动——

@@ -47,7 +47,7 @@ cfg = EvalConfig(
 
     output_dir=os.environ.get(
         "EVAL_OUTPUT",
-        "/workspace/szwCode/evaluation_results/weather_typhoon_single_fuxi",
+        "/workspace/data/shenzw/evaluation_results/weather_typhoon_single_fuxi",
     ),
     log_level="INFO",
 

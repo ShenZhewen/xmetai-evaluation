@@ -28,7 +28,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 from matplotlib.patches import Patch
-from matplotlib.ticker import MultipleLocator
+from matplotlib.ticker import MaxNLocator, MultipleLocator
 
 from xmetai_evaluation.visualization.style import (
     CMAP_SEQ,
@@ -157,6 +157,59 @@ def lead_ticks(leads: Sequence[float], max_ticks: int = 5) -> List[float]:
         return values
     indices = np.round(np.linspace(0, len(values) - 1, max_ticks)).astype(int)
     return [values[index] for index in dict.fromkeys(indices)]
+
+
+#: 子图标题 ``(a) ≥10 mm`` 与坐标框上沿的间距（pt，默认只有 6）。
+#: 贴着框线时标题像是上边框的注记，拉开一点才像这一格自己的标题。
+_TITLE_PAD = 12.0
+
+
+def _fit_y_axis(
+    ax,
+    values,
+    *,
+    zero_base: bool = False,
+    reference: Optional[float] = None,
+    nbins: int = 6,
+) -> None:
+    """让这一格按**自己的**数据取纵轴，并把刻度细化到 1/2/2.5/5 系。
+
+    多等级指标的量级差得远（≥0.1mm 的 TS 约 0.5、≥100mm 只有 0.02），共享一根
+    0–1 的轴会把高等级那几格压成紧贴横轴的一条线；各格自带纵轴后，每格都能
+    看清模型间的高低。刻度由 ``MaxNLocator`` 在 1/2/2.5/5 倍率里挑，不再固定
+    0.25 ——数据范围小时自动细到 0.05。
+
+    Args:
+        values: 本格要画的全部数值（各模型 × 各时效），None / NaN 跳过。
+        zero_base: 柱状图必须从 0 起，传 True；折线图传 False，下界跟着数据走。
+        reference: 参考线（BIAS 的 1.0）。只有它离数据不超过一个数据跨度时才拉进
+            视野——数据整体贴着 0 的格子（≥50/≥100mm）不会为了够到 1.0 又被压扁。
+        nbins: 期望的刻度个数；实际间隔由 ``MaxNLocator`` 取整。
+    """
+    clean: List[float] = []
+    for value in values:
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            continue
+        if np.isfinite(number):
+            clean.append(number)
+    if not clean:
+        return
+    low, high = min(clean), max(clean)
+    span = high - low
+    if reference is not None and low - span <= reference <= high + span:
+        low, high = min(low, reference), max(high, reference)
+        span = high - low
+    pad = 0.12 * span if span > 0 else max(abs(high) * 0.05, 0.02)
+    lower = 0.0 if zero_base else low - pad
+    # 非负指标（TS/POD/FAR/BIAS/AROC）不画出负半轴；BSS 可以为负，照常留余量。
+    if not zero_base and low >= 0:
+        lower = max(0.0, lower)
+    ax.set_ylim(lower, high + pad)
+    ax.yaxis.set_major_locator(
+        MaxNLocator(nbins=nbins, steps=[1, 2, 2.5, 5], min_n_ticks=3)
+    )
 
 
 class PrecipitationPlotter:
@@ -582,14 +635,15 @@ class PrecipitationPlotter:
         model_dfs: Dict[str, pd.DataFrame],
         lead_h: float,
         metrics: Sequence[str] = ("TS", "POD", "FAR", "BIAS"),
-        figsize: Tuple[float, float] = (12, 7.2),
+        figsize: Tuple[float, float] = (12, 8.6),
         save_path: Optional[Path] = None,
     ):
         """固定时效上的分等级指标对比：一个指标一个子图、每格一组柱。
 
         柱按模型着色（与箱线图、差值图同一份配色），横轴是降水等级。
-        ``TS`` / ``POD`` / ``FAR`` 锁 0–1，``BIAS`` 自适应并画 ``=1`` 虚线——
-        BIAS 永远不截断，截断就是在藏高报/漏报。
+        每格纵轴按本格数据取上界（柱状图一律 0 起），刻度细到 0.1 一档；
+        ``BIAS`` 另画 ``=1`` 虚线并把它留在视野里——BIAS 永远不截断，
+        截断就是在藏高报/漏报。
 
         宽度取 12 in（与其他多模型图同一档），字号随之落在 17/20 pt；
         子图标题左对齐并带 ``(a)(b)…`` 面板号，每个子图各自标 y 轴。
@@ -621,6 +675,7 @@ class PrecipitationPlotter:
 
         for index, metric in enumerate(available):
             ax = axes[index]
+            panel_values: List[float] = []
             for model_index, name in enumerate(names):
                 frame = prepared[name]
                 if metric not in frame.columns:
@@ -631,6 +686,7 @@ class PrecipitationPlotter:
                     float(series[grade]) if grade in series.index else np.nan
                     for grade in grades
                 ]
+                panel_values.extend(v for v in values if np.isfinite(v))
                 ax.bar(
                     positions + (model_index - (len(names) - 1) / 2) * bar_width,
                     values,
@@ -647,19 +703,21 @@ class PrecipitationPlotter:
             # 与轴标签同号（都是 20 pt）时四行标题会抢走视线。
             ax.set_title(
                 f"({chr(ord('a') + index)}) {metric} at {lead_h:g}h",
-                loc="left", fontsize=round(sizes["title"] * 0.85),
+                loc="left", fontsize=round(sizes["title"] * 0.85), pad=_TITLE_PAD,
             )
             ax.set_xlabel("Rain grade", fontsize=sizes["label"])
             ax.set_ylabel(metric, fontsize=sizes["label"])
             for side in ("top", "right"):
                 ax.spines[side].set_visible(False)
-            if metric in ("TS", "POD", "FAR", "漏报率"):
-                ax.set_ylim(0, 1)
-            elif metric == "BIAS":
+            if metric == "BIAS":
                 ax.axhline(
                     1.0, color=NEUTRAL["reference"], linestyle="--",
                     linewidth=1.0, alpha=0.8,
                 )
+            _fit_y_axis(
+                ax, panel_values, zero_base=True,
+                reference=1.0 if metric == "BIAS" else None,
+            )
         for ax in axes[len(available):]:
             ax.axis("off")
         handles, labels = axes[0].get_legend_handles_labels()
@@ -673,9 +731,9 @@ class PrecipitationPlotter:
             f"Metrics by rain grade at {lead_h:g}h lead",
             fontsize=sizes["suptitle"],
         )
-        # 底行子图自己带 x 轴名，图例再占一条：底部留 17%，否则图例会压到
-        # "Rain grade" 上（8% 只够图例、不够最后一行 x 标签）。
-        bottom = 0.17 if (len(names) > 1 and handles) else 0.0
+        # 底行子图自己带 x 轴名，图例再占一条：底部留 11%（按 8.6 in 高算约
+        # 0.95 in，刚好够图例 + 最后一行 x 标签，比原先的 17% 少一截空白）。
+        bottom = 0.11 if (len(names) > 1 and handles) else 0.0
         fig.tight_layout(rect=(0, bottom, 1, 0.95))
         self._save(fig, save_path)
         return fig
@@ -684,18 +742,17 @@ class PrecipitationPlotter:
         self,
         model_dfs: Dict[str, pd.DataFrame],
         metric: str = "TS",
-        figsize: Tuple[float, float] = (12, 7.2),
+        figsize: Tuple[float, float] = (12, 8.6),
         save_path: Optional[Path] = None,
-        zoom_y: bool = False,
     ):
         """**一个指标**随时效变化：每个降水等级一个子图，每个模型一条**实线**。
 
         报告里 TS / POD / FAR / BIAS 各出一张（不再把三个误差指标挤进一张矩阵图）。
         图内文字一律英文（交付件要能直接进英文文档）。子图标题左对齐、带
         ``(a)``–``(f)`` 面板号；每个子图都标 x 轴（最多 6 个等距采样时效，
-        见 :func:`lead_ticks`）和 ``Lead time (h)``，y 轴各自标指标名，不靠总标题。``BIAS`` 画 ``=1``
-        虚线，``TS`` / ``POD`` / ``FAR`` 锁 0–1（``zoom_y=True`` 时 TS 按各子图
-        数据范围自适应，便于分辨模型间差异）。
+        见 :func:`lead_ticks`）和 ``Lead time (h)``，y 轴各自标指标名，不靠总标题。
+        每格纵轴按本格数据自适应（高等级那几格不再被 0–1 的共用轴压扁），
+        刻度细到 0.1/0.05 一档；``BIAS`` 始终把 ``=1`` 虚线留在视野里。
         """
         prepared = {name: prepare_ts_dataframe(frame) for name, frame in model_dfs.items()}
         names = list(prepared)
@@ -711,15 +768,17 @@ class PrecipitationPlotter:
         rows = int(np.ceil(len(grades) / columns))
         width = snap_width(figsize[0])
         sizes = font_sizes(width)
+        # 纵轴不共享：每个等级的量级差得多，各格按自己的数据取范围。
         fig, axes = plt.subplots(
             rows, columns, figsize=(width, float(figsize[1])),
-            sharex=True, sharey=not zoom_y, squeeze=False,
+            sharex=True, squeeze=False,
         )
         axes = axes.ravel()
         colors = model_colors(names)
 
         for index, grade in enumerate(grades):
             ax = axes[index]
+            panel_values: List[float] = []
             for name in names:
                 frame = prepared[name]
                 if metric not in frame.columns:
@@ -728,6 +787,7 @@ class PrecipitationPlotter:
                 values = pd.to_numeric(subset[metric], errors="coerce")
                 if subset.empty or not values.notna().any():
                     continue
+                panel_values.extend(float(v) for v in values if np.isfinite(v))
                 ax.plot(
                     subset["lead_h"], values,
                     marker="o", markersize=4, markevery=2, linewidth=1.8,
@@ -735,7 +795,7 @@ class PrecipitationPlotter:
                 )
             ax.set_title(
                 f"({chr(ord('a') + index)}) {grade} mm",
-                loc="left", fontsize=sizes["title"],
+                loc="left", fontsize=sizes["title"], pad=_TITLE_PAD,
             )
             ax.set_ylabel(metric, fontsize=sizes["label"])
             ax.tick_params(labelsize=sizes["tick"])
@@ -746,8 +806,9 @@ class PrecipitationPlotter:
                     1.0, color=NEUTRAL["reference"], linestyle="--",
                     linewidth=1.0, alpha=0.8,
                 )
-            elif metric in ("TS", "POD", "FAR", "漏报率"):
-                ax.set_ylim(0, 1)
+            _fit_y_axis(
+                ax, panel_values, reference=1.0 if metric == "BIAS" else None,
+            )
         for ax in axes[len(grades):]:
             ax.axis("off")
 
@@ -1053,16 +1114,14 @@ class PrecipitationPlotter:
         plt.close("all")
         artifacts["metrics_at_lead"] = path
 
-        # TS / POD / FAR / BIAS 各一张，报告第 4 章各占一节。TS 用自适应纵轴：
-        # 几个模型水平接近时，锁 0–1 会把差异压成一条带；绝对水平由报告里的表负责。
+        # TS / POD / FAR / BIAS 各一张，报告第 4 章各占一节。每张图里各子图都按
+        # 本格数据取自适应纵轴：锁 0–1 会把高等级那几格压成贴横轴的一条线。
         for metric in ("TS", "POD", "FAR", "BIAS"):
             if not any(metric in frame.columns for frame in box_models.values()):
                 continue
             key = f"{metric.lower()}_vs_lead"
             path = output_dir / f"{key}.svg"
-            self.plot_metric_vs_lead(
-                box_models, metric=metric, zoom_y=(metric == "TS"), save_path=path,
-            )
+            self.plot_metric_vs_lead(box_models, metric=metric, save_path=path)
             plt.close("all")
             artifacts[key] = path
 
@@ -1263,7 +1322,7 @@ class PrecipitationPlotter:
         model_dfs: Dict[str, pd.DataFrame],
         *,
         metric: str = "AROC",
-        figsize: Tuple[int, int] = (12, 9.8),
+        figsize: Tuple[int, int] = (12, 11.2),
         save_path: Optional[Path] = None,
     ):
         """**一个**概率指标（``AROC`` 或 ``BSS``）随时效变化——2×2 面板，一格一个阈值。
@@ -1278,9 +1337,10 @@ class PrecipitationPlotter:
         每个只有 ~2.6 in 宽，曲线挤成一条带；2×2 里每格接近 5 in，横轴和纵轴
         都拉得开，阈值间差异才看得出。
 
-        AROC 纵轴从**各模型各阈值的共同最低值稍下一点**起（动态下界，不会裁数据），
-        刻度每 0.1 一格；BSS 一律自适应——它是"相对气候基准的技巧"，负多少都有可能，
-        固定下界就是在藏坏消息。
+        每个阈值面板的纵轴**各自**按本格数据取范围（上下各留 12%，非负指标不画
+        负半轴），刻度由 ``MaxNLocator`` 在 1/2/2.5/5 倍率里挑——四档阈值之间
+        技巧水平差得多，共用一个下界会把高阈值那两格压在底部。BSS 可以为负，
+        负半轴照常保留，不截断。
 
         所有模型一律实线，靠颜色和圆点区分；虚线/点划线在 2×2 小面板里容易看花。
 
@@ -1322,10 +1382,10 @@ class PrecipitationPlotter:
             ax.axis("off")
         colors = model_colors(list(prepared))
 
-        plotted_values: List[pd.Series] = []
         for column, grade in enumerate(grades):
             ax = panels[column]
             row, col = divmod(column, ncols)
+            panel_values: List[float] = []
             for name, frame in prepared.items():
                 if metric not in frame.columns:
                     continue
@@ -1333,7 +1393,7 @@ class PrecipitationPlotter:
                 values = pd.to_numeric(subset[metric], errors="coerce")
                 if subset.empty or not values.notna().any():
                     continue
-                plotted_values.append(values)
+                panel_values.extend(float(v) for v in values if np.isfinite(v))
                 ax.plot(
                     subset["lead_h"], values,
                     marker="o", markersize=4, markevery=2, linewidth=1.8,
@@ -1342,8 +1402,9 @@ class PrecipitationPlotter:
                 )
             ax.set_title(
                 f"({chr(ord('a') + column)}) {grade} mm",
-                loc="left", fontsize=sizes["title"],
+                loc="left", fontsize=sizes["title"], pad=_TITLE_PAD,
             )
+            _fit_y_axis(ax, panel_values)
             # 轴名只放在左列 / 末行：2×2 里每格都写一遍是重复信息。
             if row == nrows - 1:
                 ax.set_xlabel("Lead time (h)", fontsize=sizes["label"])
@@ -1352,22 +1413,6 @@ class PrecipitationPlotter:
             ax.tick_params(labelsize=sizes["tick"])
             for side in ("top", "right"):
                 ax.spines[side].set_visible(False)
-
-        if metric == "AROC":
-            # 下界跟着数据走：从所有模型、所有阈值里的最低值再往下让 0.02，
-            # 取两位小数向下取整（例如最低 0.534 → 0.51），再留 0.1 的刻度。
-            # 0.25/0.5 这类固定下界在数据整体较高时会把曲线压成一条平带。
-            data_min = min(
-                (float(series.min()) for series in plotted_values if len(series)),
-                default=None,
-            )
-            if data_min is None:
-                lower = 0.25
-            else:
-                lower = max(0.0, float(np.floor((data_min - 0.02) * 100) / 100))
-            for ax in panels[: len(grades)]:
-                ax.set_ylim(lower, 1.0)
-                ax.yaxis.set_major_locator(MultipleLocator(0.1))
 
         # 时效刻度只落在真实采样点上；2×2 每格接近 5 in 宽，
         # 放得下 5 个三位数标签（一横排时只放得下 4 个）。
@@ -1408,8 +1453,9 @@ class PrecipitationPlotter:
                 ncol=min(len(labels), 4),
                 fontsize=sizes["legend"], **LEGEND_FRAME,
             )
-        # 图例在格子里时底部只留 x 轴名；在格子里则不占额外高度。
-        bottom = 0.12 if (handles and not empty) else 0.03
+        # 图例在底部时留 8%（11.2 in 高约 0.9 in，够图例 + x 轴名）；
+        # 图例进了空格子就不占额外高度。
+        bottom = 0.08 if (handles and not empty) else 0.03
         # h_pad / w_pad 都比默认宽，让面板之间留出真正的空白。
         fig.tight_layout(rect=(0, bottom, 1, 1), h_pad=3.0, w_pad=2.0)
         self._save(fig, save_path)

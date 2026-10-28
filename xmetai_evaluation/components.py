@@ -73,7 +73,10 @@ def _gridded_source(
     root = _require_root(params, selected.name)
     return SourceHandle(
         reader=GriddedReader(
-            source_id=source_id, layout=selected, scales=params.get("scales")
+            source_id=source_id,
+            layout=selected,
+            scales=params.get("scales"),
+            since_init_variables=params.get("since_init_variables"),
         ),
         catalog=GriddedCatalog(root, selected),
         config=params,
