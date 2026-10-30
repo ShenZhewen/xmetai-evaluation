@@ -19,7 +19,7 @@ from __future__ import annotations
 
 import math
 from pathlib import Path
-from typing import Dict, Mapping, Optional, Sequence, Tuple
+from typing import Dict, Mapping, Optional, Sequence, Tuple, Union
 
 import matplotlib
 
@@ -436,7 +436,7 @@ class DetPlotter:
         variables: Sequence[str],
         *,
         ylabel: str,
-        ref_line: Optional[float] = None,
+        ref_line: Optional[Union[float, Sequence[float]]] = None,
         ncols: int = 4,
         suptitle: Optional[str] = None,
         save_path: Optional[Path] = None,
@@ -475,6 +475,8 @@ class DetPlotter:
         """一个变量一个子图、一个模型一条线。RMSE / ACC / FA 三张图共用。
 
         ``series_by_model`` 是 ``{模型名: DataFrame}``（index=lead_h、columns=变量）。
+        ``ref_line`` 收单值或一串值，每个值在各子图上画一条虚线（ACC 图同时画
+        0.6 与 1.0，故按 60 / 100 传）。
         字号默认按图宽查 :func:`style.font_sizes`，颜色默认走
         :func:`style.model_colors`，``palette`` / ``color_map`` / ``line_styles`` /
         各 ``*_fontsize`` 只给特殊图覆盖。``zoom_*`` 控制局部放大 inset，
@@ -486,6 +488,12 @@ class DetPlotter:
         variables = [str(v) for v in variables]
         if not variables:
             raise ValueError("variables 是空的，没东西可画")
+        if ref_line is None:
+            ref_lines: Tuple[float, ...] = ()
+        elif isinstance(ref_line, (int, float)):
+            ref_lines = (float(ref_line),)
+        else:
+            ref_lines = tuple(float(value) for value in ref_line)
 
         frames = {str(name): _numeric_frame(frame) for name, frame in series_by_model.items()}
         fallback_colors = (
@@ -547,14 +555,14 @@ class DetPlotter:
                 raise ValueError(f"所有模型都没有变量 {variable!r} 的数据")
             if zoom_y:
                 low, high = plotted_min, plotted_max
-                if ref_line is not None:
-                    low, high = min(low, ref_line), max(high, ref_line)
+                if ref_lines:
+                    low, high = min(low, *ref_lines), max(high, *ref_lines)
                 if math.isfinite(low) and math.isfinite(high):
                     span = high - low
                     pad = span * 0.04 if span > 0 else max(abs(high) * 0.02, 0.05)
                     axis.set_ylim(low - pad, high + pad)
-            if ref_line is not None:
-                axis.axhline(ref_line, color=NEUTRAL["reference"], linestyle="--", linewidth=1.0, alpha=0.8)
+            for value in ref_lines:
+                axis.axhline(value, color=NEUTRAL["reference"], linestyle="--", linewidth=1.0, alpha=0.8)
             if panel_letters:
                 # 面板字母与变量名同一字号、同一字重，整行加粗，不会一大一小。
                 letter = chr(ord("a") + index)
@@ -610,9 +618,9 @@ class DetPlotter:
         # 即使压到曲线也能看清底下是什么。``center_last``（2-2-1）例外：最后
         # 一张子图会横跨两列居中，右上角的空格也会被它压住，图例只能退回图底。
         handles, labels = axes[0].get_legend_handles_labels()
-        if ref_line is not None and ref_line_label is not None:
+        if ref_lines and ref_line_label is not None:
             handles.append(plt.Line2D([], [], color=NEUTRAL["reference"], linestyle="--", linewidth=1.0))
-            labels.append(f"{ref_line_label} = {ref_line:g}")
+            labels.append(f"{ref_line_label} = {' / '.join(f'{value:g}' for value in ref_lines)}")
         unused = list(axes[len(variables):])
         # ``legend_box=True`` 是**强制图底**：即使还有空格也不用，留给后续局部放大图。
         legend_axis = (

@@ -2658,6 +2658,8 @@ def build_ens_report(archives: Sequence[Archive], out_dir: Path, *,
         {name: base.acc_by_lead[name][bundle.acc_variables] for name in names},
         bundle.acc_variables, ylabel="ACC",
         units={var: "%" for var in bundle.acc_variables},
+        # 与确定性报告一致：0.6 门槛线 + 1.0 饱和线，都不进图例。
+        ref_line=(60.0, 100.0), ref_line_label=None,
         save_path=path, **acc_style,
     )
     plt.close("all")

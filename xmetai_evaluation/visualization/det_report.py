@@ -2444,7 +2444,8 @@ def build_det_report(
     plotter.plot_model_panels(
         acc_series, [bundle.acc_variable], ylabel="ACC", ncols=1,
         units={bundle.acc_variable: "%"},
-        ref_line=100.0, ref_line_label=None,
+        # 0.6 是常用的「有效预报」门槛；1.0 是饱和上限，两条都画。
+        ref_line=(60.0, 100.0), ref_line_label=None,
         panel_size=(7.2, 3.6), linewidth=1.8, marker=None,
         zoom_y=True, xlabel="Forecast lead time (h)",
         grid=False, minimal_spines=True,
