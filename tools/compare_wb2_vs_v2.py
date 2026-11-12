@@ -1,36 +1,42 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
-"""WB2 评测结果 × xmetai-evaluation 评测结果：指标一致性对拍工具。
+"""两套评测结果对拍：scores.csv × scores.csv 或 scores.csv × WB2 nc。
 
-用法（本机 / WSL 都可以，路径按各自平台写）：
-    python tools/compare_wb2_vs_v2.py
-    python tools/compare_wb2_vs_v2.py --v2 <目录或 scores.csv> --wb2 <目录> --out tools/report.md
+用法：
+    python tools/compare_wb2_vs_v2.py <A目录> <B目录>
+    python tools/compare_wb2_vs_v2.py <A目录> <B目录> --log-file tools/compare.log
+    python tools/compare_wb2_vs_v2.py <A目录> <B目录> --name-a ts --name-b datakit
+    python tools/compare_wb2_vs_v2.py <A目录> <B目录> --log-file tools/compare.log \\
+            --out tools/compare_A_vs_B.md
 
-输入：
-  1) evaluation 框架产物目录（默认 weather_ts_single_fgvp，需含 scores.csv）
-     长表，一行一个 (变量, 指标, 起报, 时效)。
-  2) WB2 结果目录（TongYun_nc）：
-     - wb2_2022_<var>_deterministic.nc  每文件一个变量，metric=[acc,bias,mae,mse]
-     - wb2_2022_extra.csv               prediction_activity / csi / fss / …
-输出：
-  tools/wb2_vs_v2_report.md
+A/B 支持两种格式（自动识别）：
+  - 含 scores.csv 的目录：evaluation 长表，一行一个 (变量, 指标, 起报, 时效)
+  - 含 *_deterministic.nc 的 WB2 目录（可选 wb2_2022_extra.csv）
 
-检验方式（对应报告里的 T1–T7）：
-  T1 覆盖检查        两边各自有哪些 (变量, 指标)，哪些不可比
-  T2 逐时效数值比对  逐 lead 的相对差 / 绝对差，最大化与中位偏差
-  T3 倍率与量纲推断  中位比值 + 比值变异系数，识别纯单位换算
-  T4 趋势一致性      Pearson / Spearman / 线性拟合 / 归一化 RMSE
-  T5 相对增长曲线    按各自首个时效归一后比形状；跨变量秩相关查串名
-  T6 聚合口径敏感性  逐起报 RMSE 的 mean vs RMS 聚合，看哪个更贴 WB2
-  T7 起报间散布      差异是否小于起报间标准差（批间噪声量级）
+支持组合：
+  - scores.csv × scores.csv
+  - scores.csv × WB2 nc（WB2 放 A 侧会自动交换）
 
-依赖：numpy、pandas、xarray（读 .nc）。
+流程：
+  1. 识别输入格式并读入
+  2. 一致性检查：是否同一模型 / 同一 run / 同一覆盖
+  3. 列出可对表范围：共同变量、共同指标、只在一侧存在的指标
+  4. 逐指标对比：逐时效数值、比值/倍率、趋势
+  5. 附加检查：T5 增长曲线、T6 聚合口径（仅 WB2 模式）、T7 起报散布
+  6. 输出总表
+
+输出：日志默认打印到控制台，给 --log-file 时同时写入该文件（UTF-8）；
+      Markdown 报告默认写在本脚本旁边 compare_<A>_vs_<B>.md，可用 --out 改。
+方向约定：A 为第一参数，B 为第二参数；Δ = A − B，Δ% = (A − B) / |B|。
 """
 from __future__ import annotations
 
 import argparse
+import json
+import logging
 import math
 import re
+import sys
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -42,13 +48,13 @@ import pandas as pd
 # ══════════════════════════════════════════════════════════════════════
 # 可调参数：直接改这里（不用环境变量）
 # ══════════════════════════════════════════════════════════════════════
-# 相对差判定阈值（RMSE / 活跃度等有量纲指标）
+# 相对差判定阈值（RMSE / MAE / 活跃度等有量纲指标）
 TOL_PASS_REL = 0.005     # A 一致 ≤0.5%
 TOL_CLOSE_REL = 0.010    # B 接近 ≤1%
 TOL_MINOR_REL = 0.030    # C 小差 ≤3%
 TOL_MAJOR_REL = 0.100    # D 大差 ≤10%，再大看趋势
 
-# Bias 是近零量，按自身相对差判会爆掉；改用 |Δbias|/RMSE（与下方阈值表一致）
+# Bias 是近零量，按自身相对差判会爆掉；改用 |Δbias|/RMSE
 BIAS_PASS = 0.02
 BIAS_CLOSE = 0.05
 BIAS_MINOR = 0.10
@@ -60,33 +66,41 @@ ACC_ABS_CLOSE = 5e-3
 ACC_ABS_MINOR = 1.5e-2
 ACC_ABS_MAJOR = 3e-2
 
-# 报告里一律用中文；代码内部仍用 ASCII 键
 VERDICT_CN = {
     "PASS": "一致", "CLOSE": "接近", "MINOR": "小差", "MAJOR": "大差",
     "SHAPE": "大差·形状", "MISMATCH": "不一致",
     "SCALE": "倍率", "UNIT": "单位",
 }
-LABEL_CN = {"Activity(forecast)": "活跃度（预报）"}
-VERDICT_ORDER = ["一致", "接近", "小差", "大差", "大差·形状", "倍率", "单位", "不一致"]
+VERDICT_BADGE = {
+    "PASS": "✅ PASS", "CLOSE": "🟢 CLOSE", "MINOR": "🟡 MINOR",
+    "MAJOR": "🟠 MAJOR", "SHAPE": "🟣 SHAPE", "SCALE": "🔵 SCALE",
+    "UNIT": "🔵 UNIT", "MISMATCH": "❌ MISMATCH",
+}
+VERDICT_RANK = {
+    "PASS": 0, "CLOSE": 1, "MINOR": 2, "MAJOR": 3,
+    "SHAPE": 4, "SCALE": 5, "UNIT": 5, "MISMATCH": 6,
+}
 
 OUTLIER_FACTOR = 5.0     # 单时效 |相对差| 超过中位数的 5 倍算异常时效
 CSV_CHUNK = 1_000_000    # scores.csv 分块行数
 
-DEFAULT_V2 = r"D:\weatherbench2\scores\weather_ts_single_fgvp"
-DEFAULT_WB2 = r"D:\weatherbench2\scores\TongYun_nc"
-DEFAULT_OUT = str(Path(__file__).with_name("wb2_vs_v2_report.md"))
-
-# v2 侧聚合哪些指标（其余指标只记 key，用于覆盖检查）
+# 参与标量对表的指标（其余指标如谱/球谐带只做覆盖统计）
 V2_METRICS = {
     "rmse", "bias", "mae", "acc",
     "activity_forecast", "activity_observation",
     "activity_ratio", "activity_bias",
 }
-
-CANON_UNITS = {
-    "z500": "m²/s²", "q700": "kg/kg", "t700": "K", "t850": "K",
-    "t2m": "K", "msl": "Pa", "u850": "m/s", "v850": "m/s",
-    "u10m": "m/s", "v10m": "m/s", "tp": "m",
+COMPARE_ORDER = (
+    "rmse", "acc", "bias", "mae",
+    "activity_forecast", "activity_observation",
+    "activity_ratio", "activity_bias",
+)
+METRIC_LABEL = {
+    "rmse": "RMSE", "acc": "ACC", "bias": "Bias", "mae": "MAE",
+    "activity_forecast": "Activity(fcst)",
+    "activity_observation": "Activity(obs)",
+    "activity_ratio": "Activity(ratio)",
+    "activity_bias": "Activity(bias)",
 }
 
 # v2 变量 -> WB2 deterministic nc 里 level 坐标的取值（None=地面量）
@@ -95,14 +109,14 @@ LEVELS = {
     "u850": 850, "v850": 850,
 }
 
-# nc 文件名 token -> v2 变量名
+# nc 文件名 token -> 变量名
 TOKEN2VAR = {
     "z500": "z500", "q700": "q700", "t700": "t700", "t850": "t850",
     "t2m": "t2m", "msl": "msl", "u850": "u850", "v850": "v850",
     "u10": "u10m", "v10": "v10m", "tp": "tp",
 }
 
-# extra.csv 的 (WB2 变量名, level) -> v2 变量名
+# extra.csv 的 (WB2 变量名, level) -> 变量名
 EXTRA_KEY2VAR = {
     ("geopotential", 500): "z500",
     ("specific_humidity", 700): "q700",
@@ -118,6 +132,8 @@ EXTRA_KEY2VAR = {
 }
 
 SAMPLE_LEADS = (6, 24, 48, 72, 96, 120, 168, 240, 360)
+
+log = logging.getLogger("compare")
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -156,8 +172,8 @@ class Agg:
 class PairResult:
     var: str
     label: str
-    wb2_metric: str
-    v2_metric: str
+    metric_a: str
+    metric_b: str
     n: int
     leads: List[int]
     x: np.ndarray
@@ -177,37 +193,59 @@ class PairResult:
     note: str
     outliers: List[int] = field(default_factory=list)
     init_scatter_ratio: Optional[float] = None
-    x_mean: Optional[np.ndarray] = None   # rmse 的 mean 聚合版本（供 T6）
-    bias_rel_max: Optional[float] = None  # max|Δbias|/RMSE（bias 专用判定）
+    x_mean: Optional[np.ndarray] = None
+    bias_rel_max: Optional[float] = None
 
 
 # ══════════════════════════════════════════════════════════════════════
 # 输入读取
 # ══════════════════════════════════════════════════════════════════════
-def load_v2(path: Path) -> Tuple[Dict, Dict]:
+def load_scores(path: Path) -> Tuple[Dict, Dict]:
     """流式读 scores.csv，按 (变量, 指标, 时效) 聚合逐起报值。"""
     p = path / "scores.csv" if path.is_dir() else path
     if not p.is_file():
-        raise SystemExit(f"找不到 v2 scores.csv: {p}")
+        raise SystemExit(f"找不到 scores.csv: {p}")
 
-    usecols = ["run_id", "model_id", "variable", "metric",
-               "lead_h", "value", "unit", "status"]
-    v2: Dict[str, Dict[str, Dict[float, Agg]]] = {}
+    usecols = ["run_id", "model_id", "dataset_id", "variable", "metric",
+               "lead_h", "init_time", "region", "value", "unit", "status"]
+    data: Dict[str, Dict[str, Dict[float, Agg]]] = {}
     all_keys: Set[Tuple[str, str]] = set()
     units: Dict[Tuple[str, str], Set[str]] = {}
     run_ids: Set[str] = set()
     models: Set[str] = set()
+    datasets: Set[str] = set()
+    inits: Set[str] = set()
+    leads: Set[float] = set()
+    variables: Set[str] = set()
+    regions: Set[str] = set()
+    dropped_regions: Set[str] = set()
+    globalish_seen = False
     n_rows = 0
 
     reader = pd.read_csv(p, usecols=usecols, chunksize=CSV_CHUNK, low_memory=False)
     for chunk in reader:
         n_rows += len(chunk)
+        run_ids.update(chunk["run_id"].dropna().astype(str).unique())
+        models.update(chunk["model_id"].dropna().astype(str).unique())
+        datasets.update(chunk["dataset_id"].dropna().astype(str).unique())
+        inits.update(chunk["init_time"].dropna().astype(str).unique())
+        variables.update(chunk["variable"].dropna().astype(str).unique())
+        leads.update(pd.to_numeric(chunk["lead_h"], errors="coerce").dropna().unique().tolist())
+
+        # 全球档案的 region 通常为空；少数档案混入 tropics 等分区行，不能一起平均
+        region = chunk["region"].fillna("").astype(str)
+        regions.update(x for x in region.unique() if x)
+        globalish = region.isin(["", "global", "all", "Global", "GLOBAL"])
+        if globalish.any():
+            globalish_seen = True
+        if globalish_seen and not globalish.all():
+            dropped_regions.update(region[~globalish].unique())
+            chunk = chunk[globalish]
+
         status = chunk["status"].fillna("success").astype(str)
         chunk = chunk[status.isin(["success", ""])]
         if chunk.empty:
             continue
-        run_ids.update(chunk["run_id"].dropna().astype(str).unique())
-        models.update(chunk["model_id"].dropna().astype(str).unique())
         all_keys.update(zip(chunk["variable"].astype(str),
                             chunk["metric"].astype(str)))
 
@@ -222,7 +260,7 @@ def load_v2(path: Path) -> Tuple[Dict, Dict]:
 
         for (var, met), g in sub.groupby(["variable", "metric"], sort=False):
             var, met = str(var), str(met)
-            store = v2.setdefault(var, {}).setdefault(met, {})
+            store = data.setdefault(var, {}).setdefault(met, {})
             us = [u for u in g["unit"].dropna().astype(str).unique() if u]
             if us:
                 units.setdefault((var, met), set()).update(us)
@@ -243,10 +281,19 @@ def load_v2(path: Path) -> Tuple[Dict, Dict]:
         "rows": n_rows,
         "run_ids": sorted(run_ids),
         "models": sorted(models),
+        "datasets": sorted(datasets),
+        "init_times": inits,
+        "leads": leads,
+        "variables": variables,
         "all_keys": all_keys,
         "units": units,
+        "regions": regions,
+        "dropped_regions": dropped_regions,
     }
-    return v2, meta
+    if dropped_regions:
+        log.warning("%s：已剔除非全球 region 行 %s（只保留空/global/all）",
+                    p, _fmt_set(dropped_regions, 8))
+    return data, meta
 
 
 def _lead_hours(values) -> np.ndarray:
@@ -256,8 +303,8 @@ def _lead_hours(values) -> np.ndarray:
     return vals.astype(float)
 
 
-def load_wb2_deterministic(path: Path) -> Tuple[Dict[Tuple[str, str], Dict[int, float]], List[str]]:
-    """读 wb2_2022_*_deterministic.nc，返回 {(v2变量, 指标): {lead_h: 值}}。"""
+def load_wb2_deterministic(path: Path) -> Tuple[Dict[Tuple[str, str], Dict[int, float]], List[str], Dict[str, str]]:
+    """读 wb2_*_deterministic.nc，返回 {(变量, 指标): {lead_h: 值}} 和文件属性。"""
     if not path.is_dir():
         raise SystemExit(f"WB2 结果路径不是目录: {path}")
     try:
@@ -267,6 +314,7 @@ def load_wb2_deterministic(path: Path) -> Tuple[Dict[Tuple[str, str], Dict[int, 
 
     out: Dict[Tuple[str, str], Dict[int, float]] = {}
     files_used: List[str] = []
+    attrs: Dict[str, str] = {}
     files = sorted(path.glob("*_deterministic.nc"))
     if not files:
         raise SystemExit(f"{path} 下没有 *_deterministic.nc")
@@ -274,17 +322,19 @@ def load_wb2_deterministic(path: Path) -> Tuple[Dict[Tuple[str, str], Dict[int, 
     for f in files:
         m = re.match(r"^wb2_\d{4}_(?P<tok>.+)_deterministic$", f.stem)
         if not m:
-            print(f"[skip] 文件名不识别: {f.name}")
+            log.warning("跳过文件名不识别: %s", f.name)
             continue
         var = TOKEN2VAR.get(m.group("tok"))
         if var is None:
-            print(f"[skip] 未知变量 token: {m.group('tok')}")
+            log.warning("跳过未知变量 token: %s", m.group("tok"))
             continue
 
         # 新版 xarray 不接受 lead_time 上残留的 dtype 属性（WB2 文件里带着
         # dtype=timedelta64[s]）；关掉时间解码，raw 值是 int64 小时数，够用。
         ds = xr.open_dataset(f, decode_times=False, decode_timedelta=False)
         try:
+            if not attrs:
+                attrs = {str(k): str(v) for k, v in ds.attrs.items()}
             names = list(ds.data_vars)
             if not names:
                 continue
@@ -306,7 +356,7 @@ def load_wb2_deterministic(path: Path) -> Tuple[Dict[Tuple[str, str], Dict[int, 
                 arr = arr.isel(level=idx, drop=True)
 
             if "metric" not in arr.dims or "lead_time" not in arr.coords:
-                print(f"[skip] {f.name} 缺少 metric/lead_time")
+                log.warning("跳过 %s：缺少 metric/lead_time", f.name)
                 continue
             lead_h = _lead_hours(arr["lead_time"].values)
 
@@ -324,14 +374,15 @@ def load_wb2_deterministic(path: Path) -> Tuple[Dict[Tuple[str, str], Dict[int, 
             ds.close()
         files_used.append(f.name)
 
-    return out, files_used
+    return out, files_used, attrs
 
 
-def load_wb2_extra(path: Path) -> Tuple[Dict[Tuple[str, str], Dict[int, float]], Set[Tuple[str, str, str]], int]:
+def load_wb2_extra(path: Path) -> Tuple[Dict[Tuple[str, str], Dict[int, float]], Set[Tuple[str, str, str]], Dict]:
     """读 wb2_2022_extra.csv（prediction_activity / csi / fss …）。"""
     f = path / "wb2_2022_extra.csv" if path.is_dir() else path
     if not f.is_file():
-        return {}, set(), 0
+        return {}, set(), {"rows": 0, "models": set(), "truths": set(),
+                           "years": set(), "resolutions": set()}
     df = pd.read_csv(f)
     need = {"metric", "var", "level", "lead_h", "value"}
     if not need.issubset(df.columns):
@@ -342,16 +393,308 @@ def load_wb2_extra(path: Path) -> Tuple[Dict[Tuple[str, str], Dict[int, float]],
     for row in df.itertuples(index=False):
         wb2_var = str(row.var)
         level = int(round(float(row.level)))
-        v2_var = EXTRA_KEY2VAR.get((wb2_var, level))
+        var = EXTRA_KEY2VAR.get((wb2_var, level))
         met = str(row.metric)
         lead = int(round(float(row.lead_h)))
         val = float(row.value)
-        if v2_var is None:
+        if var is None:
             unmatched.add((wb2_var, str(level), met))
             continue
         if math.isfinite(val):
-            out.setdefault((v2_var, met), {})[lead] = val
-    return out, unmatched, len(df)
+            out.setdefault((var, met), {})[lead] = val
+
+    def _uniq(col: str) -> Set[str]:
+        if col not in df.columns:
+            return set()
+        return {str(x) for x in df[col].dropna().unique()}
+
+    meta = {
+        "rows": len(df),
+        "models": _uniq("model"),
+        "truths": _uniq("truth"),
+        "years": _uniq("year"),
+        "resolutions": _uniq("resolution"),
+    }
+    return out, unmatched, meta
+
+
+def detect_format(path: Path) -> str:
+    """返回 'scores' 或 'wb2'。"""
+    if path.is_file():
+        if path.name == "scores.csv":
+            return "scores"
+        raise SystemExit(f"不支持的输入文件: {path}（只接受 scores.csv 或目录）")
+    if not path.is_dir():
+        raise SystemExit(f"输入路径不存在: {path}")
+    if (path / "scores.csv").is_file():
+        return "scores"
+    if any(path.glob("*_deterministic.nc")):
+        return "wb2"
+    raise SystemExit(f"{path} 下既没有 scores.csv，也没有 *_deterministic.nc")
+
+
+def _manifest_info(path: Path) -> Dict:
+    """读目录下 manifest.json（如果有内容）。"""
+    f = path / "manifest.json" if path.is_dir() else path.parent / "manifest.json"
+    try:
+        if f.is_file() and f.stat().st_size:
+            with f.open(encoding="utf-8") as fh:
+                return json.load(fh)
+    except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+        pass
+    return {}
+
+
+# ══════════════════════════════════════════════════════════════════════
+# 一致性检查
+# ══════════════════════════════════════════════════════════════════════
+def _same_set(a: Set, b: Set) -> bool:
+    return a == b
+
+
+def _fmt_set(values: Set, limit: int = 8) -> str:
+    vals = sorted(values)
+    if not vals:
+        return "（无）"
+    shown = ", ".join(str(v) for v in vals[:limit])
+    return shown + (" …" if len(vals) > limit else "")
+
+
+def check_scores_pair(meta_a: Dict, meta_b: Dict, name_a: str, name_b: str) -> Dict:
+    """判断两份 scores.csv 是否同一模型/同一 run/同一覆盖。"""
+    log.info("")
+    log.info("=== 2. 一致性检查（是否同一结果的评测）===")
+    log.info("[A] %s：%d 行，%.1f MB", name_a, meta_a["rows"], meta_a["size_mb"])
+    log.info("    run_id=%s model_id=%s dataset_id=%s",
+             ", ".join(meta_a["run_ids"]) or "—",
+             ", ".join(meta_a["models"]) or "—",
+             ", ".join(meta_a["datasets"]) or "—")
+    log.info("    起报 %d 个，时效 %d 个，变量 %d 个",
+             len(meta_a["init_times"]), len(meta_a["leads"]),
+             len(meta_a["variables"]))
+    log.info("[B] %s：%d 行，%.1f MB", name_b, meta_b["rows"], meta_b["size_mb"])
+    log.info("    run_id=%s model_id=%s dataset_id=%s",
+             ", ".join(meta_b["run_ids"]) or "—",
+             ", ".join(meta_b["models"]) or "—",
+             ", ".join(meta_b["datasets"]) or "—")
+    log.info("    起报 %d 个，时效 %d 个，变量 %d 个",
+             len(meta_b["init_times"]), len(meta_b["leads"]),
+             len(meta_b["variables"]))
+
+    same_model = _same_set(set(meta_a["models"]), set(meta_b["models"]))
+    same_run = _same_set(set(meta_a["run_ids"]), set(meta_b["run_ids"]))
+    same_data = _same_set(set(meta_a["datasets"]), set(meta_b["datasets"]))
+    same_inits = _same_set(meta_a["init_times"], meta_b["init_times"])
+    same_leads = _same_set(meta_a["leads"], meta_b["leads"])
+    same_vars = _same_set(meta_a["variables"], meta_b["variables"])
+
+    def mark(ok: bool) -> str:
+        return "一致" if ok else "不同"
+
+    log.info("[检查] 模型 %s；run %s；数据集实现 %s",
+             mark(same_model), mark(same_run), mark(same_data))
+    log.info("[检查] 起报 %s；时效 %s；变量 %s",
+             mark(same_inits), mark(same_leads), mark(same_vars))
+    if not same_data:
+        log.info("       数据集实现不同：A=%s，B=%s（属于评测实现/观测读取差异）",
+                 ", ".join(meta_a["datasets"]) or "—",
+                 ", ".join(meta_b["datasets"]) or "—")
+    if not same_inits:
+        common = meta_a["init_times"] & meta_b["init_times"]
+        log.warning("       起报集合不同：共同 %d 个（A %d / B %d），"
+                    "只比较共同起报上的聚合值，均值口径可能受影响",
+                    len(common), len(meta_a["init_times"]), len(meta_b["init_times"]))
+    if not same_leads:
+        common = meta_a["leads"] & meta_b["leads"]
+        log.warning("       时效集合不同：共同 %d 个（A %d / B %d）",
+                    len(common), len(meta_a["leads"]), len(meta_b["leads"]))
+
+    if same_model and same_run and same_inits and same_leads:
+        verdict = ("同一模型、同一 run、同一覆盖：属于同一个预报结果的两次评测，"
+                   "差异只可能来自评测实现/观测读取")
+    elif same_model and same_run:
+        verdict = "同一模型、同一 run，但覆盖不同：可比较，但需注意共同样本范围"
+    elif same_model:
+        verdict = "同一模型、不同 run：数值差包含初值/批次差异，不只是评测口径"
+    else:
+        verdict = "不同模型：数值差主要来自模型本身，不是评测口径对拍"
+    log.info("[判定] %s", verdict)
+
+    # manifest 里的补充信息
+    ma, mb = _manifest_info(Path(meta_a["path"])), _manifest_info(Path(meta_b["path"]))
+    for tag, m in ((name_a, ma), (name_b, mb)):
+        if m:
+            log.info("[manifest] %s：created_at=%s，n_results=%s",
+                     tag, m.get("created_at", "—"), m.get("n_results", "—"))
+
+    return {
+        "same_model": same_model,
+        "same_run": same_run,
+        "same_data": same_data,
+        "same_inits": same_inits,
+        "same_leads": same_leads,
+        "same_vars": same_vars,
+        "verdict": verdict,
+    }
+
+
+def check_scores_wb2(meta_a: Dict, meta_b: Dict, name_a: str, name_b: str) -> Dict:
+    """scores × WB2：检查变量/时效交集；WB2 侧通常没有 model/run 元数据。"""
+    log.info("")
+    log.info("=== 2. 一致性检查（是否同一结果的评测）===")
+    log.info("[A] %s（scores.csv）：%d 行，%.1f MB",
+             name_a, meta_a["rows"], meta_a["size_mb"])
+    log.info("    run_id=%s model_id=%s dataset_id=%s",
+             ", ".join(meta_a["run_ids"]) or "—",
+             ", ".join(meta_a["models"]) or "—",
+             ", ".join(meta_a["datasets"]) or "—")
+    log.info("    起报 %d 个，时效 %d 个，变量 %d 个",
+             len(meta_a["init_times"]), len(meta_a["leads"]),
+             len(meta_a["variables"]))
+    log.info("[B] %s（WB2）：%d 个 deterministic nc，extra.csv %d 行",
+             name_b, len(meta_b["files"]), meta_b["extra_rows"])
+    log.info("    变量 %d 个，时效 %d 个",
+             len(meta_b["variables"]), len(meta_b["leads"]))
+    log.info("    变量：%s", _fmt_set(set(meta_b["variables"]), 12))
+
+    em = meta_b.get("extra_meta") or {}
+    if em.get("models") or em.get("truths"):
+        log.info("[B] extra.csv 元数据：model=%s truth=%s year=%s resolution=%s",
+                 _fmt_set(em.get("models", set()), 4),
+                 _fmt_set(em.get("truths", set()), 4),
+                 _fmt_set(em.get("years", set()), 4),
+                 _fmt_set(em.get("resolutions", set()), 4))
+        wb2_models = set(em.get("models", set()))
+        score_models = set(meta_a["models"])
+        if wb2_models and score_models and not (wb2_models & score_models):
+            log.warning("[注意] WB2 标注 model=%s，scores 侧 model_id=%s，两者不一致；"
+                        "对表前请确认是不是同一模型的评测",
+                        _fmt_set(wb2_models, 4), _fmt_set(score_models, 4))
+    if meta_b["attrs"]:
+        picked = {k: v for k, v in meta_b["attrs"].items()
+                  if k.lower() in {"source", "model", "model_id", "run_id",
+                                   "dataset", "title", "history"}}
+        if picked:
+            log.info("    nc 属性：%s", picked)
+        else:
+            log.info("    nc 属性：%s …", _fmt_set(set(meta_b["attrs"]), 8))
+    else:
+        log.info("    nc 没有全局属性")
+
+    common_vars = set(meta_a["variables"]) & set(meta_b["variables"])
+    common_leads = meta_a["leads"] & meta_b["leads"]
+    log.info("[交集] 变量 %d 个（A %d / B %d）：%s",
+             len(common_vars), len(meta_a["variables"]),
+             len(meta_b["variables"]), _fmt_set(common_vars, 12))
+    log.info("[交集] 时效 %d 个（A %d / B %d）",
+             len(common_leads), len(meta_a["leads"]), len(meta_b["leads"]))
+    if not common_vars:
+        raise SystemExit("A/B 没有共同变量，无法对表")
+    if len(common_leads) < 2:
+        raise SystemExit("A/B 共同时效少于 2 个，无法对表")
+
+    wb2_models = set(em.get("models", set()))
+    score_models = set(meta_a["models"])
+    if wb2_models and score_models and not (wb2_models & score_models):
+        verdict = (f"元数据标注的模型不同（scores={_fmt_set(score_models, 3)}，"
+                   f"WB2={_fmt_set(wb2_models, 3)}），无法确认是同一结果的评测；"
+                   "以下对表只能当口径参照")
+    elif wb2_models and score_models:
+        verdict = ("模型标注一致，但 WB2 侧没有 run/起报信息，无法完全确认是同一结果；"
+                   "以下按共同变量/时效对表")
+    else:
+        verdict = ("WB2 侧没有 model/run/起报元数据，无法直接确认是否同一预报结果；"
+                   "以下按共同变量/时效对表，结果代表评测口径一致性")
+    log.info("[判定] %s", verdict)
+    return {
+        "common_vars": common_vars,
+        "common_leads": common_leads,
+        "verdict": verdict,
+    }
+
+
+def log_coverage_scores(data_a: Dict, data_b: Dict,
+                        all_keys_a: Set[Tuple[str, str]],
+                        all_keys_b: Set[Tuple[str, str]]) -> Dict:
+    """scores × scores 的可对表指标与缺口。"""
+    pairs = {(var, met)
+             for var in set(data_a) & set(data_b)
+             for met in set(data_a[var]) & set(data_b[var])
+             if met in V2_METRICS}
+    only_a = {(var, met)
+              for var in set(data_a) & set(data_b)
+              for met in set(data_a[var]) - set(data_b[var])
+              if met in V2_METRICS}
+    only_b = {(var, met)
+              for var in set(data_a) & set(data_b)
+              for met in set(data_b[var]) - set(data_a[var])
+              if met in V2_METRICS}
+    only_vars_a = set(data_a) - set(data_b)
+    only_vars_b = set(data_b) - set(data_a)
+
+    log.info("")
+    log.info("=== 3. 可对表范围 ===")
+    log.info("[可对表] %d 个 (变量, 指标) 组合，涉及指标：%s",
+             len(pairs),
+             ", ".join(sorted({m for _, m in pairs},
+                              key=lambda m: COMPARE_ORDER.index(m)
+                              if m in COMPARE_ORDER else 99)))
+    log.info("[仅 A 有] %s", _fmt_set({f"{v}/{m}" for v, m in only_a}, 12))
+    log.info("[仅 B 有] %s", _fmt_set({f"{v}/{m}" for v, m in only_b}, 12))
+    if only_vars_a:
+        log.info("[仅 A 有的变量] %s", _fmt_set(only_vars_a, 12))
+    if only_vars_b:
+        log.info("[仅 B 有的变量] %s", _fmt_set(only_vars_b, 12))
+    other = ({m for _, m in all_keys_a} | {m for _, m in all_keys_b}) - V2_METRICS
+    if other:
+        log.info("[存在但不参与标量对表] %s（谱/球谐带/分类指标等）",
+                 ", ".join(sorted(other)))
+    return {
+        "pairs": pairs, "only_a": only_a, "only_b": only_b,
+        "only_vars_a": only_vars_a, "only_vars_b": only_vars_b,
+        "other_metrics": other,
+    }
+
+
+def log_unit_diff(meta_a: Dict, meta_b: Dict, name_a: str, name_b: str) -> List[Tuple[Tuple[str, str], Set[str], Set[str]]]:
+    """单位标签差异（例如 q700 的 kg/kg vs g/kg）。"""
+    diffs: List[Tuple[Tuple[str, str], Set[str], Set[str]]] = []
+    for key in sorted(set(meta_a["units"]) & set(meta_b["units"])):
+        ua = meta_a["units"][key]
+        ub = meta_b["units"][key]
+        if ua != ub:
+            diffs.append((key, set(ua), set(ub)))
+    if diffs:
+        log.info("[单位] 检测到 %d 个单位标签差异（数值对表不受影响，但报告引用时要注意）：",
+                 len(diffs))
+        for key, ua, ub in diffs:
+            log.info("       %s/%s: A=%s B=%s", key[0], key[1],
+                     sorted(ua), sorted(ub))
+    return diffs
+
+
+def log_sample_counts(data_a: Dict, data_b: Dict) -> Tuple[int, int, List[str]]:
+    """逐 (变量, 指标, 时效) 比较两侧的逐起报样本数。"""
+    total = bad = 0
+    examples: List[str] = []
+    for var in sorted(set(data_a) & set(data_b)):
+        for met in COMPARE_ORDER:
+            if met not in data_a[var] or met not in data_b[var]:
+                continue
+            for lead in set(data_a[var][met]) & set(data_b[var][met]):
+                total += 1
+                na = data_a[var][met][lead].n
+                nb = data_b[var][met][lead].n
+                if na != nb:
+                    bad += 1
+                    if len(examples) < 6:
+                        examples.append(f"{var}/{met}/{int(lead)}h: {na} ≠ {nb}")
+    if total:
+        log.info("[样本数] 共同 (变量,指标,时效) 键 %d 个：样本数一致 %d 个，不一致 %d 个",
+                 total, total - bad, bad)
+        for e in examples:
+            log.info("         %s", e)
+    return total, bad, examples
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -403,7 +746,7 @@ def _verdict_bias(value: float, pearson: float) -> str:
 
 
 def compare_pair(var: str, label: str,
-                 v2_metric: str, wb2_metric: str,
+                 metric_a: str, metric_b: str,
                  x_map: Dict[int, float], y_map: Dict[int, float],
                  *, abs_metric: bool, note: str,
                  init_std: Optional[Dict[int, float]] = None,
@@ -421,12 +764,10 @@ def compare_pair(var: str, label: str,
     if x.size < 2:
         return None
 
-    # T4 趋势（先算相关，T3 判量纲时要用）
     pearson = _pearson(x, y)
     spearman = _spearman(x, y)
 
-    # T3 倍率推断：跳过无量纲指标。ratio = v2/WB2；
-    # scale 是“把 v2 换算到 WB2 口径”的因子，所以取 1/ratio。
+    # 倍率推断：ratio = A/B；scale 是“把 A 换算到 B 口径”的因子，取 1/ratio。
     ratio = np.full(x.size, np.nan)
     nz = np.abs(y) > 1e-12
     ratio[nz] = x[nz] / y[nz]
@@ -441,10 +782,8 @@ def compare_pair(var: str, label: str,
         elif ratio_cv <= 0.01 and abs(ratio_median - 1.0) > 0.01:
             scale, scale_kind = 1.0 / ratio_median, "approx"
     if scale_override is not None:
-        # Bias 的比值在近零处噪声大，量纲换算沿用同变量 RMSE 的判定
         scale = float(scale_override)
 
-    # T2 逐时效差
     abs_diff = x * scale - y
     rel = np.full(x.size, np.nan)
     rel[nz] = (x[nz] * scale - y[nz]) / np.abs(y[nz])
@@ -453,7 +792,6 @@ def compare_pair(var: str, label: str,
     rel_median = float(np.median(np.abs(rel[fine]))) if fine.any() else float("nan")
     abs_max = float(np.max(np.abs(abs_diff))) if abs_diff.size else float("nan")
 
-    # Bias 专用：|Δbias| 相对 WB2 RMSE 归一后的最大值
     bias_rel_max = None
     if normalize_by is not None:
         denom = np.array([normalize_by.get(l, np.nan) for l in leads], dtype=float)
@@ -463,14 +801,12 @@ def compare_pair(var: str, label: str,
                 np.max(np.abs(x[valid] * scale - y[valid]) / denom[valid])
             )
 
-    # 异常时效：|相对差| 超过中位的 OUTLIER_FACTOR 倍且 >1%
     outliers: List[int] = []
     if fine.any() and math.isfinite(rel_median) and rel_median > 0:
         thr = max(OUTLIER_FACTOR * rel_median, TOL_CLOSE_REL)
         outliers = [l for l, r in zip(leads, rel)
                     if math.isfinite(r) and abs(r) > thr]
 
-    # T4 线性拟合
     slope, intercept = float("nan"), float("nan")
     if np.std(x) > 0:
         try:
@@ -479,10 +815,8 @@ def compare_pair(var: str, label: str,
         except (np.linalg.LinAlgError, ValueError):
             pass
 
-    # T7 起报间散布
     scatter_ratio = None
     if init_std:
-        # init_std 是 v2 原始单位的散布，先乘同一个 scale 换到 WB2 口径
         stds = [init_std.get(l, float("nan")) * scale for l in leads]
         stds = np.array([s for s in stds if math.isfinite(s)], dtype=float)
         deltas = np.abs(abs_diff)
@@ -493,12 +827,13 @@ def compare_pair(var: str, label: str,
         verdict = _verdict_bias(bias_rel_max, pearson)
     else:
         verdict = _verdict(abs_metric, rel_max, abs_max, pearson, scale_kind)
+
     note_parts = [note]
     if bias_rel_max is not None:
         note_parts.append(f"max|Δbias|/RMSE={bias_rel_max:.4f}（判定依据）")
     if scale_kind in {"unit", "approx"}:
         tag = "精确" if scale_kind == "unit" else "近似"
-        note_parts.append(f"{tag}倍率 {ratio_median:.6g}×（v2/WB2）")
+        note_parts.append(f"{tag}倍率 {ratio_median:.6g}×（A/B）")
     if outliers:
         shown = ", ".join(str(l) for l in outliers[:8])
         more = "…" if len(outliers) > 8 else ""
@@ -512,7 +847,7 @@ def compare_pair(var: str, label: str,
         x_mean = np.array([x_mean_map.get(l, np.nan) for l in leads], dtype=float)
 
     return PairResult(
-        var=var, label=label, wb2_metric=wb2_metric, v2_metric=v2_metric,
+        var=var, label=label, metric_a=metric_a, metric_b=metric_b,
         n=x.size, leads=leads, x=x, y=y, scale=scale, scale_kind=scale_kind,
         ratio_median=ratio_median, ratio_cv=ratio_cv,
         rel_max=rel_max, rel_median=rel_median, abs_max=abs_max,
@@ -524,11 +859,56 @@ def compare_pair(var: str, label: str,
     )
 
 
-def build_pairs(v2: Dict, det: Dict, extra: Dict) -> List[PairResult]:
+def build_pairs_scores(data_a: Dict, data_b: Dict) -> List[PairResult]:
+    """scores × scores：两侧都按逐起报值的 mean 聚合后逐指标比较。"""
+    results: List[PairResult] = []
+    for var in sorted(set(data_a) & set(data_b)):
+        mets_a, mets_b = data_a[var], data_b[var]
+        rmse_pair: Optional[PairResult] = None
+
+        for met in COMPARE_ORDER:
+            if met not in mets_a or met not in mets_b:
+                continue
+            x_map = {l: agg.mean for l, agg in mets_a[met].items()}
+            y_map = {l: agg.mean for l, agg in mets_b[met].items()}
+            init_std = {l: agg.std for l, agg in mets_a[met].items()}
+            abs_metric = met == "acc"
+
+            note = {
+                "rmse": "两侧均按逐起报 RMSE 的 mean 聚合",
+                "acc": "两侧均为距平相关；用绝对差判定",
+                "bias": "逐格平均偏差；判定用 |Δbias|/RMSE_B",
+                "mae": "两侧均按逐起报 MAE 的 mean 聚合",
+            }.get(met, "同名指标直接比较")
+
+            normalize_by = None
+            scale_override = None
+            if met == "bias":
+                normalize_by = {l: agg.mean for l, agg in mets_b["rmse"].items()} \
+                    if "rmse" in mets_b else None
+                scale_override = rmse_pair.scale if rmse_pair else None
+
+            r = compare_pair(
+                var, METRIC_LABEL.get(met, met), met, met,
+                x_map, y_map,
+                abs_metric=abs_metric, note=note,
+                init_std=init_std,
+                normalize_by=normalize_by,
+                scale_override=scale_override,
+            )
+            if r:
+                results.append(r)
+                if met == "rmse":
+                    rmse_pair = r
+    return results
+
+
+def build_pairs_wb2(data_a: Dict, det: Dict, extra: Dict) -> List[PairResult]:
+    """scores × WB2：保持原 T1–T7 的配对逻辑。"""
     results: List[PairResult] = []
 
-    for var in sorted(v2):
-        mets = v2[var]
+    for var in sorted(data_a):
+        mets = data_a[var]
 
         if "rmse" in mets and (var, "rmse") in det:
             x_map = {l: a.rms for l, a in mets["rmse"].items()}
@@ -537,7 +917,7 @@ def build_pairs(v2: Dict, det: Dict, extra: Dict) -> List[PairResult]:
             r = compare_pair(
                 var, "RMSE", "rmse", "rmse", x_map, det[(var, "rmse")],
                 abs_metric=False, init_std=init_std, x_mean_map=x_mean_map,
-                note="v2 用逐起报 RMSE 的 RMS 聚合；WB2 为 sqrt(mse)",
+                note="scores 侧用逐起报 RMSE 的 RMS 聚合；WB2 为 sqrt(mse)",
             )
             if r:
                 results.append(r)
@@ -554,7 +934,6 @@ def build_pairs(v2: Dict, det: Dict, extra: Dict) -> List[PairResult]:
 
         if "bias" in mets and (var, "bias") in det:
             x_map = {l: a.mean for l, a in mets["bias"].items()}
-            # 量纲换算沿用同变量 RMSE 的倍率（bias 自身比值在近零处不可靠）
             rmse_pair = next(
                 (p for p in results if p.var == var and p.label == "RMSE"), None)
             r = compare_pair(var, "Bias", "bias", "bias", x_map, det[(var, "bias")],
@@ -574,10 +953,10 @@ def build_pairs(v2: Dict, det: Dict, extra: Dict) -> List[PairResult]:
         if "activity_forecast" in mets and (var, "prediction_activity") in extra:
             x_map = {l: a.mean for l, a in mets["activity_forecast"].items()}
             r = compare_pair(
-                var, "Activity(forecast)", "activity_forecast", "prediction_activity",
+                var, "Activity(fcst)", "activity_forecast", "prediction_activity",
                 x_map, extra[(var, "prediction_activity")],
                 abs_metric=False,
-                note="口径：v2=距平标准差，WB2=距平 RMS；气候态也不同",
+                note="口径：scores=距平标准差，WB2=距平 RMS；气候态也不同",
             )
             if r:
                 results.append(r)
@@ -619,7 +998,6 @@ def growth_curve_check(results: Sequence[PairResult]) -> Dict:
         rel = np.abs(xn - yn) / np.maximum(np.abs(yn), 1e-12)
         per_var.append((var, _pearson(xn, yn), float(np.max(rel))))
 
-    # 跨变量：每个时效上把归一曲线排序，看两边是否同序
     rank_leads, rank_vals = [], []
     lead_sets = [set(c[2]) for c in curves.values()]
     common = sorted(set.intersection(*lead_sets)) if lead_sets else []
@@ -643,7 +1021,7 @@ def growth_curve_check(results: Sequence[PairResult]) -> Dict:
 
 
 # ══════════════════════════════════════════════════════════════════════
-# 报告
+# 日志输出
 # ══════════════════════════════════════════════════════════════════════
 def _f(v, nd: int = 4) -> str:
     if v is None or (isinstance(v, float) and not math.isfinite(v)):
@@ -659,18 +1037,6 @@ def _pct(v) -> str:
     return f"{v * 100:.3f}%"
 
 
-def _md_table(headers: Sequence[str], rows: Sequence[Sequence[str]]) -> List[str]:
-    # 单元格内的 | 必须转义，否则会拆列（备注里的 |Δ| 最常见）
-    def cell(value) -> str:
-        return str(value).replace("|", "\\|")
-
-    out = ["| " + " | ".join(cell(h) for h in headers) + " |",
-           "|" + "|".join(["---"] * len(headers)) + "|"]
-    for row in rows:
-        out.append("| " + " | ".join(cell(c) for c in row) + " |")
-    return out
-
-
 def _sample_indices(leads: Sequence[int]) -> List[int]:
     idx = []
     for s in SAMPLE_LEADS:
@@ -683,363 +1049,552 @@ def _sample_indices(leads: Sequence[int]) -> List[int]:
     return sorted(set(idx))
 
 
-def write_report(path: Path, *, v2_meta: Dict, wb2_meta: Dict,
-                 results: Sequence[PairResult], agg_rows, growth: Dict,
-                 extra_unmatched: Set[Tuple[str, str, str]],
-                 args) -> None:
-    L: List[str] = []
-    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-    L += [
-        "# WB2 × xmetai-evaluation 指标一致性对拍报告",
-        "",
-        f"- 生成时间：{now}",
-        f"- v2 产物：`{v2_meta['path']}`（{v2_meta['size_mb']:.1f} MB，{v2_meta['rows']:,} 行）",
-        f"- v2 run_id / model：{', '.join(v2_meta['run_ids']) or '—'} / {', '.join(v2_meta['models']) or '—'}",
-        f"- WB2 产物：`{wb2_meta['path']}`（{len(wb2_meta['det_files'])} 个 deterministic nc，"
-        f"extra.csv {wb2_meta['extra_rows']} 行）",
-        f"- 判定阈值：A 一致 ≤{TOL_PASS_REL*100:g}%，B 接近 ≤{TOL_CLOSE_REL*100:g}%，"
-        f"C 小差 ≤{TOL_MINOR_REL*100:g}%，D 大差 ≤{TOL_MAJOR_REL*100:g}%，"
-        f"E 不一致 >{TOL_MAJOR_REL*100:g}%",
-        "- 判定含义：A–D 是数值差的大小；E 表示幅度或趋势不一致；"
-        "「形状」= 幅度有系统差但趋势一致；「倍率/单位」= 检测到精确/近似恒定倍率"
-        "（已按倍率折算后再看）。",
-        "",
-        "### 判定阈值",
-        "",
-        "主档（有量纲指标，按 max|Δ%|）：",
-        "",
-        "| 档 | 阈值 | 含义 | 处理动作 |",
-        "|---|---|---|---|",
-        "| A 一致 | ≤0.5% | 实现噪声级（聚合细节、float32） | 直接混用 |",
-        "| B 接近 | 0.5–1% | 已知二阶口径差 | 可直接用，注明口径 |",
-        "| C 小差 | 1–3% | 气候态/加权等一阶口径差 | 只能相对比较，不能混绝对值 |",
-        "| D 大差 | 3–10% | 系统性偏差，需归因 | 发布前修 |",
-        "| E 不一致 | >10% | 大概率 bug / 变量错配 / 单位错 | 停用排查 |",
-        "",
-        "不同指标不能用同一把尺：",
-        "",
-        "| 指标 | A / B / C / D | 超过 D |",
-        "|---|---|---|",
-        "| RMSE、MAE、活跃度 | max\\|Δ%\\| ≤0.5 / 1 / 3 / 10% | 不一致 |",
-        "| ACC | max\\|Δ\\| ≤0.002 / 0.005 / 0.015 / 0.03 | 不一致 |",
-        "| FSS | max\\|Δ\\| ≤0.005 / 0.01 / 0.03 / 0.05 | 不一致 |",
-        "| Bias | \\|Δbias\\|/RMSE ≤0.02 / 0.05 / 0.10 / 0.20 | 不一致 |",
-        "",
-        "> ACC 的 C 档取 0.015：0.01 的绝对差在 ACC≈0.3–0.6 时已有 2–3% 相对差；"
-        "本批 z500 长时效的最大差 0.0108 主要来自气候态。",
-        "",
-    ]
-
-    # ── 0. 结论总表 ──
-    L += ["## 0. 结论总表", ""]
-    if not results:
-        L += ["> 没有找到可对表的 (变量, 指标) 组合。", ""]
+def log_pair(r: PairResult) -> None:
+    """逐指标对比：一行摘要 + 备注 + RMSE 抽样时效表。"""
+    if r.bias_rel_max is not None:
+        judge = f"|Δbias|/RMSE={r.bias_rel_max:.4f}"
+    elif r.label == "ACC":
+        judge = f"max|Δ|={_f(r.abs_max, 5)}"
     else:
-        rows = []
-        for r in sorted(results, key=lambda z: (z.var, z.label)):
-            rows.append([
-                r.var, LABEL_CN.get(r.label, r.label), str(r.n),
-                _f(r.ratio_median),
-                (f"{r.bias_rel_max:.4f}（|Δb|/RMSE）"
-                 if r.bias_rel_max is not None else _pct(r.rel_max)),
-                _f(r.abs_max, 3),
-                _f(r.pearson, 5), _f(r.spearman, 4),
-                f"**{VERDICT_CN.get(r.verdict, r.verdict)}**", r.note,
-            ])
-        L += _md_table(
-            ["变量", "指标", "时效数", "比值中位", "最大相对差",
-             "最大绝对差", "Pearson", "Spearman", "判定", "备注"], rows)
-        L.append("")
-
-    # 判定分布
-    counts: Dict[str, int] = {}
-    for r in results:
-        key = VERDICT_CN.get(r.verdict, r.verdict)
-        counts[key] = counts.get(key, 0) + 1
-    if counts:
-        ordered = [k for k in VERDICT_ORDER if k in counts]
-        ordered += sorted(set(counts) - set(ordered))
-        L += ["判定分布：" + "，".join(f"{k} × {counts[k]}" for k in ordered), ""]
-
-    # ── 1. 覆盖检查 ──
-    L += ["## 1. 覆盖检查（T1）", ""]
-    v2_keys = v2_meta["all_keys"]
-    det_keys = set(wb2_meta["det_keys"])
-    extra_keys = set(wb2_meta["extra_keys"])
-    matched = {(r.var, r.v2_metric) for r in results}
-
-    L += ["**双边可比**（本报告已逐项检验）：", ""]
-    if matched:
-        L += [", ".join(f"`{v}/{m}`" for v, m in sorted(matched)), ""]
-    else:
-        L += ["（无）", ""]
-
-    # WB2 侧未被使用的指标
-    used_extra = {(r.var, "prediction_activity")
-                  for r in results if r.label.startswith("Activity")}
-    wb2_only = []
-    for (var, met) in sorted(det_keys):
-        if met in {"rmse", "mse"}:   # rmse 由 mse 派生，不单列
-            continue
-        if (var, met) not in matched:
-            wb2_only.append((var, met))
-    for (var, met) in sorted(extra_keys):
-        if (var, met) not in matched and (var, met) not in used_extra:
-            wb2_only.append((var, met))
-    L += ["**仅 WB2 有、v2 本批未产出（不可比）**：", ""]
-    if wb2_only:
-        L += [", ".join(f"`{v}/{m}`" for v, m in wb2_only), ""]
-    else:
-        L += ["（无）", ""]
-    if extra_unmatched:
-        tp_metrics = sorted({m for _, _, m in extra_unmatched})
-        L += [f"extra.csv 里未映射到 v2 变量的条目还涉及指标：{', '.join(tp_metrics)}"
-              f"（本批 v2 没有 tp，无法比较）。", ""]
-
-    v2_only = sorted({(v, m) for (v, m) in v2_keys
-                      if (v, m) not in matched
-                      and m not in {"mse"}})
-    L += ["**仅 v2 有、WB2 侧无对应产物**：", ""]
-    if v2_only:
-        L += [", ".join(f"`{v}/{m}`" for v, m in v2_only[:40])
-              + (" …" if len(v2_only) > 40 else ""), ""]
-    else:
-        L += ["（无）", ""]
-
-    # ── 2. RMSE ──
-    L += ["## 2. RMSE 逐变量对表（T2–T4、T6、T7）", "",
-          "> 若某变量涉及倍率/单位换算，`Δ%` 已按检测到的倍率折算；表中 WB2/v2 两列仍是各自原始值，"
-          "“比值”列为未折算的 v2/WB2。", ""]
-    rmse_results = [r for r in results if r.label == "RMSE"]
-    if not rmse_results:
-        L += ["（无 RMSE 对表组合）", ""]
-    for r in rmse_results:
-        L.append(f"### {r.var}  —— 判定 **{VERDICT_CN.get(r.verdict, r.verdict)}**")
-        L.append("")
-        L.append(f"- 最大相对差 {_pct(r.rel_max)}，中位 {_pct(r.rel_median)}；"
-                 f"比值中位 {_f(r.ratio_median)}（CV {_f(r.ratio_cv)}）；"
-                 f"Pearson {_f(r.pearson, 6)}，Spearman {_f(r.spearman, 5)}")
-        if math.isfinite(r.slope):
-            L.append(f"- 线性拟合 y ≈ {_f(r.slope, 5)}·x + {_f(r.intercept, 4)}")
-        if r.init_scatter_ratio is not None:
-            L.append(f"- T7 中位|Δ| / 起报间标准差 = {r.init_scatter_ratio:.3f}")
-        L.append("")
+        judge = f"max|Δ%|={_pct(r.rel_max)}"
+    log.info("  %-6s %-16s n=%2d  比值中位=%s  %s  Pearson=%.6f  => %s",
+             r.var, r.label, r.n, _f(r.ratio_median), judge,
+             r.pearson, r.verdict)
+    log.info("        %s", r.note)
+    if r.label == "RMSE":
         idx = _sample_indices(r.leads)
         rows = []
         for i in idx:
             rel = ((r.x[i] * r.scale - r.y[i]) / abs(r.y[i])
                    if r.y[i] else float("nan"))
-            rows.append([
-                str(r.leads[i]), _f(r.y[i], 6), _f(r.x[i], 6),
-                _pct(rel),
-                _f(r.x[i] / r.y[i], 6) if r.y[i] else "—",
-            ])
-        L += _md_table(["lead(h)", "WB2", "v2(RMS)", "Δ%", "比值"], rows)
-        L.append("")
-        L.append("<details><summary>逐时效全表</summary>")
-        L.append("")
-        rows = []
-        for i, lead in enumerate(r.leads):
-            rel = ((r.x[i] * r.scale - r.y[i]) / abs(r.y[i])
-                   if r.y[i] else float("nan"))
-            rows.append([str(lead), _f(r.y[i], 8), _f(r.x[i], 8),
-                         _pct(rel), _f(r.x[i] / r.y[i], 8) if r.y[i] else "—"])
-        L += _md_table(["lead(h)", "WB2", "v2(RMS)", "Δ%", "比值"], rows)
-        L += ["", "</details>", ""]
+            rows.append({
+                "lead": r.leads[i],
+                "B": _f(r.y[i], 6),
+                "A": _f(r.x[i], 6),
+                "delta%": _pct(rel),
+                "ratio": _f(r.x[i] / r.y[i], 6) if r.y[i] else "—",
+            })
+        log.info("\n%s", pd.DataFrame(rows).to_string(index=False))
 
-    # ── 3. ACC ──
-    L += ["## 3. ACC 对表（T2、T4）", ""]
-    acc_results = [r for r in results if r.label == "ACC"]
-    if not acc_results:
-        L += ["（无 ACC 对表组合：本批 v2 只产出 z500 的 ACC）", ""]
-    for r in acc_results:
-        L.append(f"### {r.var}  —— 判定 **{VERDICT_CN.get(r.verdict, r.verdict)}**")
-        L.append("")
-        L.append(f"- 最大绝对差 {_f(r.abs_max, 4)}，中位相对差 {_pct(r.rel_median)}；"
-                 f"Pearson {_f(r.pearson, 6)}")
-        L.append(f"- 说明：{r.note}")
-        L.append("")
-        idx = _sample_indices(r.leads)
-        rows = [[str(r.leads[i]), _f(r.y[i], 6), _f(r.x[i], 6),
-                 _f(r.x[i] - r.y[i], 4)] for i in idx]
-        L += _md_table(["lead(h)", "WB2", "v2", "绝对差"], rows)
-        L.append("")
-        L.append("<details><summary>逐时效全表</summary>")
-        L.append("")
-        rows = [[str(l), _f(r.y[i], 8), _f(r.x[i], 8), _f(r.x[i] - r.y[i], 6)]
-                for i, l in enumerate(r.leads)]
-        L += _md_table(["lead(h)", "WB2", "v2", "绝对差"], rows)
-        L += ["", "</details>", ""]
 
-    # ── 4. 活跃度 ──
-    L += ["## 4. 活跃度对表（T2、T4）", ""]
-    act_results = [r for r in results if r.label.startswith("Activity")]
-    if not act_results:
-        L += ["（无活跃度对表组合）", ""]
-    for r in act_results:
-        unit = CANON_UNITS.get(r.var, "")
-        L.append(f"### {r.var}  —— 判定 **{VERDICT_CN.get(r.verdict, r.verdict)}**")
-        L.append("")
-        L.append(f"- 最大相对差 {_pct(r.rel_max)}，比值中位 {_f(r.ratio_median)}"
-                 f"（CV {_f(r.ratio_cv)}）；Pearson {_f(r.pearson, 5)}")
-        L.append(f"- 说明：{r.note}")
-        L.append("")
-        idx = _sample_indices(r.leads)
-        rows = [[str(r.leads[i]), _f(r.y[i], 6), _f(r.x[i], 6),
-                 _pct((r.x[i] * r.scale - r.y[i]) / r.y[i]
-                      if r.y[i] else float('nan'))]
-                for i in idx]
-        L += _md_table(["lead(h)", f"WB2 ({unit})", f"v2 ({unit})", "Δ%"], rows)
-        L.append("")
+def log_details(results: Sequence[PairResult], name_a: str, name_b: str) -> None:
+    log.info("")
+    log.info("=== 4. 逐指标对比（A=%s, B=%s；Δ=A−B，Δ%%=(A−B)/|B|）===",
+             name_a, name_b)
+    if not results:
+        log.warning("没有可对表的 (变量, 指标) 组合")
+        return
+    for r in results:
+        log_pair(r)
 
-    # ── 5. 聚合口径与增长曲线 ──
-    L += ["## 5. 聚合口径与增长曲线（T5、T6）", ""]
-    if agg_rows:
-        L += ["### T6 逐起报 RMSE 的聚合方式", "",
-              "WB2 存的是跨起报池化后的 mse，所以 v2 侧应把逐起报 RMSE 先平方再平均（RMS），"
-              "而不是直接平均 RMSE。下表比较两种聚合的最大相对差：", ""]
-        rows = [[v, _pct(mr), _pct(mm), _f(ratio), winner]
-                for v, mr, mm, ratio, winner in agg_rows]
-        L += _md_table(["变量", "max|Δ|（RMS 聚合）", "max|Δ|（mean 聚合）",
-                        "比值中位", "更接近 WB2"], rows)
-        wins = sum(1 for row in agg_rows if row[4] == "RMS")
-        L += ["", f"结论：{wins}/{len(agg_rows)} 个变量 RMS 聚合更贴 WB2。", ""]
-    else:
-        L += ["（没有 RMSE 对表，跳过 T6）", ""]
 
-    L += ["### T5 相对增长曲线（各自除以首个时效）", ""]
+def log_extra_checks(results: Sequence[PairResult], *, wb2_mode: bool) -> None:
+    """T5 / T6 / T7。"""
+    log.info("")
+    log.info("=== 5. 附加检查 ===")
+
+    growth = growth_curve_check(results)
+    log.info("[T5] 归一增长曲线（各自除以首个时效）")
     if growth["per_var"]:
-        rows = [[v, _f(c, 6), _pct(d)] for v, c, d in growth["per_var"]]
-        L += _md_table(["变量", "归一曲线 Pearson", "最大归一偏差"], rows)
-        L.append("")
+        for var, corr, dev in growth["per_var"]:
+            log.info("      %-8s Pearson=%s  最大归一偏差=%s",
+                     var, _f(corr, 6), _pct(dev))
         if math.isfinite(growth["rank_spearman_mean"]):
-            L.append(f"跨变量排序一致性（每个时效上对归一增长曲线排序）："
-                     f"Spearman 均值 {growth['rank_spearman_mean']:.4f}。"
-                     "接近 1 说明没有变量串名/错位。")
-        L.append("")
+            log.info("[T5] 跨变量排序一致性：Spearman 均值 %.4f（接近 1 说明没有变量串名/错位）",
+                     growth["rank_spearman_mean"])
     else:
-        L += ["（没有可比较的 RMSE 曲线）", ""]
+        log.info("      （没有可比较的 RMSE 曲线）")
 
-    # ── 6. 检验方法说明 ──
-    L += [
-        "## 6. 检验方法说明",
-        "",
-        "- **T1 覆盖检查**：枚举两边 (变量, 指标)，标出双边可比 / 仅一边有。",
-        "- **T2 逐时效数值比对**：对每个 lead 计算 `(v2−WB2)/|WB2|`（RMSE、活跃度）"
-        "或绝对差（ACC），给出最大、中位偏差和异常时效。",
-        "- **T3 倍率与量纲推断**：看 `v2/WB2` 的中位比值与变异系数；若比值恒定且≠1，"
-        "判为纯单位/量纲换算（单位），不按数值不一致处理。",
-        "- **T4 趋势一致性**：Pearson、Spearman、线性拟合与斜率。相关系数接近 1 但幅度有偏，"
-        "通常指向口径（气候态、聚合方式）差异而不是数据错误。",
-        "- **T5 相对增长曲线**：各自除以首个时效后比较形状；再把各变量在每个时效上排序，"
-        "算跨变量 Spearman，用于发现变量串名或错位。",
-        "- **T6 聚合口径敏感性**：把 v2 逐起报 RMSE 分别按 `mean` 与 `RMS` 聚合，"
-        "与 WB2 池化 mse 比较，看哪种更接近。",
-        "- **T7 起报间散布**：用逐起报 RMSE 的标准差作噪声尺，比较 `中位|Δ| / 标准差`；"
-        "小于 1 说明当前差异在批间抖动量级内。",
-        "",
-    ]
+    if wb2_mode:
+        rows = aggregation_sensitivity(results)
+        log.info("[T6] RMSE 聚合口径：scores 侧逐起报 RMSE 的 RMS vs mean")
+        if rows:
+            for var, mr, mm, ratio, winner in rows:
+                log.info("      %-8s max|Δ|(RMS)=%s  max|Δ|(mean)=%s  比值中位=%s  -> %s 更贴 WB2",
+                         var, _pct(mr), _pct(mm), _f(ratio), winner)
+            wins = sum(1 for row in rows if row[4] == "RMS")
+            log.info("      结论：%d/%d 个变量 RMS 聚合更贴 WB2", wins, len(rows))
+        else:
+            log.info("      （没有 RMSE 对表，跳过）")
 
-    # ── 7. 已知口径差异与注意事项 ──
-    scale_pairs = [r for r in results if r.verdict in {"SCALE", "UNIT"}]
-    L += [
-        "## 7. 已知口径差异与注意事项",
-        "",
-        "- **RMSE**：WB2 deterministic nc 存的是 `mse`（跨起报池化），本报告开方后比较；"
-        "v2 用逐起报 RMSE 的 RMS 聚合（T6 会验证这一点）。",
-        "- **ACC**：两边都是“距平场直接二阶矩”的未去域均相关（v2 `centered=False`，"
-        "WB2 `_spatial_average(f'·o')/sqrt(...)`）；差异主要来自气候态——"
-        "v2 用 15 天滑动气候态，WB2 用 1990–2020 未平滑 6h 气候态。",
-        "- **活跃度**：v2 是距平场纬度加权**标准差**，WB2 `prediction_activity` 是距平场"
-        "纬度加权**RMS**（含距平均值项），且气候态不同；预期存在几个百分点系统差。",
-    ]
-    if scale_pairs:
-        L.append("- **恒定倍率（倍率/单位）**：下列配对数值差主要由单位/口径换算造成，"
-                 "已按倍率折算后再评估数值一致性：")
-        for r in scale_pairs:
-            L.append(f"  - `{r.var}/{r.label}`：v2/WB2 ≈ {r.ratio_median:.6g}"
-                     f"（换算后最大相对差 {_pct(r.rel_max)}）")
-    L += [
-        "- **起报窗**：v2 配置里写的是 2022 全年；WB2 的最后一个起报是 "
-        "2022-12-16T12（+360h 落在 12-31，仍在 2022 真值内），评测的有效时间覆盖全年。"
-        "若 v2 的 inference_raw 也止于 12-16，两边样本一致。",
-        "- **Bias**：v2 的 bias 是逐格平均偏差（forecast−obs 的网格均值），"
-        "与 WB2 的 `bias` 同义。bias 本身接近 0，相对差会爆掉，故判定统一用 "
-        "`max|Δbias|/RMSE`（阈值见上方表），量纲换算沿用同变量 RMSE 的倍率。",
-        "- **FSS 特别说明**：即使补上 tp，v2 的 FSS（等权、无经度环绕、窗口不含 9px）"
-        "与 WB2（面积加权、经度环绕、9px）也不是同一口径，不能直接对表。",
-        "",
-        "## 8. 输入指纹",
-        "",
-        f"- v2 指标 key 数（含谱/球谐带）：{len(v2_keys)}",
-        f"- WB2 deterministic 指标：{', '.join(sorted({m for _, m in det_keys}))}",
-        f"- WB2 extra 指标：{', '.join(sorted({m for _, m in extra_keys}))}",
-        "",
-    ]
+    log.info("[T7] 起报间散布：RMSE 的中位|Δ| / A 侧逐起报标准差")
+    any_scatter = False
+    for r in results:
+        if r.label != "RMSE" or r.init_scatter_ratio is None:
+            continue
+        any_scatter = True
+        tag = "小于" if r.init_scatter_ratio < 1 else "大于"
+        log.info("      %-8s %-16s %.3f（%s起报间标准差）",
+                 r.var, r.label, r.init_scatter_ratio, tag)
+    if not any_scatter:
+        log.info("      （没有起报级散布数据）")
+
+
+def log_summary(results: Sequence[PairResult]) -> None:
+    """最后一张总表（纯 ASCII 列，便于对齐）。"""
+    log.info("")
+    log.info("=== 6. 总表 ===")
+    if not results:
+        log.warning("没有可对表的指标")
+        return
+
+    order = {m: i for i, m in enumerate(COMPARE_ORDER)}
+    rows = []
+    for r in sorted(results, key=lambda z: (z.var, order.get(z.metric_a, 99))):
+        rows.append({
+            "var": r.var,
+            "metric": r.label,
+            "n": r.n,
+            "ratio_med": _f(r.ratio_median),
+            "max_rel": ("" if (r.bias_rel_max is not None or r.metric_a == "acc")
+                        else _pct(r.rel_max)),
+            "max_abs": _f(r.abs_max, 4),
+            "bias_rel": (_f(r.bias_rel_max, 4)
+                         if r.bias_rel_max is not None else ""),
+            "pearson": _f(r.pearson, 6),
+            "spearman": _f(r.spearman, 5),
+            "verdict": r.verdict,
+        })
+    log.info("\n%s", pd.DataFrame(rows).to_string(index=False))
+
+    counts: Dict[str, int] = {}
+    for r in results:
+        counts[r.verdict] = counts.get(r.verdict, 0) + 1
+    log.info("判定分布：%s",
+             "，".join(f"{k}={v}" for k, v in sorted(counts.items())))
+    log.info("判定说明：PASS≤%.1f%%，CLOSE≤%.1f%%，MINOR≤%.1f%%，MAJOR≤%.1f%%，"
+             "SHAPE=幅度有差但趋势一致，UNIT/SCALE=恒定倍率，MISMATCH=不一致",
+             TOL_PASS_REL * 100, TOL_CLOSE_REL * 100,
+             TOL_MINOR_REL * 100, TOL_MAJOR_REL * 100)
+    log.info("Bias 专用判定：bias_rel 列 = max|Δbias|/RMSE，"
+             "PASS≤%.2f，CLOSE≤%.2f，MINOR≤%.2f，MAJOR≤%.2f",
+             BIAS_PASS, BIAS_CLOSE, BIAS_MINOR, BIAS_MAJOR)
+
+
+# ══════════════════════════════════════════════════════════════════════
+# Markdown 报告
+# ══════════════════════════════════════════════════════════════════════
+def _md_cell(value) -> str:
+    return str(value).replace("|", "\\|").replace("\n", " ")
+
+
+def _md_table(headers: Sequence[str], rows: Sequence[Sequence]) -> List[str]:
+    out = ["| " + " | ".join(_md_cell(h) for h in headers) + " |",
+           "| " + " | ".join("---" for _ in headers) + " |"]
+    for row in rows:
+        out.append("| " + " | ".join(_md_cell(c) for c in row) + " |")
+    return out
+
+
+def _metric_rank(met: str) -> int:
+    return COMPARE_ORDER.index(met) if met in COMPARE_ORDER else 99
+
+
+def _dev_text(r: PairResult) -> str:
+    if r.bias_rel_max is not None:
+        return f"|Δbias|/RMSE = {r.bias_rel_max:.4f}"
+    if r.metric_a == "acc":
+        return f"max|ΔACC| = {_f(r.abs_max, 5)}"
+    return f"max|Δ%| = {_pct(r.rel_max)}"
+
+
+def _worst_result(results: Sequence[PairResult]) -> Optional[PairResult]:
+    if not results:
+        return None
+
+    def dev(r: PairResult) -> float:
+        if r.bias_rel_max is not None:
+            return r.bias_rel_max
+        if r.metric_a == "acc":
+            return r.abs_max
+        return r.rel_max
+
+    return max(results, key=lambda r: (VERDICT_RANK.get(r.verdict, -1), dev(r)))
+
+
+def write_markdown(path: Path, ctx: Dict) -> None:
+    """把本次对拍结果写成 Markdown 报告。"""
+    name_a, name_b = ctx["name_a"], ctx["name_b"]
+    meta_a, meta_b = ctx["meta_a"], ctx["meta_b"]
+    consistency = ctx.get("consistency") or {}
+    coverage = ctx.get("coverage") or {}
+    results: List[PairResult] = ctx.get("results") or []
+    wb2_mode = bool(ctx.get("wb2_mode"))
+
+    L: List[str] = [f"# 评测结果对拍：{name_a} vs {name_b}", ""]
+    L += [f"> 生成时间：{datetime.now():%Y-%m-%d %H:%M:%S}　　"
+          f"A = `{ctx['path_a']}`　　B = `{ctx['path_b']}`", ""]
+
+    # 0. 概览
+    counts: Dict[str, int] = {}
+    for r in results:
+        counts[r.verdict] = counts.get(r.verdict, 0) + 1
+    L += ["## 0. 结论速览", ""]
+    if results:
+        if set(counts) == {"PASS"}:
+            headline = f"全部 {len(results)} 个可对表项在输出精度内一致（PASS）"
+        else:
+            worst = _worst_result(results)
+            headline = (f"最大偏差项：{worst.var}/{worst.label}，"
+                        f"{_dev_text(worst)}（{worst.verdict}）")
+        dist = "，".join(
+            f"{VERDICT_BADGE.get(k, k)} × {v}"
+            for k, v in sorted(counts.items(),
+                               key=lambda kv: VERDICT_RANK.get(kv[0], 9)))
+        L += [
+            f"- **一致性**：{consistency.get('verdict', '—')}",
+            f"- **可对表**：{len(results)} 个 (变量, 指标) 组合",
+            f"- **结果分布**：{dist}",
+            f"- **一句话**：{headline}",
+        ]
+    else:
+        L += ["- **可对表**：0 个组合（没有共同变量或指标）"]
+    L += ["", "---", ""]
+
+    # 1. 输入信息
+    L += ["## 1. 输入信息", ""]
+    if not wb2_mode:
+        ma = _manifest_info(Path(meta_a["path"]))
+        mb = _manifest_info(Path(meta_b["path"]))
+        rows = [
+            ["路径", f"`{meta_a['path']}`", f"`{meta_b['path']}`"],
+            ["格式", "scores.csv", "scores.csv"],
+            ["行数", f"{meta_a['rows']:,}", f"{meta_b['rows']:,}"],
+            ["run_id", ", ".join(meta_a["run_ids"]) or "—",
+             ", ".join(meta_b["run_ids"]) or "—"],
+            ["model_id", ", ".join(meta_a["models"]) or "—",
+             ", ".join(meta_b["models"]) or "—"],
+            ["dataset_id", ", ".join(meta_a["datasets"]) or "—",
+             ", ".join(meta_b["datasets"]) or "—"],
+            ["起报 / 时效 / 变量",
+             f"{len(meta_a['init_times'])} / {len(meta_a['leads'])} / {len(meta_a['variables'])}",
+             f"{len(meta_b['init_times'])} / {len(meta_b['leads'])} / {len(meta_b['variables'])}"],
+        ]
+        if ma or mb:
+            rows.append(["manifest",
+                         f"created_at={ma.get('created_at', '—')}<br>n_results={ma.get('n_results', '—')}",
+                         f"created_at={mb.get('created_at', '—')}<br>n_results={mb.get('n_results', '—')}"])
+    else:
+        em = meta_b.get("extra_meta") or {}
+        rows = [
+            ["路径", f"`{meta_a['path']}`", f"`{ctx['path_b']}`"],
+            ["格式", "scores.csv",
+             f"WB2 deterministic nc（{len(meta_b['files'])} 个）+ extra.csv"],
+            ["规模", f"{meta_a['rows']:,} 行",
+             f"nc {len(meta_b['files'])} 个；extra {meta_b['extra_rows']:,} 行"],
+            ["run_id", ", ".join(meta_a["run_ids"]) or "—", "—"],
+            ["model_id", ", ".join(meta_a["models"]) or "—",
+             _fmt_set(em.get("models", set()), 4)],
+            ["dataset / truth", ", ".join(meta_a["datasets"]) or "—",
+             f"truth={_fmt_set(em.get('truths', set()), 4)}，"
+             f"year={_fmt_set(em.get('years', set()), 4)}"],
+            ["起报 / 时效 / 变量",
+             f"{len(meta_a['init_times'])} / {len(meta_a['leads'])} / {len(meta_a['variables'])}",
+             f"— / {len(meta_b['leads'])} / {len(meta_b['variables'])}"],
+        ]
+    L += _md_table(["项", f"A：{name_a}", f"B：{name_b}"], rows)
+    L += [""]
+
+    # 2. 一致性
+    L += ["## 2. 一致性检查", ""]
+    if not wb2_mode:
+        checks = [
+            ("模型", consistency.get("same_model")),
+            ("run", consistency.get("same_run")),
+            ("数据集实现", consistency.get("same_data")),
+            ("起报集合", consistency.get("same_inits")),
+            ("时效集合", consistency.get("same_leads")),
+            ("变量集合", consistency.get("same_vars")),
+        ]
+        for label, ok in checks:
+            L.append(f"- {'✅' if ok else '❌'} {label}：{'一致' if ok else '不同'}")
+        if not consistency.get("same_data"):
+            L.append(f"  - 数据集实现：A = `{', '.join(meta_a['datasets']) or '—'}`，"
+                     f"B = `{', '.join(meta_b['datasets']) or '—'}`"
+                     "（评测实现/观测读取差异，不是预报差异）")
+        sc = ctx.get("sample_counts")
+        if sc:
+            total, bad, examples = sc
+            L.append(f"- {'✅' if bad == 0 else '⚠️'} 逐键样本数：{total} 个键，"
+                     f"{bad} 个不一致")
+            if examples:
+                L.append("  - " + "；".join(examples))
+    else:
+        em = meta_b.get("extra_meta") or {}
+        if em.get("models") or em.get("truths"):
+            L.append(f"- WB2 extra 元数据：model = `{_fmt_set(em.get('models', set()), 4)}`，"
+                     f"truth = `{_fmt_set(em.get('truths', set()), 4)}`，"
+                     f"year = `{_fmt_set(em.get('years', set()), 4)}`")
+        L.append(f"- 共同变量 {len(consistency.get('common_vars', set()))} 个；"
+                 f"共同时效 {len(consistency.get('common_leads', set()))} 个")
+    L += ["", f"> **判定**：{consistency.get('verdict', '—')}", ""]
+
+    ud = ctx.get("unit_diffs") or []
+    L += ["### 单位标签", ""]
+    if ud:
+        L += _md_table(["变量/指标", f"A：{name_a}", f"B：{name_b}"],
+                       [[f"{key[0]}/{key[1]}", ", ".join(sorted(ua)),
+                         ", ".join(sorted(ub))] for key, ua, ub in ud])
+        L += ["", "> 单位标签不同不代表数值不同；以数值对比为准。", ""]
+    else:
+        L += ["无差异。", ""]
+
+    # 3. 可对表范围
+    L += ["## 3. 可对表范围", ""]
+    if not wb2_mode:
+        pairs = coverage.get("pairs", set())
+        metrics = sorted({m for _, m in pairs}, key=_metric_rank)
+        L.append(f"- **可对表**：{len(pairs)} 个 (变量, 指标) 组合；"
+                 f"指标：{', '.join(metrics) or '—'}")
+        only_a = coverage.get("only_a", set())
+        only_b = coverage.get("only_b", set())
+        if only_a:
+            L.append("- **仅 A 有**：" + ", ".join(sorted(f"{v}/{m}" for v, m in only_a)))
+        if only_b:
+            L.append("- **仅 B 有**：" + ", ".join(sorted(f"{v}/{m}" for v, m in only_b)))
+        other = coverage.get("other_metrics", set())
+        if other:
+            L.append("- **存在但不参与标量对表**：" + ", ".join(sorted(other)))
+    else:
+        L.append("- **WB2 deterministic 指标**："
+                 + (", ".join(ctx.get("det_metrics") or []) or "—"))
+        L.append("- **WB2 extra 指标**："
+                 + (", ".join(ctx.get("extra_metrics") or []) or "—"))
+        if ctx.get("extra_unmatched"):
+            L.append(f"- **extra 未映射**：{len(ctx['extra_unmatched'])} 条")
+        L.append(f"- **实际对表**：{len(results)} 个组合")
+    L += ["", "---", ""]
+
+    # 4. 逐指标对比
+    L += ["## 4. 逐指标对比", "", "### 4.1 总表", ""]
+    rows = []
+    for r in sorted(results, key=lambda z: (z.var, _metric_rank(z.metric_a))):
+        rows.append([
+            r.var, r.label, r.n, _f(r.ratio_median),
+            "" if (r.bias_rel_max is not None or r.metric_a == "acc")
+            else _pct(r.rel_max),
+            _f(r.abs_max, 4),
+            "" if r.bias_rel_max is None else _f(r.bias_rel_max, 4),
+            _f(r.pearson, 6), _f(r.spearman, 5),
+            VERDICT_BADGE.get(r.verdict, r.verdict),
+        ])
+    if rows:
+        L += _md_table(["变量", "指标", "时效数", "比值中位", "最大相对差",
+                        "最大绝对差", "|Δbias|/RMSE", "Pearson", "Spearman", "判定"],
+                       rows)
+        L += ["", "> Δ = A − B，Δ% = (A − B) / |B|；bias_rel = max|Δbias|/RMSE。", ""]
+    else:
+        L += ["没有可对表的指标。", ""]
+
+    rmse_results = sorted([r for r in results if r.label == "RMSE"],
+                          key=lambda x: x.var)
+    if rmse_results:
+        L += ["### 4.2 RMSE 逐时效明细", ""]
+        for r in rmse_results:
+            L.append(f"<details><summary><b>{r.var}</b> — n={r.n}，"
+                     f"max|Δ%|={_pct(r.rel_max)}，"
+                     f"{VERDICT_BADGE.get(r.verdict, r.verdict)}</summary>")
+            L.append("")
+            rows = []
+            for i, lead in enumerate(r.leads):
+                y = r.y[i]
+                rel = ((r.x[i] * r.scale - y) / abs(y)) if y else float("nan")
+                rows.append([int(lead), _f(r.x[i], 6), _f(y, 6), _pct(rel),
+                             _f(r.x[i] / y, 6) if y else "—"])
+            L += _md_table(["时效(h)", f"A：{name_a}", f"B：{name_b}",
+                            "Δ%", "比值 A/B"], rows)
+            L += ["", "</details>", ""]
+    L += ["---", ""]
+
+    # 5. 附加检查
+    growth = growth_curve_check(results)
+    L += ["## 5. 附加检查", "", "### T5 归一增长曲线", ""]
+    if growth["per_var"]:
+        L += _md_table(["变量", "Pearson", "最大归一偏差"],
+                       [[var, _f(corr, 6), _pct(dev)]
+                        for var, corr, dev in growth["per_var"]])
+        if math.isfinite(growth["rank_spearman_mean"]):
+            L += ["", f"- 跨变量排序一致性：Spearman 均值 "
+                      f"**{growth['rank_spearman_mean']:.4f}**"]
+    else:
+        L.append("无可用 RMSE 曲线。")
+
+    if wb2_mode:
+        L += ["", "### T6 RMSE 聚合口径", ""]
+        rows6 = aggregation_sensitivity(results)
+        if rows6:
+            L += _md_table(["变量", "max|Δ|（RMS 聚合）", "max|Δ|（mean 聚合）",
+                            "比值中位", "更贴 WB2"],
+                           [[var, _pct(mr), _pct(mm), _f(ratio), winner]
+                            for var, mr, mm, ratio, winner in rows6])
+            wins = sum(1 for row in rows6 if row[4] == "RMS")
+            L += ["", f"- {wins}/{len(rows6)} 个变量的 RMS 聚合更贴 WB2。"]
+        else:
+            L.append("无 RMSE 对表，跳过。")
+
+    L += ["", "### T7 起报间散布", ""]
+    scat = [(r.var, r.init_scatter_ratio) for r in results
+            if r.label == "RMSE" and r.init_scatter_ratio is not None]
+    if scat:
+        L += _md_table(["变量", "中位|Δ| / A 起报间标准差"],
+                       [[var, f"{val:.3f}"] for var, val in scat])
+    else:
+        L.append("无起报级散布数据。")
+    L += ["", "---", ""]
+
+    # 6. 口径说明
+    L += ["## 6. 口径与判定说明", "",
+          "- 方向：Δ = A − B，Δ% = (A − B) / |B|。",
+          "- scores × scores：两侧都按 (变量, 指标, 时效) 的逐起报值均值聚合。",
+          "- scores × WB2：scores 侧 RMSE 用逐起报 RMSE 的 RMS 聚合，"
+          "WB2 侧 RMSE = sqrt(mse)。",
+          f"- 相对差判定：PASS ≤ {TOL_PASS_REL:.2%}，CLOSE ≤ {TOL_CLOSE_REL:.2%}，"
+          f"MINOR ≤ {TOL_MINOR_REL:.2%}，MAJOR ≤ {TOL_MAJOR_REL:.2%}；"
+          "再大则看 Pearson，≥0.999 记为 SHAPE，否则 MISMATCH。",
+          f"- ACC 用绝对差：PASS ≤ {ACC_ABS_PASS:g}，CLOSE ≤ {ACC_ABS_CLOSE:g}，"
+          f"MINOR ≤ {ACC_ABS_MINOR:g}，MAJOR ≤ {ACC_ABS_MAJOR:g}。",
+          f"- Bias 用 |Δbias|/RMSE：PASS ≤ {BIAS_PASS}，CLOSE ≤ {BIAS_CLOSE}，"
+          f"MINOR ≤ {BIAS_MINOR}，MAJOR ≤ {BIAS_MAJOR}。",
+          "- 谱/球谐带/分类指标不参与标量对表。",
+          "- scores.csv 若混入非全球 region 行，会被剔除并记录在日志中。",
+          ]
 
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text("\n".join(L) + "\n", encoding="utf-8")
+    path.write_text("\n".join(L).rstrip() + "\n", encoding="utf-8")
+    log.info("Markdown 报告写入：%s", path)
 
 
 # ══════════════════════════════════════════════════════════════════════
 # main
 # ══════════════════════════════════════════════════════════════════════
-def main(argv: Optional[Sequence[str]] = None) -> int:
+def setup_logging(log_file: Optional[str]) -> None:
+    fmt = logging.Formatter("%(asctime)s %(levelname)-5s %(message)s",
+                            "%Y-%m-%d %H:%M:%S")
+    root = logging.getLogger()
+    root.setLevel(logging.INFO)
+    console = logging.StreamHandler(sys.stdout)
+    console.setFormatter(fmt)
+    root.addHandler(console)
+    if log_file:
+        p = Path(log_file)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        fh = logging.FileHandler(p, mode="w", encoding="utf-8")
+        fh.setFormatter(fmt)
+        root.addHandler(fh)
+        log.info("日志同时写入：%s", p)
+
+
+def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     ap = argparse.ArgumentParser(
-        description="WB2 与 xmetai-evaluation 指标一致性对拍",
+        description="两套评测结果对拍：scores.csv × scores.csv 或 scores.csv × WB2 nc",
     )
-    ap.add_argument("--v2", default=DEFAULT_V2,
-                    help="v2 产物目录（含 scores.csv）或 scores.csv 路径")
-    ap.add_argument("--wb2", default=DEFAULT_WB2,
-                    help="WB2 结果目录（含 *_deterministic.nc 与 wb2_2022_extra.csv）")
-    ap.add_argument("--out", default=DEFAULT_OUT,
-                    help="输出 Markdown 报告路径")
-    args = ap.parse_args(argv)
+    ap.add_argument("a", metavar="A", help="第一个结果目录（scores.csv 或 WB2 nc）")
+    ap.add_argument("b", metavar="B", help="第二个结果目录（scores.csv 或 WB2 nc）")
+    ap.add_argument("--log-file", default=None,
+                    help="同时把日志写入该文件（默认只输出到控制台）")
+    ap.add_argument("--name-a", default=None, help="A 侧显示名（默认用目录名）")
+    ap.add_argument("--name-b", default=None, help="B 侧显示名（默认用目录名）")
+    ap.add_argument("--out", default=None,
+                    help="Markdown 报告路径（默认写在本脚本旁边 compare_<A>_vs_<B>.md）")
+    return ap.parse_args(argv)
 
-    v2_path = Path(args.v2)
-    wb2_path = Path(args.wb2)
-    out_path = Path(args.out)
 
-    print(f"[1/4] 读取 v2 scores: {v2_path}")
-    v2, v2_meta = load_v2(v2_path)
-    print(f"      行数 {v2_meta['rows']:,}，指标 key {len(v2_meta['all_keys'])} 个")
+def main(argv: Optional[Sequence[str]] = None) -> int:
+    args = parse_args(argv)
+    setup_logging(args.log_file)
 
-    print(f"[2/4] 读取 WB2 deterministic: {wb2_path}")
-    det, det_files = load_wb2_deterministic(wb2_path)
-    print(f"      nc {len(det_files)} 个，指标 key {len(det)} 个")
+    path_a, path_b = Path(args.a), Path(args.b)
+    fmt_a, fmt_b = detect_format(path_a), detect_format(path_b)
+    name_a = args.name_a or path_a.name
+    name_b = args.name_b or path_b.name
 
-    print(f"[3/4] 读取 WB2 extra.csv")
-    extra, extra_unmatched, extra_rows = load_wb2_extra(wb2_path)
-    print(f"      extra 记录 {extra_rows} 行")
+    # WB2 放 A 侧时交换，让 scores 始终在 A 侧
+    if fmt_a == "wb2" and fmt_b == "scores":
+        log.info("检测到 A 是 WB2、B 是 scores，自动交换两侧")
+        path_a, path_b = path_b, path_a
+        fmt_a, fmt_b = fmt_b, fmt_a
+        name_a, name_b = name_b, name_a
 
-    print("[4/4] 比对并生成报告")
-    results = build_pairs(v2, det, extra)
-    agg_rows = aggregation_sensitivity(results)
-    growth = growth_curve_check(results)
-    wb2_meta = {
-        "path": str(wb2_path),
-        "det_files": det_files,
-        "det_keys": set(det),
-        "extra_keys": set(extra),
-        "extra_rows": extra_rows,
-    }
-    write_report(out_path, v2_meta=v2_meta, wb2_meta=wb2_meta,
-                 results=results, agg_rows=agg_rows, growth=growth,
-                 extra_unmatched=extra_unmatched, args=args)
-    print(f"报告已写出: {out_path}")
+    if fmt_a == "wb2" and fmt_b == "wb2":
+        raise SystemExit("不支持 WB2 × WB2：两边都是 *_deterministic.nc")
 
-    if results:
-        print("\n判定汇总：")
-        for r in sorted(results, key=lambda z: (z.var, z.label)):
-            label = LABEL_CN.get(r.label, r.label)
-            verdict = VERDICT_CN.get(r.verdict, r.verdict)
-            if r.bias_rel_max is not None:
-                metric = f"max|Δb|/RMSE={r.bias_rel_max:.4f}"
-            else:
-                metric = f"max|Δ|={r.rel_max*100:.3f}%"
-            print(f"  {r.var:6s} {label:12s} {verdict:8s} "
-                  f"{metric}  r={r.pearson:.5f}")
+    log.info("=== 1. 输入识别 ===")
+    log.info("A = %s（%s）", name_a, "scores.csv" if fmt_a == "scores" else "WB2 nc")
+    log.info("B = %s（%s）", name_b, "scores.csv" if fmt_b == "scores" else "WB2 nc")
+
+    log.info("")
+    log.info("[读取] %s", path_a)
+    data_a, meta_a = load_scores(path_a)
+    log.info("       %d 行，指标 key %d 个", meta_a["rows"], len(meta_a["all_keys"]))
+
+    if fmt_b == "scores":
+        log.info("[读取] %s", path_b)
+        data_b, meta_b = load_scores(path_b)
+        log.info("       %d 行，指标 key %d 个", meta_b["rows"], len(meta_b["all_keys"]))
+        if not (set(data_a) & set(data_b)):
+            raise SystemExit("A/B 没有共同变量，无法对表")
+        consistency = check_scores_pair(meta_a, meta_b, name_a, name_b)
+        unit_diffs = log_unit_diff(meta_a, meta_b, name_a, name_b)
+        sample_counts = log_sample_counts(data_a, data_b)
+        coverage = log_coverage_scores(data_a, data_b,
+                                       meta_a["all_keys"], meta_b["all_keys"])
+        results = build_pairs_scores(data_a, data_b)
+        log.info("[可对表] 实际构建 %d 个 (变量, 指标) 对", len(results))
+        wb2_mode = False
+        det_metrics = extra_metrics = extra_unmatched = None
+    else:
+        log.info("[读取] %s", path_b)
+        det, files_used, attrs = load_wb2_deterministic(path_b)
+        extra, extra_unmatched, extra_meta = load_wb2_extra(path_b)
+        meta_b = {
+            "files": files_used,
+            "attrs": attrs,
+            "extra_rows": extra_meta["rows"],
+            "extra_meta": extra_meta,
+            "variables": {v for v, _ in det},
+            "leads": {float(l) for d in det.values() for l in d},
+        }
+        log.info("       nc %d 个，指标 key %d 个，extra %d 行",
+                 len(files_used), len(det), extra_meta["rows"])
+        consistency = check_scores_wb2(meta_a, meta_b, name_a, name_b)
+        log.info("")
+        log.info("=== 3. 可对表范围 ===")
+        det_metrics = sorted({m for _, m in det})
+        log.info("[WB2 指标] %s", ", ".join(det_metrics))
+        extra_metrics = sorted({m for _, m in extra})
+        if extra:
+            log.info("[WB2 extra 指标] %s", ", ".join(extra_metrics))
+        if extra_unmatched:
+            log.info("[extra 未映射] %d 条（%s）", len(extra_unmatched),
+                     ", ".join(sorted({m for _, _, m in extra_unmatched})))
+        extra_unmatched = sorted(extra_unmatched)
+        results = build_pairs_wb2(data_a, det, extra)
+        log.info("[可对表] 实际构建 %d 个 (变量, 指标) 对", len(results))
+        wb2_mode = True
+        unit_diffs = None
+        sample_counts = None
+        coverage = None
+
+    log_details(results, name_a, name_b)
+    log_extra_checks(results, wb2_mode=wb2_mode)
+    log_summary(results)
+
+    out_path = (Path(args.out) if args.out
+                else Path(__file__).resolve().parent / f"compare_{name_a}_vs_{name_b}.md")
+    write_markdown(out_path, {
+        "name_a": name_a, "name_b": name_b,
+        "path_a": path_a.resolve(), "path_b": path_b.resolve(),
+        "meta_a": meta_a, "meta_b": meta_b,
+        "consistency": consistency,
+        "unit_diffs": unit_diffs,
+        "sample_counts": sample_counts,
+        "coverage": coverage,
+        "results": results,
+        "wb2_mode": wb2_mode,
+        "det_metrics": det_metrics,
+        "extra_metrics": extra_metrics,
+        "extra_unmatched": extra_unmatched,
+    })
     return 0
 
 
