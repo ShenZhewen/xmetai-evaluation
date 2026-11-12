@@ -828,8 +828,12 @@ def analyze(
     if not fa_variables:
         raise ValueError("这些模型没有共享的 <变量>_ratio 列，算不出 FA 偏差")
 
+    # 只有出了纬向谱诊断的模型参与频谱指标；只留长表、没有 ``diagnostics`` 的归档
+    # （例如从别处搬来的 ``scores.csv``）照常进报告，谱指标与四项平均排名留空。
+    # 一个模型都没有纬向谱时仍然报错，不静默跳过整节。
+    spectrum_archives = [a for a in archives if spectrum_variables(a.root)]
     spectrum_vars = None
-    for archive in archives:
+    for archive in spectrum_archives:
         own = set(spectrum_variables(archive.root))
         spectrum_vars = own if spectrum_vars is None else (spectrum_vars & own)
     spectrum_vars = sorted(spectrum_vars or set())
@@ -841,8 +845,8 @@ def analyze(
     spectrum_variable = _pick_variable(set(spectrum_vars), variables)
 
     spectrum: Dict[str, pd.DataFrame] = {}
-    spectrum_rms_values: Dict[str, float] = {}
-    for archive in archives:
+    spectrum_rms_values: Dict[str, float] = {name: float("nan") for name in names}
+    for archive in spectrum_archives:
         pred, obs = load_spectrum(
             archive.root, dates_by_model[archive.name], spectrum_variable, archive.name
         )
@@ -1322,6 +1326,12 @@ def _section_overall(bundle: Bundle, figures: Mapping[str, str]) -> List[str]:
             f"球谐比偏差最小 {bundle.sph_bias.idxmin()}"
             f"（{fmt_number(bundle.sph_bias.min(), 2)}%）。"
         )
+    missing_spectrum = [name for name in bundle.names if name not in bundle.spectrum]
+    if missing_spectrum:
+        items.append(
+            "、".join(missing_spectrum) + " 的产物里没有纬向谱诊断，"
+            "频谱对数RMS×100 与平均排名分记为「—」，不参与频谱与四项名次平均。"
+        )
     lines += bullet_lines(items)
     lines += [
         "",
@@ -1452,6 +1462,7 @@ def _section_fa(bundle: Bundle, figures: Mapping[str, str]) -> List[str]:
 
 
 def _section_spectrum(bundle: Bundle, figures: Mapping[str, str]) -> List[str]:
+    missing = [name for name in bundle.names if name not in bundle.spectrum]
     lines = ["## 4.4 纬向功率谱", "", "**纬向谱绝对对数偏差（log10）**", ""]
     rows = [[
         bundle.spectrum_variable,
@@ -1467,7 +1478,8 @@ def _section_spectrum(bundle: Bundle, figures: Mapping[str, str]) -> List[str]:
         "",
         f"图 5：{bundle.spectrum_variable} 的纬向功率谱（双对数，"
         f"{date_span(bundle.dates)} 共同日期平均），每条颜色曲线为一个模型的预测谱，"
-        "黑色虚线为观测谱。",
+        "黑色虚线为观测谱。"
+        + (f"{'、'.join(missing)} 缺谱产物，图中不出曲线。" if missing else ""),
         "",
     ]
     items = [
@@ -1476,6 +1488,11 @@ def _section_spectrum(bundle: Bundle, figures: Mapping[str, str]) -> List[str]:
         f"最大 {bundle.spectrum_rms.idxmax()}（{fmt_number(bundle.spectrum_rms.max(), 2)}）。",
         "这是 log10 口径；§4.5 球谐带用自然对数 ln，两者不可直接比大小。",
     ]
+    if missing:
+        items.append(
+            "、".join(missing) + " 的产物里没有 diagnostics/"
+            f"{SPECTRUM_BY_INIT_NAME}，不参与本节频谱指标，也不计入四项平均排名。"
+        )
     lines += bullet_lines(items)
     return lines
 
@@ -2327,6 +2344,11 @@ def _conclusion_summary(
         + "、".join(f"{name} {fmt_number(bundle.rank_score[name], 1)}" for name in bundle.rank_score.sort_values().index)
         + "。",
     ]
+    missing_spectrum = [name for name in bundle.names if name not in bundle.spectrum]
+    if missing_spectrum:
+        items[-1] = items[-1].rstrip("。") + (
+            f"（{'、'.join(missing_spectrum)} 无纬向谱产物，不参与四项平均排名）。"
+        )
     if bundle.sph_available:
         items.append(
             f"球谐带功率上，{bundle.sph_rms.idxmin()} 的总 log-RMS×100 最低"
